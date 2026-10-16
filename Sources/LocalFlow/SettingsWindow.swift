@@ -323,6 +323,26 @@ final class SettingsModel: ObservableObject {
 // MARK: - Window controller
 
 @MainActor
+final class SettingsWindow: NSWindow {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) { return true }
+        // This accessory app has no application Edit menu to route shortcuts.
+        guard event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command else {
+            return false
+        }
+        let action: Selector
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "x": action = #selector(NSText.cut(_:))
+        case "c": action = #selector(NSText.copy(_:))
+        case "v": action = #selector(NSText.paste(_:))
+        case "a": action = #selector(NSText.selectAll(_:))
+        default: return false
+        }
+        return firstResponder?.tryToPerform(action, with: self) ?? false
+    }
+}
+
+@MainActor
 final class SettingsPanelController {
     private let model: SettingsModel
     private var window: NSWindow?
@@ -343,7 +363,7 @@ final class SettingsPanelController {
         model.refresh()
         if window == nil {
             let hosting = NSHostingController(rootView: SettingsView(model: model))
-            let w = NSWindow(contentViewController: hosting)
+            let w = SettingsWindow(contentViewController: hosting)
             w.title = "\(AppIdentity.current.name) Settings"
             w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
             // A native toolbar gives the window controls their standard vertical inset.
@@ -395,6 +415,51 @@ final class SettingsPanelController {
 }
 
 // MARK: - Views
+
+struct NewSnippetForm: View {
+    @Binding var trigger: String
+    @Binding var expansion: String
+    let add: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Spoken phrase")
+                    .font(.subheadline.weight(.medium))
+                TextField("Spoken phrase", text: $trigger, prompt: Text("e.g. insert practice code"))
+                    .textFieldStyle(.roundedBorder)
+                    .labelsHidden()
+                    .accessibilityLabel("Spoken phrase")
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Text to insert")
+                    .font(.subheadline.weight(.medium))
+                TextEditor(text: $expansion)
+                    .font(.body)
+                    .frame(height: 100)
+                    .scrollContentBackground(.hidden)
+                    .padding(4)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color(nsColor: .separatorColor))
+                            .allowsHitTesting(false)
+                    }
+                    .accessibilityLabel("Text to insert")
+                Text("Type or paste the full text here. Line breaks are preserved.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Add snippet", action: add)
+                    .disabled(trigger.trimmingCharacters(in: .whitespaces).isEmpty
+                        || expansion.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+}
 
 enum SettingsPane: String, CaseIterable, Identifiable {
     case general = "General"
@@ -792,27 +857,15 @@ struct SettingsView: View {
                         .help("Remove this snippet")
                     }
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    TextField("Say this…", text: $newSnippetTrigger)
-                    TextField("…to insert this", text: $newSnippetExpansion, axis: .vertical)
-                        .lineLimit(2...5)
-                    HStack {
-                        Spacer()
-                        Button("Add snippet") {
-                            model.addSnippet(trigger: newSnippetTrigger, expansion: newSnippetExpansion)
-                            newSnippetTrigger = ""
-                            newSnippetExpansion = ""
-                        }
-                        .disabled(
-                            newSnippetTrigger.trimmingCharacters(in: .whitespaces).isEmpty
-                                || newSnippetExpansion.trimmingCharacters(in: .whitespaces).isEmpty
-                        )
-                    }
+                NewSnippetForm(trigger: $newSnippetTrigger, expansion: $newSnippetExpansion) {
+                    model.addSnippet(trigger: newSnippetTrigger, expansion: newSnippetExpansion)
+                    newSnippetTrigger = ""
+                    newSnippetExpansion = ""
                 }
             } header: {
                 Text("Snippets")
             } footer: {
-                Text("Voice shortcuts for text you type often. Say the trigger anywhere in a dictation (\u{201C}insert my signature\u{201D}) and it's replaced with the full text, verbatim.")
+                Text("The spoken phrase must match your words; capitalization is ignored. Its saved text is inserted exactly, even with Literal formatting on.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
