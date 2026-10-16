@@ -60,7 +60,9 @@ Change the hotkey, speech model, microphone, and HUD theme in Settings.
   updating without a pause. This text is raw; Flo pastes the final text after release.
 - **Formatting.** Long pauses start paragraphs; "first... second..." makes
   numbered lists. Say "new line", "new paragraph", "bullet point", "numbered
-  list", or "thumbs up emoji". Commands always apply, even mid-sentence.
+  list", or "thumbs up emoji". Commands apply even mid-sentence. Enable
+  **Literal formatting** in Settings to keep command phrases as text and disable
+  automatic numbered lists.
 - **Vocabulary and corrections.** Add names and jargon in Settings to guide Whisper.
   Teach fixes like "talex" to "Talix", or edit and copy a pasted dictation,
   then pick **Fix Last Dictation...** to learn the swaps.
