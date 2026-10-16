@@ -100,6 +100,7 @@ struct DictationTranscriptionRequest {
     let samples: [Float]
     let lowEnergy: Bool
     var purpose: TranscriptionPurpose = .authoritative
+    var lifetime: TranscriptionLifetime? = nil
 }
 
 struct DictationCleanupRequest {
@@ -152,10 +153,11 @@ final class DictationSessionPipeline {
         var capturedAudioSaved = false
         var pendingChunks: [IncrementalChunk] = []
         var activeTask: Task<Void, Never>?
-        /// Normal release and Escape leave inference running. Only explicit
-        /// interruption or a stall deadline cancels it and quarantines the engine.
+        /// Escape gives active inference a bounded grace period at Transcriber.
+        /// Explicit interruption and the release deadline cancel it immediately.
         var previewTask: Task<Void, Never>?
-        var previewLifetime: PreviewLifetime?
+        var previewLifetime: TranscriptionLifetime?
+        var inferenceLifetimes: [UUID: TranscriptionLifetime] = [:]
         var lastPreviewRange: Range<Int>?
         var displayedPreview: DisplayedPreview?
         var nextChunkSnapshotSamples = 0
@@ -324,7 +326,7 @@ final class DictationSessionPipeline {
         let audio = DictationAudioPreparation(samples: Array(samples[range]))
         guard audio.isAdmitted else { return }
         session.lastPreviewRange = range
-        let lifetime = PreviewLifetime()
+        let lifetime = TranscriptionLifetime()
         session.previewLifetime = lifetime
         let request = DictationTranscriptionRequest(
             generation: session.generation,
@@ -460,17 +462,15 @@ final class DictationSessionPipeline {
         scheduleReleaseTimeout(for: session)
     }
 
-    /// `interruptInference: false` abandons the session without cancelling
-    /// its running task. Cancelling a task inside speech inference makes the
-    /// transcriber quarantine its engine, which is right for a stall but would
-    /// unload the model on every Escape. The abandoned task's result is
-    /// dropped by `isCurrent` when it returns, and the transcription gate
-    /// holds any new dictation until then. Text cleanup is still cancelled.
+    /// Escape invalidates queued work and gives active inference a grace period
+    /// owned by Transcriber. Explicit interruption still cancels immediately.
+    /// Session identity rejects all late results. Text cleanup is always cancelled.
     func cancel(generation: Int, interruptInference: Bool = true) {
         let trace = sessions[generation]?.trace ?? completed[generation]?.trace
         trace?.record(.cancellationRequested)
         if let session = sessions.removeValue(forKey: generation) {
             session.previewLifetime?.invalidate()
+            for lifetime in session.inferenceLifetimes.values { lifetime.invalidate() }
             session.releaseTimeout?.cancel()
             session.cleanupDeadline?.cancel()
             session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
@@ -708,6 +708,7 @@ final class DictationSessionPipeline {
     private func complete(_ session: Session, with outcome: DictationSessionOutcome) {
         guard isCurrent(session) else { return }
         session.previewLifetime?.invalidate()
+        for lifetime in session.inferenceLifetimes.values { lifetime.invalidate() }
         session.releaseTimeout?.cancel()
         session.releaseTimeout = nil
         session.cleanupDeadline?.cancel()
@@ -767,6 +768,12 @@ final class DictationSessionPipeline {
     private func runTranscription(_ request: DictationTranscriptionRequest, session: Session) async throws -> String {
         try Task.checkCancellation()
         guard isCurrent(session) else { throw CancellationError() }
+        let id = UUID()
+        let lifetime = TranscriptionLifetime()
+        session.inferenceLifetimes[id] = lifetime
+        defer { session.inferenceLifetimes.removeValue(forKey: id) }
+        var request = request
+        request.lifetime = lifetime
         // A preview runs every second. Keeping its audio and text would bloat
         // the opt-in diagnostic archive, so only the trace sees it.
         let diagnostics = request.segment == .preview ? nil : session.diagnostics

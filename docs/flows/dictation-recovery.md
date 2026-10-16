@@ -633,3 +633,186 @@ Stack integration keeps queued-preview invalidation in the prepared-audio releas
 overload shared by live delivery and raw-sample callers. The queued-preview
 regression now exercises prepared-audio release; other release tests retain the
 raw-sample path. Assembled-stack validation is recorded separately.
+
+## R1: Bounded abandoned inference and model-switch recovery, October 15, 2026
+
+Owner: Flo maintainers. Requirement source: the authorized reliability report R1
+and implementation brief. Foundation: `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Prerequisite E2 was cherry-picked unchanged as
+`ee1bf8b2f4d976707efd6e7564fe9e66d308bb00`, from
+`be83e19d79c868f25dffb214659b4c343da179cb`. The R1 commit follows it on
+`fix/abandoned-inference-recovery`. Target selection, clipboard delivery R3,
+other report items, and proposed features are outside this change.
+
+Escape still reaches `DictationSessionPipeline.cancel` through AppDelegate and
+DictationDelivery with `interruptInference: false`. Each `runTranscription`
+request now carries a lifetime. Cancelling or completing a session invalidates
+its outstanding requests. The existing E2 observer implementation is renamed
+`TranscriptionLifetime` and reused for session abandonment and preview
+obsolescence. Those signals remain separate: release invalidates a queued
+preview without treating active preview inference as explicitly cancelled.
+Both AppDelegate and DictationReplay already forward the complete request.
+
+`TranscriptionGate.acquire` removes abandoned queued requests immediately.
+`Transcriber.runInference` owns an active request's abandonment deadline, even
+after the session drops its task handles. The default grace is 90 seconds,
+injected as `abandonedInferenceGrace` for tests. Completion during grace cancels
+the deadline and keeps the model warm. Expiry quarantines a still-active holder;
+its engine and old gate remain isolated until it returns. A per-call identity
+prevents a delayed deadline or cancellation callback from affecting another
+inference on the same engine. Abandoned results cannot return text or update
+the preview budget.
+
+Replacing or quarantining an engine retires its gate. Retirement wakes queued
+acquirers, which re-evaluate the current engine rather than wait for the old
+holder. A loaded replacement serves them; without one, authoritative requests
+fail and retain retry audio through the existing delivery path. Manual Retry
+uses the existing AppDelegate model-load path before retrying retained audio.
+Replacement loads count all unresolved engine holders, including work inside
+grace, against the existing two-engine recovery limit. A third replacement
+fails with `recoveryBusy` until one holder returns. Explicit interruption and
+release deadlines still quarantine immediately.
+
+`Transcriber.load` advances its load generation before the warm-model shortcut.
+For warm A, suspended loading B, then request A, B's late load cannot publish.
+The warm A request does not construct another engine.
+
+Fake suspended engines in `DictationSessionStallTests` verify these acceptance
+examples through the real Transcriber and gate:
+
+- `testEscapeAbandonedFinalExpiresAndQueuedFollowerRetriesOnReplacement` and
+  `testEscapeAbandonedPreviewExpiresAndQueuedFollowerRetriesOnReplacement` check
+  grace, follower failure, retained retry audio, replacement success, and no late
+  original delivery or history after its transcription callback finishes.
+- `testEscapeRemovesQueuedFinalWithoutQuarantiningUnrelatedHolder` checks that
+  abandoning a waiter does not quarantine the active request.
+- `testFinishedAbandonmentDeadlineCannotQuarantineNextInferenceOnSameEngine`,
+  `testKeyboardCancelLeavesRunningInferenceAndModelLoaded`, and the existing E2
+  Escape tests check warm reuse without another load.
+- `testAbandonedOldInferenceGraceCannotQuarantineReplacement` checks that an
+  old generation's expired deadline and late result leave its replacement usable.
+- `testWarmRequestInvalidatesBlockedDifferentModelLoad` covers A-B-A;
+  `testQueuedRequestUsesReplacementAfterOrdinaryModelSwitch` now requires the
+  follower to finish before the original holder returns.
+- `testAbandonmentCapsQuarantinedEnginesUntilOldInferenceReturns`,
+  `testRecoveryCapsQuarantinedEnginesUntilOldInferenceReturns`, and
+  `testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound` check the cap
+  for abandoned, explicitly cancelled, and still-in-grace holders.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1` and the unchanged lockfile. Evidence identifies the prerequisite
+plus the R1 diff saved at `/tmp/flo-r1-final.diff`; the implementation handoff
+provides the final R1 commit SHA.
+
+- RED, exit 1: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'`,
+  34 tests, three failed assertions exposing A-B-A and the stuck old-gate waiter
+  before the source repair. Log: `/tmp/flo-r1-baseline.log`.
+- RED, exit 1: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound`,
+  one test, two failed assertions exposing replacement during grace bypassing
+  the cap. Log: `/tmp/flo-r1-grace-bound-red.log`.
+- PASS, exit 0: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'`,
+  119 tests, zero failures. Log: `/tmp/flo-r1-recovery-final.log`.
+- PASS, exit 0: `swift test --scratch-path .build/r1 --disable-automatic-resolution --skip TextInjectorTests`,
+  382 tests, zero failures, one optional HUD render skipped because
+  `LOCALFLOW_RENDER_DIR` was unset. All 21 TextInjector tests were excluded to
+  respect the task's no-clipboard boundary, including private pasteboards.
+  Log: `/tmp/flo-r1-broad-tests.log`.
+- PASS, exit 0: `python3 -B Tests/StartupReadinessTests.py`, four tests.
+  Log: `/tmp/flo-r1-startup-tests.log`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+  Log: `/tmp/flo-r1-diff-check.log`.
+
+NOT RUN: actual Whisper or Parakeet inference, runtime menu interaction,
+microphone capture, clipboard access, target-app insertion, release packaging,
+installation, or performance measurement. Tests use synthetic audio and fake
+engines, delivery, and history callbacks. Existing compiler warnings in
+untouched diagnostic, injection, and startup-test code remain. The parent
+integration owner must assemble the stack and perform any authorized runtime
+validation. This task creates local commits only.
+
+## R1 command follow-up: caller-owned speech abandonment, October 16, 2026
+
+Owner: Flo maintainers and the parent R1 integration agent. Requirement source:
+the authorized PR #50 follow-up brief, extending R1 to command-mode speech.
+Base: `9094828c8efcecdf5c655575aaa43816ae89c574` on local
+`pr/r1-abandoned-inference-recovery`. This is one additional local R1 commit.
+R2's compiled boundary-test pattern was inspected at `f6d302f`; none of its
+implementation was copied or cherry-picked. R3/R4, target selection, live
+capture, clipboard access, installation, publishing, and model changes are
+outside this follow-up.
+
+Intended behavior and observed path:
+
+- `AppDelegate.process(asCommand: true)` creates a `TranscriptionLifetime`,
+  stores it by command sequence, captures it in the task, and passes it into
+  the existing `Transcriber.transcribe(samples:lowEnergy:lifetime:)` call.
+  This replaces the speech-phase set with the existing lifetime type.
+- Escape skips the pending command through `completeCommand`, invalidating
+  and removing its lifetime before dropping the task handle. Speech stays
+  uncancelled, and a suspended call retains its invalidated lifetime. The
+  existing Transcriber owns the 90-second grace and quarantine. No caller
+  timer or scheduler was added. A queued request instead leaves the real gate.
+- The speech-call defer removes ownership and invalidates the lifetime after
+  Transcriber has detached its observer. Normal completion, empty output,
+  no-speech, and errors therefore do not start abandonment after inference.
+- The delivery timeout removes pending identity before invoking
+  `AppDelegate.cancelCommand`. That method invalidates the lifetime and
+  explicitly cancels the task, retaining immediate quarantine for active
+  speech. After speech finishes, Escape and timeout still cancel text-model
+  work. Existing pending-sequence checks reject late speech, selection, and
+  text-model results before follow-on work or delivery.
+- Discarding a held command has no speech lifetime yet. The existing discard
+  path stops capture without starting command recognition.
+
+`Tests/CommandAbandonmentBoundaryTests.py` compiles the actual AppDelegate
+stored ownership declarations and seven methods, plus the actual
+`TranscriptionLifetime` and `TranscriptionGate`. UI, capture, selection access,
+speech, text models, and delivery side effects are inert dependencies. Its
+13 cases exercise suspended Escape and skip, queued removal, Escape before
+task execution, speech timeout, normal completion and gate reuse, text-model
+Escape and timeout, late selection, empty/no-speech/error completion, and held
+discard. The fake speech backend deliberately returns late text so caller
+identity guards must prevent further selection access, model work, or delivery.
+The suspended case checks the weakly observed lifetime remains invalidated
+after all caller task handles are removed. Every case checks speech ownership
+is released. CI's existing Test step runs the documented Python command.
+
+The boundary harness proves caller wiring and the real gate/lifetime contract;
+it does not itself implement or measure model quarantine. Existing real
+Transcriber cases in `DictationSessionStallTests` and
+`PreviewInferenceBudgetTests` verify injected grace expiry, replacement,
+queued removal, warm reuse, and explicit interruption. They passed alongside
+the new caller checks. The live default remains 90 seconds; tests use the
+existing injected backend and deadline seams.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1-command` and the unchanged lockfile. Evidence identifies the base
+above plus `/tmp/flo-r1-command-final.diff`; the handoff names the resulting
+local commit. Executed commands and results:
+
+```sh
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'
+python3 -B Tests/CommandAbandonmentBoundaryTests.py CommandAbandonmentBoundaryTests.test_escape_retains_invalidated_suspended_speech_without_task_cancellation
+python3 -B Tests/CommandAbandonmentBoundaryTests.py
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'
+git diff --check
+git diff --cached --check
+```
+
+- PASS, exit 0: baseline, 41 tests. `/tmp/flo-r1-command-baseline.log`.
+- RED, exit 1: one caller test against the unfixed AppDelegate. The compiled
+  case failed with `actual command caller must pass a speech lifetime`.
+  `/tmp/flo-r1-command-boundary-red.log`.
+- PASS, exit 0: final boundary suite, 13 tests, no skips.
+  `/tmp/flo-r1-command-boundary.log`.
+- PASS, exit 0: focused Swift suite, 124 tests, zero failures, no skips.
+  `/tmp/flo-r1-command-focused.log`. This also compiles the actual application.
+- PASS, exit 0: unstaged and staged diff checks.
+  `/tmp/flo-r1-command-diff-check.log`.
+
+NOT RUN: full Swift suite, real-model inference, live app, microphone,
+clipboard, system Accessibility, installation, packaging, or remote CI.
+The focused tests use fake engines and inert delivery callbacks. No new
+production abstraction, dependency, timer, or scheduler was introduced;
+command speech reuses R1's lifetime, gate, grace, and quarantine mechanisms.
+The parent agent owns integration into PR #50 and any later live acceptance.
