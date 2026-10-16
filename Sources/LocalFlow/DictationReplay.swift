@@ -103,7 +103,8 @@ enum DictationReplay {
         let duration = Double(samples.count) / AudioRecorder.sampleRate
         guard duration <= 300 else { throw ReplayError.audioTooLong(duration) }
 
-        guard DictationAudioPreparation(samples: samples).isAdmitted else {
+        let audio = DictationAudioPreparation(samples: samples)
+        guard audio.isAdmitted else {
             throw ReplayError.insufficientVoice
         }
 
@@ -178,7 +179,7 @@ enum DictationReplay {
                 }
                 let releasedAt = DispatchTime.now().uptimeNanoseconds
                 trace?.record(.hotkeyReleased, at: releasedAt)
-                pipeline.release(generation: generation, fullSamples: samples)
+                pipeline.release(generation: generation, audio: audio)
 
                 let timeout = Task { @MainActor in
                     try? await Task.sleep(for: .seconds(180))
