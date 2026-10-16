@@ -6,6 +6,23 @@ final class VerbatimSnippetPipelineTests: XCTestCase {
     private let code = "  ```swift\n\tlet url = \"https://example.com/a?b=1\"\n// beta new line $1 \\n\n```\n "
     private let speech = [Float](repeating: 0.2, count: 16_000)
 
+    func testAutomaticNumberedListKeepsItsStructureAcrossASnippet() async {
+        let delivered = expectation(description: "automatic list around snippet")
+        var outcomes: [DictationSessionOutcome] = []
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in "First, insert code. Second, get eggs." },
+            cleanup: { .init(text: $0.text, succeeded: true) },
+            onOutcome: { outcomes.append($0); delivered.fulfill() }
+        )
+        pipeline.begin(generation: 20, context: .init(
+            cleanupEnabled: false, styleProfile: .general, corrections: [],
+            snippets: [("insert code", "code")]
+        ))
+        pipeline.release(generation: 20, fullSamples: speech)
+        await fulfillment(of: [delivered], timeout: 1)
+        XCTAssertEqual(outcomes, [.finalTranscript(generation: 20, text: "1. code\n2. Get eggs.")])
+    }
+
     func testPolishedOnlyCleansProseAndReassemblesRepeatedSnippetsInOrder() async {
         let delivered = expectation(description: "composed output")
         var inputs: [String] = []
