@@ -723,7 +723,7 @@ final class DictationSessionPipeline {
                             return TranscriptCleanupResult(text: composed, succeeded: false)
                         }
                         switch part {
-                        case .verbatim(let text): output += text
+                        case .verbatim: output += part.text
                         case .transcript(let text):
                             // Preserve spacing at snippet boundaries even when a
                             // cleaner trims its input or rewrites all of the prose.

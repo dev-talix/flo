@@ -167,8 +167,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recentTranscripts: [RecentDictation] = []
     private var recordingCommandTarget: TextInjector.CommandTarget?
     private var commandTasks: [Int: Task<Void, Never>] = [:]
-    /// Commands whose task is still inside speech inference.
-    private var transcribingCommands: Set<Int> = []
+    /// Speech requests still owned by a pending command, including gate waiters.
+    private var commandSpeechLifetimes: [Int: TranscriptionLifetime] = [:]
     private var retryingDictations = false
     private var commandHudGenerations: [Int: Int] = [:]
 
@@ -1058,10 +1058,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // cancel(generation:) can't fire onCancelled. Hide it here.
             dismissHud(released.hudGeneration)
         } else if let sequence = commandHudGenerations.first(where: { $0.value == recordingGeneration })?.key {
-            // Skipping the command makes its task drop the result. Only the
-            // text-model phase is cancelled: cancelling speech inference
-            // would unload the speech model.
-            if !transcribingCommands.contains(sequence) { commandTasks[sequence]?.cancel() }
+            // Speech abandonment uses Transcriber's grace so a quick finish
+            // keeps the model warm. Text-model work can be cancelled immediately.
+            if commandSpeechLifetimes[sequence] == nil { commandTasks[sequence]?.cancel() }
             completeCommand(sequence, with: .skip)
             dismissHud(recordingGeneration)
         } else {
@@ -1094,15 +1093,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let seq = dictationDelivery.beginCommand()
             if let hudGeneration { commandHudGenerations[seq] = hudGeneration }
             let context = captureDictationContext()
-            transcribingCommands.insert(seq)
+            let lifetime = TranscriptionLifetime()
+            commandSpeechLifetimes[seq] = lifetime
             let task = Task {
                 do {
                     let raw: String
                     do {
-                        defer { self.transcribingCommands.remove(seq) }
+                        defer {
+                            self.commandSpeechLifetimes.removeValue(forKey: seq)
+                            // Transcriber detaches its observer before returning.
+                            lifetime.invalidate()
+                        }
                         raw = try await transcriber.transcribe(
                             samples: audio.samples,
-                            lowEnergy: audio.lowEnergy
+                            lowEnergy: audio.lowEnergy,
+                            lifetime: lifetime
                         )
                     }
                     guard self.dictationDelivery.isCommandPending(seq) else { return }
@@ -1209,12 +1214,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func completeCommand(_ sequence: Int, with outcome: InjectionCoordinator.Outcome) {
+        commandSpeechLifetimes.removeValue(forKey: sequence)?.invalidate()
         commandTasks.removeValue(forKey: sequence)
         commandHudGenerations.removeValue(forKey: sequence)
         dictationDelivery.completeCommand(sequence, with: outcome)
     }
 
     private func cancelCommand(_ sequence: Int) {
+        commandSpeechLifetimes.removeValue(forKey: sequence)?.invalidate()
         commandTasks.removeValue(forKey: sequence)?.cancel()
         let hudGeneration = commandHudGenerations.removeValue(forKey: sequence)
         dismissHud(hudGeneration)

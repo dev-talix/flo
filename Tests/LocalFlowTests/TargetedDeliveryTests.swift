@@ -160,6 +160,144 @@ final class TargetedDeliveryTests: XCTestCase {
         guard case .failure(.unavailable) = result else { return XCTFail("Expected safe refusal") }
     }
 
+    func testCaptureRejectsFocusChangeDuringAttributeReads() {
+        for attribute in [kAXSelectedTextRangeAttribute, kAXSelectedTextAttribute, kAXFocusedWindowAttribute] {
+            for changeApp in [false, true] {
+                let focus = CommandFocus()
+                focus.onRead = { _, name in
+                    guard name == attribute else { return }
+                    focus.onRead = nil
+                    if changeApp {
+                        focus.application = AXUIElementCreateApplication(110)
+                    } else {
+                        focus.element = AXUIElementCreateApplication(111)
+                    }
+                }
+                guard case .failure(.unavailable) = focus.capture() else {
+                    XCTFail("Accepted focus change during \(attribute), different app: \(changeApp)")
+                    continue
+                }
+            }
+        }
+    }
+
+    func testDeliveryRejectsFocusChangeDuringAttributeReadsWithoutWritesOrEvents() throws {
+        for attribute in [kAXSelectedTextRangeAttribute, kAXSelectedTextAttribute, kAXFocusedWindowAttribute] {
+            for changeApp in [false, true] {
+                let focus = CommandFocus()
+                let target = try focus.capture().get()
+                let harness = DeliveryHarness(test: self, focus: focus)
+                let changeCount = harness.board.changeCount
+                focus.onRead = { element, name in
+                    guard name == attribute else { return }
+                    focus.onRead = nil
+                    if name != kAXFocusedWindowAttribute { XCTAssertTrue(CFEqual(element, target.element)) }
+                    if changeApp {
+                        // The old app still reports F1 when another app takes focus.
+                        focus.application = AXUIElementCreateApplication(110)
+                    } else {
+                        focus.element = AXUIElementCreateApplication(111)
+                    }
+                    // F1 retains the exact captured selection, range, and window.
+                }
+                let command = harness.delivery.beginCommand()
+                harness.delivery.completeCommand(command, with: .inject("rewrite result", target: target))
+                XCTAssertEqual(harness.results, [.targetChanged], "\(attribute), different app: \(changeApp)")
+                XCTAssertEqual(harness.board.changeCount, changeCount)
+                XCTAssertNil(harness.board.receipt)
+                XCTAssertTrue(harness.sent.isEmpty)
+                XCTAssertTrue(harness.typed.isEmpty)
+                XCTAssertEqual(harness.history, ["rewrite result"])
+                XCTAssertFalse(harness.delivery.isBusy)
+                TextInjector.restoreNow()
+            }
+        }
+    }
+
+    func testDeliveryRejectsWindowSelectionRangeOrSecureInputChangeDuringReads() throws {
+        let mutations: [(CommandFocus) -> Void] = [
+            { $0.window = AXUIElementCreateApplication(112) },
+            { $0.selection = "different text" },
+            { $0.range.location += 1 },
+            { $0.secure = true }
+        ]
+        for attribute in [kAXSelectedTextRangeAttribute, kAXSelectedTextAttribute, kAXFocusedWindowAttribute] {
+            for mutate in mutations {
+                let focus = CommandFocus()
+                let target = try focus.capture().get()
+                let harness = DeliveryHarness(test: self, focus: focus)
+                let changeCount = harness.board.changeCount
+                focus.onRead = { _, name in
+                    guard name == attribute else { return }
+                    focus.onRead = nil
+                    mutate(focus)
+                }
+                let command = harness.delivery.beginCommand()
+                harness.delivery.completeCommand(command, with: .inject("rewrite result", target: target))
+                XCTAssertEqual(harness.results, [.targetChanged], attribute)
+                XCTAssertEqual(harness.board.changeCount, changeCount)
+                XCTAssertNil(harness.board.receipt)
+                XCTAssertTrue(harness.sent.isEmpty)
+                XCTAssertTrue(harness.typed.isEmpty)
+                XCTAssertEqual(harness.history, ["rewrite result"])
+                XCTAssertFalse(harness.delivery.isBusy)
+                TextInjector.restoreNow()
+            }
+        }
+    }
+
+    func testSecureCommandRefusesCaptureAndDeliveryWithoutAXOrClipboardWrites() throws {
+        let focus = CommandFocus()
+        let target = try focus.capture().get()
+        let harness = DeliveryHarness(test: self, focus: focus)
+        let changeCount = harness.board.changeCount
+        focus.secure = true
+        focus.onRead = { _, _ in XCTFail("Secure commands must not read AX") }
+        guard case .failure(.unavailable) = focus.capture() else { return XCTFail("Expected refusal") }
+        harness.secureInput = true
+        let command = harness.delivery.beginCommand()
+        harness.delivery.completeCommand(command, with: .inject("rewrite result", target: target))
+        XCTAssertEqual(harness.results, [.targetChanged])
+        XCTAssertEqual(harness.board.changeCount, changeCount)
+        XCTAssertTrue(harness.sent.isEmpty)
+        XCTAssertTrue(harness.typed.isEmpty)
+        XCTAssertEqual(harness.history, ["rewrite result"])
+        XCTAssertFalse(harness.delivery.isBusy)
+    }
+
+    func testCaptureRejectsMixedSelectionAndRangeAcrossReads() {
+        for attribute in [kAXSelectedTextAttribute, kAXFocusedWindowAttribute] {
+            let focus = CommandFocus()
+            focus.onRead = { _, name in
+                guard name == attribute else { return }
+                focus.onRead = nil
+                if name == kAXSelectedTextAttribute {
+                    focus.range.location += 1
+                } else {
+                    focus.selection = "different text"
+                }
+            }
+            guard case .failure(.unavailable) = focus.capture() else {
+                XCTFail("Accepted a mixed snapshot during \(attribute)")
+                continue
+            }
+        }
+    }
+
+    func testUnexposedWindowStillAllowsStableCommandTarget() throws {
+        let focus = CommandFocus()
+        focus.window = nil
+        let target = try focus.capture().get()
+        XCTAssertNil(target.window)
+        let harness = DeliveryHarness(test: self, focus: focus)
+        let command = harness.delivery.beginCommand()
+        harness.delivery.completeCommand(command, with: .inject("result", target: target))
+        XCTAssertEqual(harness.sent, ["result"])
+        TextInjector.restoreNow()
+        XCTAssertEqual(harness.results, [.dispatched])
+        XCTAssertFalse(harness.delivery.isBusy)
+    }
+
     func testUnavailableOrInconsistentSelectionRangeRefusesCommandCapture() {
         let focus = CommandFocus()
         focus.readable = false
@@ -280,21 +418,25 @@ final class TargetedDeliveryTests: XCTestCase {
 private final class CommandFocus {
     var application = AXUIElementCreateApplication(100)
     var element = AXUIElementCreateApplication(101)
-    var window = AXUIElementCreateApplication(105)
+    var window: AXUIElement? = AXUIElementCreateApplication(105)
     var selection: String? = "original words"
     var range = CFRange(location: 7, length: 14)
     var readable = true
     var secure = false
+    var onRead: ((AXUIElement, String) -> Void)?
 
     func read(_ element: AXUIElement, _ attribute: CFString) -> (AXError, CFTypeRef?) {
         guard readable else { return (.cannotComplete, nil) }
+        let result: (AXError, CFTypeRef?)
         switch attribute as String {
-        case kAXFocusedUIElementAttribute: return (.success, self.element)
-        case kAXFocusedWindowAttribute: return (.success, window)
-        case kAXSelectedTextAttribute: return (.success, (selection ?? "") as CFString)
-        case kAXSelectedTextRangeAttribute: return (.success, AXValueCreate(.cfRange, &range))
-        default: return (.attributeUnsupported, nil)
+        case kAXFocusedUIElementAttribute: result = (.success, self.element)
+        case kAXFocusedWindowAttribute: result = window.map { (.success, $0) } ?? (.noValue, nil)
+        case kAXSelectedTextAttribute: result = (.success, (selection ?? "") as CFString)
+        case kAXSelectedTextRangeAttribute: result = (.success, AXValueCreate(.cfRange, &range))
+        default: result = (.attributeUnsupported, nil)
         }
+        onRead?(element, attribute as String)
+        return result
     }
 
     func capture() -> Result<TextInjector.CommandTarget, TextInjector.SelectionError> {
