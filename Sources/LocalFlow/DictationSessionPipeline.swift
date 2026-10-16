@@ -170,6 +170,8 @@ final class DictationSessionPipeline {
         var incrementalFailed = false
         var cancelled = false
         var releaseTimeout: DispatchWorkItem?
+        var cleanupDeadline: DispatchWorkItem?
+        var cleanupFallbackText: String?
 
         init(generation: Int, context: DictationSessionContext, trace: DictationTrace?, diagnostics: DictationDiagnosticStore.Recording?, personalVoice: PersonalVoiceStore.Recording?) {
             self.generation = generation
@@ -185,6 +187,7 @@ final class DictationSessionPipeline {
     private let onOutcome: OutcomeHandler
     private let onPartialTranscript: ((Int, String) -> Void)?
     private let stalledGenerationTimeout: TimeInterval
+    private let cleanupTimeout: TimeInterval
     private var sessions: [Int: Session] = [:]
     private var generationOrder: [Int] = []
     private var completed: [Int: (outcome: DictationSessionOutcome, trace: DictationTrace?)] = [:]
@@ -195,13 +198,15 @@ final class DictationSessionPipeline {
         cleanup: @escaping Cleanup,
         onOutcome: @escaping OutcomeHandler,
         onPartialTranscript: ((Int, String) -> Void)? = nil,
-        stalledGenerationTimeout: TimeInterval = 90
+        stalledGenerationTimeout: TimeInterval = 90,
+        cleanupTimeout: TimeInterval = 3
     ) {
         self.transcribe = transcribe
         self.cleanup = cleanup
         self.onOutcome = onOutcome
         self.onPartialTranscript = onPartialTranscript
         self.stalledGenerationTimeout = stalledGenerationTimeout
+        self.cleanupTimeout = cleanupTimeout
     }
 
     func begin(generation: Int, context: DictationSessionContext, trace: DictationTrace? = DictationTrace.current,
@@ -458,6 +463,7 @@ final class DictationSessionPipeline {
         trace?.record(.cancellationRequested)
         if let session = sessions.removeValue(forKey: generation) {
             session.releaseTimeout?.cancel()
+            session.cleanupDeadline?.cancel()
             session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
             session.personalVoice?.finish(status: "cancelled")
             session.cancelled = true
@@ -655,6 +661,15 @@ final class DictationSessionPipeline {
             context: session.context
         )
         session.activeTaskIsCleanup = true
+        session.cleanupFallbackText = composed
+        let deadline = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session, self.isCurrent(session),
+                  let fallback = session.cleanupFallbackText else { return }
+            session.activeTask?.cancel()
+            self.completeCleanup(session, result: .init(text: fallback, succeeded: false))
+        }
+        session.cleanupDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + cleanupTimeout, execute: deadline)
         session.activeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             session.trace?.record(.cleanupStarted)
@@ -664,22 +679,29 @@ final class DictationSessionPipeline {
                 }
             }
             guard isCurrent(session) else { return }
-            session.diagnostics?.record(.init(stage: "cleanupOutput", text: result.text,
-                                              status: result.succeeded ? "success" : "fallback"))
-            session.trace?.record(.cleanupFinished, status: Task.isCancelled ? .cancelled : (result.succeeded ? .success : .fallback))
-            guard isCurrent(session) else { return }
-            session.activeTask = nil
-            complete(
-                session,
-                with: .finalTranscript(generation: session.generation, text: result.text)
-            )
+            completeCleanup(session, result: result)
         }
+    }
+
+    private func completeCleanup(_ session: Session, result: TranscriptCleanupResult) {
+        guard isCurrent(session), session.cleanupFallbackText != nil else { return }
+        session.cleanupDeadline?.cancel()
+        session.cleanupDeadline = nil
+        session.cleanupFallbackText = nil
+        session.activeTask = nil
+        session.activeTaskIsCleanup = false
+        session.diagnostics?.record(.init(stage: "cleanupOutput", text: result.text,
+                                          status: result.succeeded ? "success" : "fallback"))
+        session.trace?.record(.cleanupFinished, status: result.succeeded ? .success : .fallback)
+        complete(session, with: .finalTranscript(generation: session.generation, text: result.text))
     }
 
     private func complete(_ session: Session, with outcome: DictationSessionOutcome) {
         guard isCurrent(session) else { return }
         session.releaseTimeout?.cancel()
         session.releaseTimeout = nil
+        session.cleanupDeadline?.cancel()
+        session.cleanupDeadline = nil
         let status: DictationTrace.Status
         switch outcome {
         case .finalTranscript: status = .success
@@ -777,6 +799,11 @@ final class DictationSessionPipeline {
         let work = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session, self.isCurrent(session) else { return }
             session.releaseTimeout = nil
+            if let fallback = session.cleanupFallbackText {
+                session.activeTask?.cancel()
+                self.completeCleanup(session, result: .init(text: fallback, succeeded: false))
+                return
+            }
             session.trace?.record(.cancellationRequested)
             session.previewTask?.cancel()
             session.previewTask = nil
