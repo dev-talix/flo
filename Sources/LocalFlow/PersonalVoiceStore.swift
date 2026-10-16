@@ -154,10 +154,10 @@ final class PersonalVoiceStore: @unchecked Sendable {
             guard fm.fileExists(atPath: self.diagnosticsFolder.path) else { return 0 }
             let sources = try fm.contentsOfDirectory(at: self.diagnosticsFolder, includingPropertiesForKeys: [.isSymbolicLinkKey])
             var imported = 0
+            var capacityExceeded = false
             for source in sources.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 guard let id = UUID(uuidString: source.lastPathComponent),
-                      try source.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true,
-                      !fm.fileExists(atPath: self.directory(id).path) else { continue }
+                      try source.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { continue }
                 let original = source.appendingPathComponent("original.wav")
                 guard fm.fileExists(atPath: original.path) else { continue }
                 let metadata = try self.decoder().decode(DictationDiagnosticStore.Metadata.self,
@@ -166,23 +166,57 @@ final class PersonalVoiceStore: @unchecked Sendable {
                 var clip = Clip(id: id, createdAt: metadata.startedAt, metadata: metadata)
                 let eventsURL = source.appendingPathComponent("events.jsonl")
                 var captureComplete = false
+                var rawTranscript: String?
+                var finalTranscript: String?
                 if let events = try? Data(contentsOf: eventsURL) {
-                    for line in events.split(separator: 0x0a) {
+                    // Ignore an in-flight or interrupted trailing write until its newline arrives.
+                    for line in events.split(separator: 0x0a, omittingEmptySubsequences: false).dropLast() {
                         guard let event = try? self.decoder().decode(DictationDiagnosticStore.Event.self, from: Data(line)) else { continue }
                         if event.stage == "capture" { captureComplete = true }
-                        if event.stage == "assembledTranscript" { clip.rawTranscript = event.text ?? "" }
-                        if event.stage == "finalTranscript" { clip.finalTranscript = event.text }
+                        if event.stage == "assembledTranscript", let text = event.text { rawTranscript = text }
+                        if event.stage == "finalTranscript", let text = event.text { finalTranscript = text }
                     }
                 }
                 // Capture is recorded on the diagnostic queue after the WAV closes.
+                // Interrupted traces remain reviewable; later imports reconcile automatic stages.
                 guard captureComplete else { continue }
+                let destinationAttributes: [FileAttributeKey: Any]?
+                do {
+                    destinationAttributes = try fm.attributesOfItem(atPath: self.directory(id).path)
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                    destinationAttributes = nil
+                }
+                if let destinationAttributes {
+                    // Match archive enumeration: only real managed directories can reconcile.
+                    // Attributes inspect the link itself, including dangling links.
+                    guard destinationAttributes[.type] as? FileAttributeType == .typeDirectory else { continue }
+                    let existing = try self.readClip(self.directory(id))
+                    if rawTranscript.map({ $0 != existing.rawTranscript }) == true ||
+                        finalTranscript.map({ $0 != existing.finalTranscript }) == true {
+                        try self.update(id) {
+                            if let rawTranscript { $0.rawTranscript = rawTranscript }
+                            if let finalTranscript { $0.finalTranscript = finalTranscript }
+                        }
+                    }
+                    // Preserve audio, reviewed text, approval, and all other existing fields.
+                    continue
+                }
+                guard !capacityExceeded else { continue }
+                clip.rawTranscript = rawTranscript ?? ""
+                clip.finalTranscript = finalTranscript
                 let audio = try AVAudioFile(forReading: original)
                 guard audio.length > 0 else { continue }
                 clip.duration = Double(audio.length) / audio.fileFormat.sampleRate
                 clip.sampleRate = audio.fileFormat.sampleRate
                 let metadataData = try self.encoder().encode(clip)
                 let bytes = try original.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                try self.checkCapacity(additional: Int64(bytes + metadataData.count))
+                do {
+                    try self.checkCapacity(additional: Int64(bytes + metadataData.count))
+                } catch ArchiveError.full {
+                    // Stop admitting audio, but finish existing clips before reporting full.
+                    capacityExceeded = true
+                    continue
+                }
                 let staging = self.root.appendingPathComponent(".pending-\(UUID().uuidString)", isDirectory: true)
                 try self.createDirectory(staging)
                 defer { try? fm.removeItem(at: staging) }
@@ -193,6 +227,7 @@ final class PersonalVoiceStore: @unchecked Sendable {
                 try fm.moveItem(at: staging, to: self.directory(id))
                 imported += 1
             }
+            if capacityExceeded { throw ArchiveError.full }
             return imported
         }
     }

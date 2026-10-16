@@ -38,35 +38,10 @@ enum DiagLog {
     /// Trim on launch so the log can't grow without bound.
     static func startSession(afterRecovery: () -> Void = {}) {
         queue.sync {
-            if archivesHistory {
-                do {
-                    try DiagnosticsArchive.current.recover(log: fileURL, recordings: DiagnosticsArchive.current.directory
-                        .deletingLastPathComponent().appendingPathComponent("DiagnosticRecordings"))
-                } catch {
-                    archiveFailed = true
-                    NSLog("LocalFlow: timing history recovery failed: %@", String(describing: type(of: error)))
-                }
-            }
-            // Older builds logged transcript content. Purge that legacy file
-            // once so upgrading also removes text already written to disk.
-            let defaults = UserDefaults.standard
-            if defaults.integer(forKey: privacyLogVersionKey) < currentPrivacyLogVersion {
-                let manager = FileManager.default
-                if manager.fileExists(atPath: path) {
-                    try? manager.removeItem(atPath: path)
-                }
-                if !manager.fileExists(atPath: path) {
-                    defaults.set(currentPrivacyLogVersion, forKey: privacyLogVersionKey)
-                }
-            }
-
-            let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-            if let size = attrs?[.size] as? Int, size > 5_000_000, !archiveFailed {
-                try? FileManager.default.removeItem(atPath: path)
-            }
+            archiveFailed = !startSession(archive: archivesHistory ? .current : nil,
+                                          log: fileURL, defaults: .standard, afterRecovery: afterRecovery)
             write("=== LocalFlow session start (pid \(ProcessInfo.processInfo.processIdentifier)) ===")
             write(sessionEnvironment)
-            if !archiveFailed { afterRecovery() }
             if archivesHistory, maintenance == nil, DiagnosticsArchive.current.retentionDays != nil {
                 let timer = DispatchSource.makeTimerSource(queue: queue)
                 timer.schedule(deadline: .now() + 3600, repeating: 3600)
@@ -78,6 +53,38 @@ enum DiagLog {
                 timer.resume()
             }
         }
+    }
+
+    /// Recovery must be attempted before recording expiry, but failure cannot disable expiry.
+    /// Explicit storage dependencies also let tests exercise legacy recovery without user files.
+    @discardableResult
+    static func startSession(archive: DiagnosticsArchive?, log: URL, defaults: UserDefaults,
+                             afterRecovery: () -> Void) -> Bool {
+        var recovered = true
+        if let archive {
+            do {
+                try archive.recover(log: log, recordings: archive.directory
+                    .deletingLastPathComponent().appendingPathComponent("DiagnosticRecordings"))
+            } catch {
+                recovered = false
+                NSLog("LocalFlow: timing history recovery failed: %@", String(describing: type(of: error)))
+            }
+        }
+        if recovered {
+            // Older logs contain transcript content. Remove them only after ingest succeeds.
+            let manager = FileManager.default
+            if defaults.integer(forKey: privacyLogVersionKey) < currentPrivacyLogVersion {
+                if manager.fileExists(atPath: log.path) { try? manager.removeItem(at: log) }
+                if !manager.fileExists(atPath: log.path) {
+                    defaults.set(currentPrivacyLogVersion, forKey: privacyLogVersionKey)
+                }
+            }
+            let attrs = try? manager.attributesOfItem(atPath: log.path)
+            if let size = attrs?[.size] as? Int, size > 5_000_000 { try? manager.removeItem(at: log) }
+        }
+        // This callback starts independent retained-audio maintenance after the attempt.
+        afterRecovery()
+        return recovered
     }
 
     /// NSLog-compatible signature so existing call sites convert mechanically.
