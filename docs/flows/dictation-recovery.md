@@ -505,3 +505,11 @@ not a measured speedup. See [E4 WAV verification](diagnostic-recordings.md#e4-bo
 Stack integration retains bounded-preview continuity using absolute sample
 offsets. The continuity regression now feeds ranges selected by the capture
 policy, including preview-only ticks after the window advances.
+E4 integration passed `swift test --disable-automatic-resolution`: 398 tests,
+zero failures, one optional HUD render skip. Evidence:
+`/tmp/flo-capture-stack-e4-debug-final.log` (exit 0). The first assembled run
+failed one input-size expectation that assumed the old rolling window. The
+repaired preview decodes one new second after freezing its full window; the
+assertion now checks that input. Earlier displayed words are covered by the
+continuity regression. Initial evidence: `/tmp/flo-capture-stack-e4-debug.log`
+(exit 1). Live capture and measured performance remain unverified.

@@ -58,7 +58,7 @@ final class DictationSessionPipelineTests: XCTestCase {
         pipeline.processIncrementalSnapshot(generation: 101, samples: [Float](repeating: 0.3, count: rate * 15),
                                             sampleOffset: rate * 16)
         expectTrue(await waitForCall(.preview, generation: 101, in: transcriber, minimumCount: 2))
-        expectEqual(await transcriber.sampleCounts(.preview, generation: 101), [rate * 15, rate * 15])
+        expectEqual(await transcriber.sampleCounts(.preview, generation: 101), [rate * 15, rate])
         pipeline.cancel(generation: 101)
         expectTrue(await transcriber.succeed("ignored", segment: .preview, generation: 101))
         XCTAssertNil(pipeline.incrementalSnapshotRange(generation: 101))
