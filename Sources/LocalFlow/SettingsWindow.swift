@@ -644,7 +644,13 @@ struct SettingsView: View {
     private var cleanupPane: some View {
         Form {
             Section {
-                Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
+                Picker("Dictation finish", selection: $model.cleanupEnabled) {
+                    Text("Fast").tag(false)
+                    Text("Polished").tag(true)
+                }
+                Text(cleanupLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
                     Label {
                         Text("Ollama isn't running — raw transcripts will be pasted until it's back.")
@@ -657,7 +663,7 @@ struct SettingsView: View {
             } header: {
                 Text("Transcript cleanup")
             } footer: {
-                Text("Turn off for fast dictation. Corrections, snippets, and voice formatting still apply. With cleanup on, slow responses fall back to the recognized text.")
+                Text("Fast skips model cleanup. Polished cleans up the recognized text. Both apply corrections, snippets, and voice formatting. Slow cleanup falls back to the recognized text.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

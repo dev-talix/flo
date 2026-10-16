@@ -502,8 +502,9 @@ git diff --check
 Owner: Flo maintainers. The October 15, 2026 efficiency request includes a
 separate cleanup budget and an explicit fast path. Recognition and deterministic
 corrections, voice formatting, and snippets still run before optional cleanup.
-The existing cleanup switch is the fast-path preference; its Settings help now
-explains that turning it off skips text-model processing.
+Settings offers Fast and Polished choices using the existing cleanup preference.
+Fast skips text-model processing; Polished enables it. Existing saved choices
+keep the same behavior, and the model's availability still selects the backend.
 
 `DictationSessionPipeline.finalize` retains the composed transcript and gives
 cleanup three seconds. The cleanup deadline returns that transcript without
@@ -527,3 +528,9 @@ delivery, diagnostics, and stall checks passed 53 tests. Evidence is
 `/tmp/flo-e3-cleanup-` prefix. Base is preview commit `47f1bb9` plus this change.
 Live model cleanup, rendered Settings help, microphone input, and target-app
 insertion were NOT RUN. No new settings key or public model policy was added.
+
+The explicit Fast/Polished picker was compiled and checked with
+`swift test --disable-automatic-resolution --filter 'DictationCleanupDeadlineTests|SettingsPaneTests'`,
+six cleanup tests passed, exit 0. There is no `SettingsPaneTests` class in this
+checkout, so that filter added no UI test coverage. Evidence:
+`/tmp/flo-e3-explicit-modes.log`. Rendered Settings interaction remains NOT RUN.
