@@ -135,3 +135,33 @@ including the existing local theme-icon edit, and reports its base revision with
 a modified-tree flag. The commit excludes that unrelated edit and `.claude`.
 No microphone dictation or target-app insertion was performed during installation;
 the next live recording remains the end-to-end archive check.
+
+## E4: bounded retained WAV buffers
+
+Requirement source: authorized efficiency report item E4. Owner: Flo maintainers.
+`RetainedAudioFile.writePCM` allocates one Float32 mono PCM buffer capped at
+16,384 frames, or 64 KiB, and reuses it for exact frame writes. The final partial
+write sets its own `frameLength`, so stale buffer contents cannot become extra
+audio. Sample rates and Float32 values are unchanged. Empty input publishes a
+readable zero-frame WAV without allocating a PCM buffer.
+
+The shared diagnostic and personal-voice writer still creates a private 0600
+sibling staging file, closes and finalizes its header, then atomically moves or
+replaces the destination. Input and file errors throw; the existing defer removes
+staging on failure. Retention callers keep their existing error handling.
+
+`Tests/LocalFlowTests/RetainedAudioFileTests.swift` checks exact 16 kHz and 48 kHz
+round-trips over three full buffers plus 137 frames, replacement, permissions,
+empty input, and every sample of a 310-second synthetic 48 kHz recording plus a
+seven-frame tail. It also checks invalid rates preserving an existing file,
+failure under a missing parent, and failed publication without leftover staging.
+The integration selection exercises original retention, diagnostic failure,
+personal voice, retry, and quiet-tail contracts.
+
+PASS: five writer tests in `/tmp/flo-e4-focused.log` and 147 integration tests in
+`/tmp/flo-e4-integration.log`, with zero failures and command exit 0. Exact
+commands, environment, verified base/diff, and final release results are in
+[E4 capture verification](dictation-recovery.md#e4-bounded-capture-snapshots).
+Disk-full and mid-write device failures were NOT RUN; AVAudioFile write errors
+still propagate through the existing throwing call. No user recordings or model
+downloads were used. Runtime speedup and peak process memory were not measured.

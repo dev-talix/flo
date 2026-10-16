@@ -110,12 +110,12 @@ final class DictationDelivery {
         return generation
     }
 
-    func wantsIncrementalSnapshot(generation: Int) -> Bool {
-        pipeline.wantsIncrementalSnapshot(generation: generation)
+    func incrementalSnapshotRange(generation: Int) -> ((Int) -> Range<Int>)? {
+        pipeline.incrementalSnapshotRange(generation: generation)
     }
 
-    func processIncrementalSnapshot(generation: Int, samples: [Float]) {
-        pipeline.processIncrementalSnapshot(generation: generation, samples: samples)
+    func processIncrementalSnapshot(generation: Int, samples: [Float], sampleOffset: Int = 0) {
+        pipeline.processIncrementalSnapshot(generation: generation, samples: samples, sampleOffset: sampleOffset)
     }
 
     func release(generation: Int, samples: [Float], nativeAudio: NativeAudioRecording? = nil,

@@ -31,6 +31,13 @@ final class AudioRecorder {
         let startError: Error?
     }
 
+    struct Snapshot {
+        let samples: [Float]
+        let sampleOffset: Int
+
+        var endIndex: Int { sampleOffset + samples.count }
+    }
+
     static let sampleRate: Double = 16_000
 
     /// RMS energy of a capture in dBFS (0 = full scale); -infinity for
@@ -59,6 +66,11 @@ final class AudioRecorder {
 
     /// 20 ms analysis frames.
     private static let voiceFrameSamples = Int(sampleRate * 0.02)
+
+    /// Keep the original analysis frame alignment when omitting committed audio.
+    static func incrementalAnalysisStart(after committedEnd: Int) -> Int {
+        committedEnd / voiceFrameSamples * voiceFrameSamples
+    }
 
     /// Frame-level voice metrics: seconds of 20ms frames whose RMS beats
     /// `floorDBFS`, and the RMS level over just those frames. Whole-capture
@@ -370,16 +382,29 @@ final class AudioRecorder {
         }
     }
 
-    /// Takes an immutable copy without interrupting capture. The control and
+    /// Takes a detached immutable range without interrupting capture. The control and
     /// sample queues are drained in the same order as stop(), so callers see
-    /// every converted buffer that arrived before their request.
-    func snapshot(completion: @escaping ([Float]) -> Void) {
+    /// converted buffers queued before the drain. The range selector receives
+    /// the drained sample count off main and must only use captured values.
+    func snapshot(
+        range: @escaping (Int) -> Range<Int> = { 0..<$0 },
+        completion: @escaping (Snapshot) -> Void
+    ) {
         controlQueue.async {
             self.sampleQueue.sync {}
             self.lock.lock()
-            let captured = self.recordingActive ? self.samples : []
+            let count = self.recordingActive ? self.samples.count : 0
+            let requested = range(count)
+            let start = min(count, max(0, requested.lowerBound))
+            let end = min(count, max(start, requested.upperBound))
+            // Copy through a pointer even for a full range. Sharing the array or
+            // an ArraySlice would make the next capture append copy its storage.
+            let captured = self.samples.withUnsafeBufferPointer {
+                Array(UnsafeBufferPointer(rebasing: $0[start..<end]))
+            }
             self.lock.unlock()
-            DispatchQueue.main.async { completion(captured) }
+            let snapshot = Snapshot(samples: captured, sampleOffset: start)
+            DispatchQueue.main.async { completion(snapshot) }
         }
     }
 

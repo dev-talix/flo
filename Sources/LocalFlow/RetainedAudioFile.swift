@@ -22,10 +22,18 @@ enum RetainedAudioFile {
         }
         let file = try AVAudioFile(forWriting: url, settings: format.settings)
         guard !samples.isEmpty else { return }
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
+        let capacity = min(samples.count, 16_384)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(capacity)),
               let channel = buffer.floatChannelData?[0] else { throw CocoaError(.fileWriteUnknown) }
-        buffer.frameLength = AVAudioFrameCount(samples.count)
-        samples.withUnsafeBufferPointer { channel.update(from: $0.baseAddress!, count: samples.count) }
-        try file.write(from: buffer)
+        try samples.withUnsafeBufferPointer { source in
+            var offset = 0
+            while offset < source.count {
+                let count = min(capacity, source.count - offset)
+                channel.update(from: source.baseAddress!.advanced(by: offset), count: count)
+                buffer.frameLength = AVAudioFrameCount(count)
+                try file.write(from: buffer)
+                offset += count
+            }
+        }
     }
 }
