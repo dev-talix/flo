@@ -809,7 +809,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Both startup and terminal stream failures consume the press's UI
     /// generation once, including failure racing a queued release handoff.
-    /// Recorder cleanup is complete; no unscoped stop may reach a newer hold.
+    /// Recorder state is invalidated; hardware teardown may still be pending.
+    /// No unscoped stop may reach a newer hold.
     private func handleCaptureFailure(
         _ error: Error, generation: Int, dictationGeneration: Int?, summary: String
     ) {

@@ -354,7 +354,8 @@ final class AudioRecorder {
     /// AUDIBLE audio. Neither session start nor buffer arrival means the
     /// mic is hearing — AirPods stream digital zeros for seconds while
     /// their mic path spins up. Runtime failure runs once on the control
-    /// queue after terminal cleanup and identifies this start and its session.
+    /// queue after state invalidation, before hardware teardown, and identifies
+    /// this start and its session.
     func start(
         recordingID: UUID = UUID(), trace: DictationTrace? = nil,
         retainNativeAudio: Bool = false, onCaptureLive: (() -> Void)? = nil,
@@ -724,7 +725,8 @@ final class AudioRecorder {
     }
 
     /// The control queue owns terminal failure. Invalidate recording and
-    /// sample callbacks atomically before hardware teardown can block.
+    /// sample callbacks atomically, then notify the caller so it can reject
+    /// in-flight inference before hardware teardown can block.
     private func failRecording(_ error: Error, recordingID: UUID, notify: Bool = true) {
         lock.lock()
         guard self.recordingID == recordingID, recordingActive else {
@@ -752,10 +754,10 @@ final class AudioRecorder {
         startError = error
         warmTeardown?.cancel()
         warmTeardown = nil
-        tearDownSession()
         failedTrace?.record(.captureFailed)
         DiagLog.log("capture terminal failure: %@", error.localizedDescription)
         callback?(failure)
+        tearDownSession()
     }
 
     /// Starts capture on the preferred mic; if that fails (a device
