@@ -729,3 +729,90 @@ engines, delivery, and history callbacks. Existing compiler warnings in
 untouched diagnostic, injection, and startup-test code remain. The parent
 integration owner must assemble the stack and perform any authorized runtime
 validation. This task creates local commits only.
+
+## R1 command follow-up: caller-owned speech abandonment, October 16, 2026
+
+Owner: Flo maintainers and the parent R1 integration agent. Requirement source:
+the authorized PR #50 follow-up brief, extending R1 to command-mode speech.
+Base: `9094828c8efcecdf5c655575aaa43816ae89c574` on local
+`pr/r1-abandoned-inference-recovery`. This is one additional local R1 commit.
+R2's compiled boundary-test pattern was inspected at `f6d302f`; none of its
+implementation was copied or cherry-picked. R3/R4, target selection, live
+capture, clipboard access, installation, publishing, and model changes are
+outside this follow-up.
+
+Intended behavior and observed path:
+
+- `AppDelegate.process(asCommand: true)` creates a `TranscriptionLifetime`,
+  stores it by command sequence, captures it in the task, and passes it into
+  the existing `Transcriber.transcribe(samples:lowEnergy:lifetime:)` call.
+  This replaces the speech-phase set with the existing lifetime type.
+- Escape skips the pending command through `completeCommand`, invalidating
+  and removing its lifetime before dropping the task handle. Speech stays
+  uncancelled, and a suspended call retains its invalidated lifetime. The
+  existing Transcriber owns the 90-second grace and quarantine. No caller
+  timer or scheduler was added. A queued request instead leaves the real gate.
+- The speech-call defer removes ownership and invalidates the lifetime after
+  Transcriber has detached its observer. Normal completion, empty output,
+  no-speech, and errors therefore do not start abandonment after inference.
+- The delivery timeout removes pending identity before invoking
+  `AppDelegate.cancelCommand`. That method invalidates the lifetime and
+  explicitly cancels the task, retaining immediate quarantine for active
+  speech. After speech finishes, Escape and timeout still cancel text-model
+  work. Existing pending-sequence checks reject late speech, selection, and
+  text-model results before follow-on work or delivery.
+- Discarding a held command has no speech lifetime yet. The existing discard
+  path stops capture without starting command recognition.
+
+`Tests/CommandAbandonmentBoundaryTests.py` compiles the actual AppDelegate
+stored ownership declarations and seven methods, plus the actual
+`TranscriptionLifetime` and `TranscriptionGate`. UI, capture, selection access,
+speech, text models, and delivery side effects are inert dependencies. Its
+13 cases exercise suspended Escape and skip, queued removal, Escape before
+task execution, speech timeout, normal completion and gate reuse, text-model
+Escape and timeout, late selection, empty/no-speech/error completion, and held
+discard. The fake speech backend deliberately returns late text so caller
+identity guards must prevent further selection access, model work, or delivery.
+The suspended case checks the weakly observed lifetime remains invalidated
+after all caller task handles are removed. Every case checks speech ownership
+is released. CI's existing Test step runs the documented Python command.
+
+The boundary harness proves caller wiring and the real gate/lifetime contract;
+it does not itself implement or measure model quarantine. Existing real
+Transcriber cases in `DictationSessionStallTests` and
+`PreviewInferenceBudgetTests` verify injected grace expiry, replacement,
+queued removal, warm reuse, and explicit interruption. They passed alongside
+the new caller checks. The live default remains 90 seconds; tests use the
+existing injected backend and deadline seams.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1-command` and the unchanged lockfile. Evidence identifies the base
+above plus `/tmp/flo-r1-command-final.diff`; the handoff names the resulting
+local commit. Executed commands and results:
+
+```sh
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'
+python3 -B Tests/CommandAbandonmentBoundaryTests.py CommandAbandonmentBoundaryTests.test_escape_retains_invalidated_suspended_speech_without_task_cancellation
+python3 -B Tests/CommandAbandonmentBoundaryTests.py
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'
+git diff --check
+git diff --cached --check
+```
+
+- PASS, exit 0: baseline, 41 tests. `/tmp/flo-r1-command-baseline.log`.
+- RED, exit 1: one caller test against the unfixed AppDelegate. The compiled
+  case failed with `actual command caller must pass a speech lifetime`.
+  `/tmp/flo-r1-command-boundary-red.log`.
+- PASS, exit 0: final boundary suite, 13 tests, no skips.
+  `/tmp/flo-r1-command-boundary.log`.
+- PASS, exit 0: focused Swift suite, 124 tests, zero failures, no skips.
+  `/tmp/flo-r1-command-focused.log`. This also compiles the actual application.
+- PASS, exit 0: unstaged and staged diff checks.
+  `/tmp/flo-r1-command-diff-check.log`.
+
+NOT RUN: full Swift suite, real-model inference, live app, microphone,
+clipboard, system Accessibility, installation, packaging, or remote CI.
+The focused tests use fake engines and inert delivery callbacks. No new
+production abstraction, dependency, timer, or scheduler was introduced;
+command speech reuses R1's lifetime, gate, grace, and quarantine mechanisms.
+The parent agent owns integration into PR #50 and any later live acceptance.
