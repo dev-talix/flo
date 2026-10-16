@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.12.0](https://github.com/dev-talix/flo/compare/v1.11.1...v1.12.0) (2026-10-16)
+
+### Features
+
+* Choose Fast dictation to skip model cleanup, or Polished to clean up recognized prose. ([#48](https://github.com/dev-talix/flo/pull/48))
+* Enable Literal formatting to keep spoken formatting commands and ordinal phrases as text. ([#54](https://github.com/dev-talix/flo/pull/54))
+
+### Fixes
+
+* Show live previews during continuous speech and preserve newer displayed words as chunks finish. ([#46](https://github.com/dev-talix/flo/pull/46), [#49](https://github.com/dev-talix/flo/pull/49))
+* Preserve saved snippets exactly in Fast and Polished, including whitespace, line breaks, tabs, and literal backslashes. ([#54](https://github.com/dev-talix/flo/pull/54))
+* Restore editing shortcuts in Settings and provide clearly labeled fields with a multiline snippet editor. ([#58](https://github.com/dev-talix/flo/pull/58))
+* Recover from stalled or abandoned recognition after Escape and reject late results from cancelled sessions. ([#50](https://github.com/dev-talix/flo/pull/50))
+* Detect microphone stream failures, discard failed captures, and prevent stale results from reaching delivery. ([#55](https://github.com/dev-talix/flo/pull/55))
+* Pace queued pastes around clipboard reads and reject command replacements when the original target or selection changes. ([#53](https://github.com/dev-talix/flo/pull/53))
+* Identify installed apps by bundle and request normal Quit during installation. ([#52](https://github.com/dev-talix/flo/pull/52))
+* Keep retained-recording expiry working after recovery failures and refresh imported transcript stages while preserving review edits. ([#57](https://github.com/dev-talix/flo/pull/57))
+
+### Performance
+
+* Reuse prepared audio and bound preview inference, optional cleanup, capture snapshots, and retained audio buffers. ([#47](https://github.com/dev-talix/flo/pull/47), [#48](https://github.com/dev-talix/flo/pull/48), [#49](https://github.com/dev-talix/flo/pull/49), [#51](https://github.com/dev-talix/flo/pull/51))
+* Skip idle audio analysis and unused spectrum work. ([#56](https://github.com/dev-talix/flo/pull/56))
+* Reduce repeated archive scans and diagnostic encoding during recording. ([#56](https://github.com/dev-talix/flo/pull/56))
+
 ## [1.11.1](https://github.com/dev-talix/flo/compare/v1.10.0...v1.11.1) (2026-10-10)
 
 
