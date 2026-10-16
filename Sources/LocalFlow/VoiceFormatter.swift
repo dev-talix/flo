@@ -62,11 +62,12 @@ enum TranscriptCorrections {
 enum Snippets {
     enum Part {
         case transcript(String)
-        case verbatim(String)
+        // Retain the consumed original range for formatting context only.
+        case verbatim(String, source: String)
 
         var text: String {
             switch self {
-            case .transcript(let text), .verbatim(let text): return text
+            case .transcript(let text), .verbatim(let text, _): return text
             }
         }
     }
@@ -104,7 +105,7 @@ enum Snippets {
             if match.range.location > cursor {
                 parts.append(.transcript(ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))))
             }
-            parts.append(.verbatim(match.expansion))
+            parts.append(.verbatim(match.expansion, source: ns.substring(with: match.range)))
             cursor = NSMaxRange(match.range)
         }
         if cursor < ns.length { parts.append(.transcript(ns.substring(from: cursor))) }
@@ -168,31 +169,30 @@ enum VoiceFormatter {
     }()
 
     static func apply(_ text: String) -> String {
-        var listMode: ListMode?
-        var capitalizeNext = false
-        return autoNumberLists(applyCommands(text, preceding: "", listMode: &listMode, capitalizeNext: &capitalizeNext))
+        apply([.transcript(text)]).map(\.text).joined()
     }
 
-    /// Keep explicit list and break commands working across opaque snippets.
-    /// Automatic ordinal lists are recognized within each prose span only.
+    /// Keep command state across snippets, then detect ordinal runs using the
+    /// matched source for context and distance. Saved bytes are never parsed.
     static func apply(_ parts: [Snippets.Part]) -> [Snippets.Part] {
         var preceding = ""
         var listMode: ListMode?
         var capitalizeNext = false
-        return parts.map { part in
+        let commanded = parts.map { part in
             switch part {
-            case .verbatim(let text):
+            case .verbatim(let text, _):
                 preceding += text
                 capitalizeNext = false
                 return part
             case .transcript(let text):
-                let formatted = autoNumberLists(applyCommands(
+                let formatted = applyCommands(
                     text, preceding: preceding, listMode: &listMode, capitalizeNext: &capitalizeNext
-                ))
+                )
                 preceding += formatted
                 return .transcript(formatted)
             }
         }
+        return autoNumberLists(commanded)
     }
 
     private static func applyCommands(
@@ -295,9 +295,31 @@ enum VoiceFormatter {
     }
 
     static func autoNumberLists(_ text: String) -> String {
-        let ns = text as NSString
-        let matches = ordinalCueRegex.matches(in: text, range: NSRange(location: 0, length: ns.length))
-        guard matches.count >= 2 else { return text }
+        autoNumberLists([.transcript(text)]).map(\.text).joined()
+    }
+
+    private static func autoNumberLists(_ parts: [Snippets.Part]) -> [Snippets.Part] {
+        // Source text supplies consumed punctuation and trigger length without
+        // placing expansions or placeholder tokens in the parser's input.
+        var source = ""
+        var protectedRanges: [NSRange] = []
+        for part in parts {
+            switch part {
+            case .transcript(let text): source += text
+            case .verbatim(_, let matchedSource):
+                protectedRanges.append(NSRange(location: source.utf16.count, length: matchedSource.utf16.count))
+                source += matchedSource
+            }
+        }
+        let ns = source as NSString
+        let matches = ordinalCueRegex.matches(in: source, range: NSRange(location: 0, length: ns.length)).filter { match in
+            // A separator may include a snippet's consumed period, but the
+            // ordinal and its comma/colon must belong entirely to prose.
+            let prefixEnd = NSMaxRange(match.range(at: 1))
+            let cue = NSRange(location: prefixEnd, length: NSMaxRange(match.range) - prefixEnd)
+            return !protectedRanges.contains { NSIntersectionRange($0, cue).length > 0 }
+        }
+        guard matches.count >= 2 else { return parts }
 
         // First pass: find ascending runs starting at 1; only they convert.
         // Consecutive cues must also be CLOSE: "First, I joined Acme."
@@ -338,27 +360,46 @@ enum VoiceFormatter {
             previousCueEnd = match.range.location + match.range.length
         }
         commitRun()
-        guard !itemNumber.isEmpty else { return text }
+        guard !itemNumber.isEmpty else { return parts }
 
-        // Second pass: rewrite each converted cue as "\nN. ", keeping the
-        // sentence punctuation that preceded it.
-        var output = ""
-        var cursor = 0
+        // Rewrite only prose ranges. A consumed source separator can establish
+        // a sentence boundary without being restored into the saved expansion.
+        var preceding = ""
+        var sourceOffset = 0
         var capitalizeNext = false
-        for (i, match) in matches.enumerated() {
-            guard let number = itemNumber[i] else { continue }
-            let between = ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
-            appendText(between, to: &output, capitalizeNext: &capitalizeNext)
-            cursor = match.range.location + match.range.length
-            let prefix = ns.substring(with: match.range(at: 1))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            output += prefix
-            ensureTrailingNewlines(1, in: &output)
-            output += "\(number). "
-            capitalizeNext = true
+        return parts.map { part in
+            switch part {
+            case .verbatim(let text, let matchedSource):
+                sourceOffset += matchedSource.utf16.count
+                preceding += text
+                capitalizeNext = false
+                return part
+            case .transcript(let text):
+                let span = NSRange(location: sourceOffset, length: text.utf16.count)
+                var output = ""
+                var cursor = span.location
+                for (i, match) in matches.enumerated() {
+                    guard let number = itemNumber[i],
+                          NSLocationInRange(match.range(at: 2).location, span) else { continue }
+                    let start = max(span.location, match.range.location)
+                    appendText(ns.substring(with: NSRange(location: cursor, length: start - cursor)),
+                               to: &output, capitalizeNext: &capitalizeNext, preceding: preceding)
+                    let prefix = NSIntersectionRange(match.range(at: 1), span)
+                    if prefix.length > 0 {
+                        output += ns.substring(with: prefix).trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                    ensureTrailingNewlines(1, in: &output, preceding: preceding)
+                    output += "\(number). "
+                    capitalizeNext = true
+                    cursor = NSMaxRange(match.range)
+                }
+                appendText(ns.substring(with: NSRange(location: cursor, length: NSMaxRange(span) - cursor)),
+                           to: &output, capitalizeNext: &capitalizeNext, preceding: preceding)
+                sourceOffset = NSMaxRange(span)
+                preceding += output
+                return .transcript(output)
+            }
         }
-        appendText(ns.substring(from: cursor), to: &output, capitalizeNext: &capitalizeNext)
-        return output
     }
 
     /// Appends plain transcript text, sentence-casing the first word after a

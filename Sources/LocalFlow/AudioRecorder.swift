@@ -393,20 +393,19 @@ final class AudioRecorder {
         stopTrace?.record(.stopEnqueued)
         controlQueue.async {
             stopTrace?.record(.stopStarted)
-            // Include conversion queued before release, then validate and
-            // detach under one lock. A timer need not win the release race.
-            self.sampleQueue.sync {}
             let sessionRunning = self.session?.isRunning ?? false
-            let (captured, native, wasLive, warmWanted): ([Float], NativeAudioRecording?, Bool, Bool) = {
+            // Serialize validation and detachment with whole raw/converted
+            // callbacks, including callbacks arriving during session validation.
+            let (captured, native, wasLive, warmWanted, failure):
+                ([Float], NativeAudioRecording?, Bool, Bool, (UUID, Error)?) = self.sampleQueue.sync {
                 self.lock.lock()
+                defer { self.lock.unlock() }
                 if let recordingID = self.recordingID,
                    let error = self.captureFailureLocked() ??
                     (self.recordingActive && self.captureLive && !sessionRunning ? RecorderError.streamStopped : nil) {
-                    self.lock.unlock()
-                    self.failRecording(error, recordingID: recordingID)
-                    return ([], nil, false, false)
+                    self.runtimeFailed = true
+                    return ([], nil, false, false, (recordingID, error))
                 }
-                defer { self.lock.unlock() }
                 let captured = self.samples
                 let native = self.nativeAudio?.recording
                 self.samples = []
@@ -419,8 +418,13 @@ final class AudioRecorder {
                 self.onLiveCallback = nil
                 self.onRuntimeFailure = nil
                 self.trace = nil
-                return (captured, native, wasLive, warmWanted)
-            }()
+                return (captured, native, wasLive, warmWanted, nil)
+            }
+            // Session shutdown can drain sampleQueue. Never tear down from
+            // inside the queue whose callbacks it is waiting to finish.
+            if let (recordingID, error) = failure {
+                self.failRecording(error, recordingID: recordingID)
+            }
             let recording = Recording(samples: captured, nativeAudio: native, startError: self.startError)
             self.startError = nil
             stopTrace?.record(.audioDetached, fields: [.samples: Double(captured.count)])
