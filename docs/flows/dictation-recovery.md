@@ -949,3 +949,66 @@ selection-callback case is replaced by missing-target rejection because R3 no
 longer reads selection after recognition. All 13 caller cases pass, exit 0:
 `/tmp/flo-r1-r3-command-boundary-final.log`. The original ownership-only parent
 also passed 13 cases in `/tmp/flo-r1-command-stack-boundary.log`.
+
+## R3 repair: Reject focus changes during command target reads
+
+Owner: Flo maintainers; the parent task owns PR53 integration and R1 command
+lifetime. Requirement source: confirmed CS1 in
+`/Users/nikhlkapadia/Talix/flo-pr-work/review-r3-r4-result.json` and
+`verify-r3-focus-result.txt`. This repair starts at local
+`pr/r3-targeted-delivery`, `4110df96fbbc4042c341684d3a7d20d7b7332bba`, without
+changing its prerequisites.
+
+`TextInjector.captureCommandTarget` previously retained F1 while reading its
+range, selected text, and the app's focused window. Focus could move to F2
+during those reads while F1's attributes stayed valid. Validation then approved
+F1, allowing the untargeted paste to reach F2. Capture now rereads range and
+selected text, checks the focused window again, then checks the live focused
+element, frontmost app, and secure-input state before accepting. The existing
+`validateCommandTarget` capture and comparison path also gets these checks.
+The private `selectedRange` parser is shared by the two range reads. There is
+no retry loop, additional receipt, or new delivery boundary.
+
+Six new `TargetedDeliveryTests` use the existing injected reader. Its one-shot
+`CommandFocus.onRead` hook returns the sampled value while changing subsequent
+state. Cases move focus within one window or to another app during range,
+selected-text, and window reads. The app-switch case leaves the old app reporting
+F1. Delivery checks assert `.targetChanged`, zero clipboard writes, no paste or
+typing, retained output history, and released queue ownership. Further cases
+cover mixed selection/range capture, window and secure-input changes during
+reads, secure refusal without AX reads, and a stable target without an exposed
+window. Existing cases exercise unchanged selection/cursor delivery, failure,
+restoration, and receipt-based FIFO pacing.
+
+Checks ran on macOS 27.0.1, arm64, Apple Swift 6.4. The worktree's ignored
+`.build` was cloned from the existing delivery-stack cache. Automatic resolution
+and dependency updates were disabled. Evidence prefix:
+`/tmp/flo-r3-focus-snapshot-`; each test log has a matching `.exit` file.
+
+```sh
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests.testCaptureRejectsFocusChangeDuringAttributeReads|TargetedDeliveryTests.testDeliveryRejectsFocusChangeDuringAttributeReadsWithoutWritesOrEvents|TargetedDeliveryTests.testDeliveryRejectsWindowSelectionRangeOrSecureInputChangeDuringReads|TargetedDeliveryTests.testSecureCommandRefusesCaptureAndDeliveryWithoutAXOrClipboardWrites'
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+swift test -c release --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+git diff --check
+```
+
+- RED, exit 1 before the fix: four initial regression tests, 81 failed
+  assertions, no unexpected failures, `red.log`. The secure-refusal control
+  passed. The final fixture also adds mixed-capture and unexposed-window cases
+  and keeps the old app's F1 focused in the app-switch variant.
+- PASS, exit 0: final debug selection, 75 tests, zero failures or skips,
+  `final-debug.log`. An earlier selection passed 73 tests in `focused.log`.
+- PASS, exit 0: final release selection, 75 tests, zero failures or skips,
+  `final-release.log`.
+- PASS, exit 0: `git diff --check`, `diff-check.log`. The complete repair diff
+  against the pinned parent is `final.diff`; the local repair commit SHA is
+  returned in the implementation handoff. Existing concurrency/capture warnings
+  and the `--skip-update` deprecation warning remain in the build logs.
+
+The checks use the in-memory clipboard, local AX identity objects, fake readers,
+and stubbed event posting. Live app, microphone, system clipboard, real AX
+requests, network, full suite, installation, push, new PR, and merge were NOT
+RUN. Sampled AX reads cannot provide an atomic OS snapshot or atomic paste.
+Changes after the closing reads and changes that return to the same observable
+state can escape detection; dispatch still does not prove insertion. Live and
+assembled-stack acceptance remain with the parent and Flo maintainers.
