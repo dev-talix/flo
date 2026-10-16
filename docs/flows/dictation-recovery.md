@@ -513,3 +513,515 @@ repaired preview decodes one new second after freezing its full window; the
 assertion now checks that input. Earlier displayed words are covered by the
 continuity regression. Initial evidence: `/tmp/flo-capture-stack-e4-debug.log`
 (exit 1). Live capture and measured performance remain unverified.
+
+## E1: Prepare each released recording once
+
+Owner: Flo maintainers. The October 15, 2026 efficiency report E1 authorizes
+reusing full-recording preparation across delivery and the session pipeline.
+Base commit: `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Preview scheduling, snapshot ranges, cleanup budgets, model defaults, and
+decoder rules are outside this item.
+
+`DictationAudioPreparation` in `Sources/LocalFlow/DictationSessionPipeline.swift`
+now keeps immutable `originalSamples` alongside trimmed samples and the existing
+separate raw-window retry and trimmed admission metrics. `DictationDelivery.release`
+passes that preparation to `DictationSessionPipeline.release(generation:audio:tailSamples:)`.
+The raw-sample release overload remains available and retains capture before
+preparing it. `DictationReplay.run` reuses its admission preparation for releases
+across replay runs. Delivery still retains the original for manual retry and
+passes native audio to the first-save-wins recording retention path.
+
+Release reuses the full preparation for an unused tail when no chunk was
+submitted, when incremental recognition already failed, or when the derived
+tail is the whole original. `nextChunkIndex` tracks submitted chunks, including
+queued work and the first in-flight chunk while `chunkCount` is still zero.
+Release waits for that work and derives a separate tail from original sample
+indices. Trace sample counts still describe the raw recording and tail.
+Successful chunks keep nonzero quiet endings eligible; failed chunks use the
+prepared full recording for the existing single recovery attempt.
+
+Acceptance coverage uses synthetic samples and temporary retention folders:
+
+- `DictationAudioPreparationTests.testPreparedReleaseKeepsOriginalSamplesAndHalfFrameRetryMetrics`
+  verifies exact originals and a 280 ms raw-window result that passes 300 ms
+  trimmed admission without earning an empty-result retry. The existing quiet
+  archive/retry test now exercises prepared release and exact WAV retention.
+- `DictationDeliveryTests.testPreparedReleaseAndManualRetryKeepOriginalWindowMetrics`
+  verifies delivery duration, inference samples, and retention of the raw
+  recording for manual retry rather than a trimmed request.
+- The two prepared-release tests in `DictationSessionPipelineTests` verify an
+  in-flight first chunk, the correct quiet tail after leading-silence trimming,
+  and full fallback without another retry when that chunk fails.
+- `PersonalVoicePipelineTests.testDeliveryRetainsOriginalFallbackOnceAcrossManualRetry`
+  reads every persisted Float32 sample and verifies one unchanged personal clip
+  across manual retry. Existing native-audio, silence, cancellation, output-order,
+  diagnostic-stage, capture, and stall checks remain in the selected suites.
+
+Verified on macOS 27.0.1, Apple M5 Pro, Swift 6.4, with worktree-local `.build`.
+Evidence prefix: `/tmp/flo-e1-`. The final patch is `final.diff` under that
+prefix, applied to the base commit above. No new abstraction was introduced;
+the existing prepared type is reused by delivery, pipeline, and replay.
+
+Exact test commands and results:
+
+```sh
+swift test --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests'
+swift test --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|DictationReplayTests|DictationSessionStallTests'
+swift test --disable-automatic-resolution --filter 'DictationSessionPipelineTests.testPreparedReleaseDerivesQuietTailFromOriginalWhileFirstChunkIsInFlight'
+swift test --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnostic|PersonalVoice|DictationReplayTests|DictationSessionStallTests|NativeAudioRecordingTests|AudioRecorderTests|AudioCaptureLifecycleTests|DictationTraceTests'
+swift test -c release --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnostic|PersonalVoice|DictationReplayTests|DictationSessionStallTests|NativeAudioRecordingTests|AudioRecorderTests|AudioCaptureLifecycleTests|DictationTraceTests'
+git diff --check
+```
+
+- PASS, exit 0: baseline command, 46 tests, `baseline-tests.log`.
+- FAIL, exit 1: first expanded focused build used a nonexistent `Clip.status`
+  field in the new test, `focused-tests.log`. Corrected to the persisted failure
+  reason and transcript fields. PASS, exit 0: rerun, 66 tests,
+  `focused-tests-rerun.log`.
+- EXPECTED FAIL, exit 1: the single in-flight test with a temporary mutation
+  selecting full audio from `chunkCount == 0`, `inflight-mutation-tests.log`.
+  It caught a 28,000-sample full recording replacing the 8,000-sample quiet
+  tail. Submitted-chunk tracking was restored before final checks.
+- PASS, exit 0: expanded debug selection, 120 tests, `final-tests.log`.
+- PASS, exit 0: the same selection in release, 120 tests, `release-tests.log`.
+- PASS, exit 0: `git diff --check`, `diff-check.log`.
+- NOT RUN: full Swift suite, live microphone, installed-app replay, panel
+  timing, clipboard/typing, packaging, installation, or model inference.
+  Maintainers own live acceptance and assembled-item integration. No runtime
+  speedup was measured or claimed.
+
+## E3: bounded optional cleanup
+
+Owner: Flo maintainers. The October 15, 2026 efficiency request includes a
+separate cleanup budget and an explicit fast path. Recognition and deterministic
+corrections, voice formatting, and snippets still run before optional cleanup.
+Settings offers Fast and Polished choices using the existing cleanup preference.
+Fast skips text-model processing; Polished enables it. Existing saved choices
+keep the same behavior, and the model's availability still selects the backend.
+
+`DictationSessionPipeline.finalize` retains the composed transcript and gives
+cleanup three seconds. The cleanup deadline returns that transcript without
+waiting for a backend that ignores cancellation. If the original release
+deadline expires after recognition finished, it also delivers the retained
+transcript instead of failing the dictation. Normal recognition timeouts keep
+their existing failure and retry behavior. The completion helper is shared by
+normal cleanup, its own deadline, and release-deadline fallback. It emits one
+cleanup result and preserves spoken-order delivery. Cancellation removes the
+deadline, and late backend results cannot produce another outcome.
+
+`DictationCleanupDeadlineTests` covers an uncooperative backend, late output,
+the shorter release deadline, successful cleanup, cleanup disabled, cancellation,
+and a completed follower waiting behind a stalled cleanup. The initial six-test
+run reproduced six assertions failing before the deadline implementation.
+
+PASS: `swift test --disable-automatic-resolution`, 392 tests with zero failures
+and one optional render skip, on macOS 27.0.1, arm64, Swift 6.4. Focused pipeline,
+delivery, diagnostics, and stall checks passed 53 tests. Evidence is
+`/tmp/flo-e3-cleanup-red.log`, `focused.log`, and `tests.log` under the same
+`/tmp/flo-e3-cleanup-` prefix. Base is preview commit `47f1bb9` plus this change.
+Live model cleanup, rendered Settings help, microphone input, and target-app
+insertion were NOT RUN. No new settings key or public model policy was added.
+
+The explicit Fast/Polished picker was compiled and checked with
+`swift test --disable-automatic-resolution --filter 'DictationCleanupDeadlineTests|SettingsPaneTests'`,
+six cleanup tests passed, exit 0. There is no `SettingsPaneTests` class in this
+checkout, so that filter added no UI test coverage. Evidence:
+`/tmp/flo-e3-explicit-modes.log`. Rendered Settings interaction remains NOT RUN.
+
+## E2: Preview inference budget, October 15, 2026
+
+Owner: Flo maintainers. Requirement source: the authorized efficiency report E2,
+against preview foundation `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Give disposable previews their own inference budget without changing final
+recognition, release audio preparation, retry, quiet-tail, or delivery contracts.
+This section belongs to E2; other efficiency and reliability items have separate
+owners and PRs.
+
+`DictationSessionPipeline.startPreviewIfNeeded` attaches `TranscriptionPurpose`
+and a per-request `PreviewLifetime`. Both `AppDelegate` and `DictationReplay`
+forward the complete request through `Transcriber.transcribe(_:)`. Existing
+sample/file callers remain authoritative by default. `SpeechEngine` supplies
+adapters for engines that retain their existing preview decoder, including
+Parakeet.
+
+`WhisperEngine.decodingOptions(lowEnergy:purpose:)` keeps the temperature-zero
+pass and sets `temperatureFallbackCount` to zero for previews. The pinned
+WhisperKit 1.1.0 `TranscribeTask` builds attempts with
+`0...temperatureFallbackCount`, so zero means one attempt. Final options,
+vocabulary prompts, timestamps, VAD chunking, and the low-energy policy retain
+their existing values. No new model or dependency is required.
+
+`TranscriptionGate` gives waiting authoritative requests priority over disposable
+previews and keeps FIFO arrival order within each purpose. It cannot preempt
+active inference. Release and cancellation invalidate the preview lifetime,
+remove its waiter, and reject a stale permit handoff without cancelling active
+inference. The existing generation and audio-coverage checks still drop late
+text. Routine Escape leaves the model loaded. Explicit interruption and the
+release deadline still cancel active inference and quarantine its engine.
+
+`Transcriber` measures preview inference with a monotonic clock, excluding gate
+waits. After a preview taking duration D, that model's next preview becomes
+eligible D seconds after completion. Requests during this interval skip rather
+than queue or sleep. Budgets are keyed by the loaded model ID, so measurements
+from a slow model do not throttle another model. Finals never consult this
+budget. Cancelled or superseded engine generations do not update it. Capture
+still schedules one-second ticks, permits one active preview per session, and
+bounds preview audio to 15 seconds. The complete original release audio still
+determines final recognition. Preview text does not enter cleanup, history,
+delivery, personal voice labels, or diagnostic audio archives.
+
+Acceptance examples target the real gate with fake engines in
+`PreviewInferenceBudgetTests`: final precedence with FIFO finals; queued-preview
+removal during release and Escape before active inference returns; active-preview
+release and Escape without unloading; explicit interruption with quarantine;
+model-specific observed-duration backoff that leaves finals eligible; stale
+work rejection at an idle gate; and preview-only Whisper option changes.
+Existing `DictationSessionStallTests` now use the same request adapter as live
+and replay, including the stalled-preview deadline and engine recovery case.
+Existing pipeline, audio-preparation, diagnostic, delivery, model, and replay
+suites cover bounded audio, original final audio, quiet tails, retries, and
+preview side-effect isolation.
+
+Verified on macOS 27.0.1, arm64, Swift 6.4, from baseline
+`47f1bb906e8f3b2291a617f13dd9bb0b11300e74` plus the E2 diff on
+`perf/preview-inference-budget`. The reviewed source/test diff is saved at
+`/tmp/flo-e2-final.diff`; the handoff names the final local commit. All SwiftPM
+commands used this worktree's isolated `.build-e2` scratch directory and the
+existing lockfile. Generated build artifacts were moved to ignored `.build/e2`
+after validation, without touching another worktree's output.
+
+Executed checks, with final results:
+
+- PASS, exit 0: `swift test --scratch-path .build-e2 --disable-automatic-resolution --filter TranscriberTests`,
+  13 tests. Evidence: `/tmp/flo-e2-transcriber-tests.log`.
+- PASS, exit 0: `swift test --scratch-path .build-e2 --disable-automatic-resolution --filter 'PreviewInferenceBudgetTests|TranscriberTests|DictationSessionPipelineTests|DictationSessionStallTests|DictationAudioPreparationTests|DictationReplayTests|DictationDiagnosticPipelineTests|TranscriptionModelTests|ParakeetEngineTests'`,
+  97 tests, including all nine E2 tests. Evidence: `/tmp/flo-e2-focused-tests.log`.
+- PASS, exit 0: `swift test --scratch-path .build-e2 --disable-automatic-resolution`,
+  395 tests, zero failures. Evidence: `/tmp/flo-e2-full-tests.log`.
+  SKIPPED: one optional `HudRenderSnapshots.testRenderOverlayStates`, which
+  requires `LOCALFLOW_RENDER_DIR`.
+- PASS, exit 0: `python3 -B Tests/TranscribeCLITests.py`, two tests.
+  Evidence: `/tmp/flo-e2-cli-tests.log`.
+- PASS, exit 0: `python3 -B Tests/StartupReadinessTests.py`, four tests.
+  Evidence: `/tmp/flo-e2-startup-tests.log`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+
+Earlier test iterations were corrected before the passing checks above.
+`swift test --scratch-path .build-e2 --disable-automatic-resolution --filter PreviewInferenceBudgetTests`
+initially exited 1 with eight passing tests and one failure caused by comparing
+JSON objects with unsorted keys. Evidence: `/tmp/flo-e2-budget-tests.log`.
+The comparison now sorts keys. The first focused build also exited 1 because
+an async assertion used an autoclosure that cannot await; the assertion now
+uses an explicit guard. Neither was an engine behavior failure. The initial
+build also emitted existing warnings in untouched diagnostic, injection, and
+startup-test code; those warnings remain outside E2.
+
+NOT RUN: real-model replay, preview-quality comparison, latency/power benchmarks,
+release packaging, installation, microphone capture, clipboard access, or typing.
+No model downloads or dependency upgrades were performed. Speedup and real-model
+preview quality remain unmeasured. Maintainers own those checks after integrating
+E1 and the other authorized items. Active previews remain nonpreemptible.
+
+Stack integration keeps queued-preview invalidation in the prepared-audio release
+overload shared by live delivery and raw-sample callers. The queued-preview
+regression now exercises prepared-audio release; other release tests retain the
+raw-sample path. Assembled-stack validation is recorded separately.
+
+## R1: Bounded abandoned inference and model-switch recovery, October 15, 2026
+
+Owner: Flo maintainers. Requirement source: the authorized reliability report R1
+and implementation brief. Foundation: `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Prerequisite E2 was cherry-picked unchanged as
+`ee1bf8b2f4d976707efd6e7564fe9e66d308bb00`, from
+`be83e19d79c868f25dffb214659b4c343da179cb`. The R1 commit follows it on
+`fix/abandoned-inference-recovery`. Target selection, clipboard delivery R3,
+other report items, and proposed features are outside this change.
+
+Escape still reaches `DictationSessionPipeline.cancel` through AppDelegate and
+DictationDelivery with `interruptInference: false`. Each `runTranscription`
+request now carries a lifetime. Cancelling or completing a session invalidates
+its outstanding requests. The existing E2 observer implementation is renamed
+`TranscriptionLifetime` and reused for session abandonment and preview
+obsolescence. Those signals remain separate: release invalidates a queued
+preview without treating active preview inference as explicitly cancelled.
+Both AppDelegate and DictationReplay already forward the complete request.
+
+`TranscriptionGate.acquire` removes abandoned queued requests immediately.
+`Transcriber.runInference` owns an active request's abandonment deadline, even
+after the session drops its task handles. The default grace is 90 seconds,
+injected as `abandonedInferenceGrace` for tests. Completion during grace cancels
+the deadline and keeps the model warm. Expiry quarantines a still-active holder;
+its engine and old gate remain isolated until it returns. A per-call identity
+prevents a delayed deadline or cancellation callback from affecting another
+inference on the same engine. Abandoned results cannot return text or update
+the preview budget.
+
+Replacing or quarantining an engine retires its gate. Retirement wakes queued
+acquirers, which re-evaluate the current engine rather than wait for the old
+holder. A loaded replacement serves them; without one, authoritative requests
+fail and retain retry audio through the existing delivery path. Manual Retry
+uses the existing AppDelegate model-load path before retrying retained audio.
+Replacement loads count all unresolved engine holders, including work inside
+grace, against the existing two-engine recovery limit. A third replacement
+fails with `recoveryBusy` until one holder returns. Explicit interruption and
+release deadlines still quarantine immediately.
+
+`Transcriber.load` advances its load generation before the warm-model shortcut.
+For warm A, suspended loading B, then request A, B's late load cannot publish.
+The warm A request does not construct another engine.
+
+Fake suspended engines in `DictationSessionStallTests` verify these acceptance
+examples through the real Transcriber and gate:
+
+- `testEscapeAbandonedFinalExpiresAndQueuedFollowerRetriesOnReplacement` and
+  `testEscapeAbandonedPreviewExpiresAndQueuedFollowerRetriesOnReplacement` check
+  grace, follower failure, retained retry audio, replacement success, and no late
+  original delivery or history after its transcription callback finishes.
+- `testEscapeRemovesQueuedFinalWithoutQuarantiningUnrelatedHolder` checks that
+  abandoning a waiter does not quarantine the active request.
+- `testFinishedAbandonmentDeadlineCannotQuarantineNextInferenceOnSameEngine`,
+  `testKeyboardCancelLeavesRunningInferenceAndModelLoaded`, and the existing E2
+  Escape tests check warm reuse without another load.
+- `testAbandonedOldInferenceGraceCannotQuarantineReplacement` checks that an
+  old generation's expired deadline and late result leave its replacement usable.
+- `testWarmRequestInvalidatesBlockedDifferentModelLoad` covers A-B-A;
+  `testQueuedRequestUsesReplacementAfterOrdinaryModelSwitch` now requires the
+  follower to finish before the original holder returns.
+- `testAbandonmentCapsQuarantinedEnginesUntilOldInferenceReturns`,
+  `testRecoveryCapsQuarantinedEnginesUntilOldInferenceReturns`, and
+  `testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound` check the cap
+  for abandoned, explicitly cancelled, and still-in-grace holders.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1` and the unchanged lockfile. Evidence identifies the prerequisite
+plus the R1 diff saved at `/tmp/flo-r1-final.diff`; the implementation handoff
+provides the final R1 commit SHA.
+
+- RED, exit 1: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'`,
+  34 tests, three failed assertions exposing A-B-A and the stuck old-gate waiter
+  before the source repair. Log: `/tmp/flo-r1-baseline.log`.
+- RED, exit 1: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound`,
+  one test, two failed assertions exposing replacement during grace bypassing
+  the cap. Log: `/tmp/flo-r1-grace-bound-red.log`.
+- PASS, exit 0: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'`,
+  119 tests, zero failures. Log: `/tmp/flo-r1-recovery-final.log`.
+- PASS, exit 0: `swift test --scratch-path .build/r1 --disable-automatic-resolution --skip TextInjectorTests`,
+  382 tests, zero failures, one optional HUD render skipped because
+  `LOCALFLOW_RENDER_DIR` was unset. All 21 TextInjector tests were excluded to
+  respect the task's no-clipboard boundary, including private pasteboards.
+  Log: `/tmp/flo-r1-broad-tests.log`.
+- PASS, exit 0: `python3 -B Tests/StartupReadinessTests.py`, four tests.
+  Log: `/tmp/flo-r1-startup-tests.log`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+  Log: `/tmp/flo-r1-diff-check.log`.
+
+NOT RUN: actual Whisper or Parakeet inference, runtime menu interaction,
+microphone capture, clipboard access, target-app insertion, release packaging,
+installation, or performance measurement. Tests use synthetic audio and fake
+engines, delivery, and history callbacks. Existing compiler warnings in
+untouched diagnostic, injection, and startup-test code remain. The parent
+integration owner must assemble the stack and perform any authorized runtime
+validation. This task creates local commits only.
+
+## R3: Pace delivery by clipboard reads and retain command identity
+
+Owner: Flo maintainers. The October 15, 2026 reliability report R3 authorizes
+clipboard-aware queue pacing and command target/selection identity. The isolated
+base is `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`; E1
+`dc5df59821180d6ca224b282eb65ae6f0eefc656` was cherry-picked unchanged as
+`b0873cd980a8211a29a9ba758dbb4263501f00d8`. Other efficiency and reliability
+items, model policy, installed apps, and live input are outside this change.
+
+Intended and implemented path:
+
+- `InjectionCoordinator.drain` retains FIFO ownership until the injector calls
+  its readiness callback. It no longer advances after a fixed 400 ms. Delivery
+  UUIDs ignore duplicate callbacks; synchronous failures continue draining
+  without recursive delivery. Existing command and stalled-head deadlines stay.
+- `TextInjector.inject` uses the existing `PasteReceipt` first-read signal to
+  release the next delivery on the next main-queue turn, after the provider
+  returns its bytes. Restoration still follows the existing floor/grace/ceiling
+  timing. Receipt timeout, external provider finish, empty input, event failure,
+  and completed typing also release queue ownership. Provider finish uses the
+  generation and change count to distinguish external copies from Flo's writes.
+- `DictationDelivery` passes readiness separately from final completion. Its
+  existing active-injection tracking keeps Quit blocked through restoration.
+  A following paste still preserves the first clipboard snapshot unless the
+  user copied something in between. History records output before delivery.
+- `AppDelegate.commandKeyPressed` prepares AX access and captures a
+  `TextInjector.CommandTarget` before recording. Release latches that immutable
+  value across audio handoff, STT, rewrite, and the delivery queue. The rewrite
+  uses its captured selection. `TextInjector.validateCommandTarget` compares
+  AX application/process identity, focused element, focused window when exposed,
+  selected text, and range after reading the clipboard snapshot and before any
+  clipboard write or dispatch. Reading another clipboard provider can block,
+  so validation must follow that read. Cursor-only commands
+  require the same field and zero-length range. Unreadable identity, secure
+  input, or an outstanding promised paste safely refuses capture. Cancellation
+  and recording startup failure clear the held snapshot.
+- A changed or unreadable target produces `InjectionResult.targetChanged` with
+  an explicit warning and no paste, typing, or clipboard write. The generated
+  result remains in Recent Dictations and history. Ordinary dictation retains
+  its focused-app policy. A command target that changes and returns to the same
+  observable identity passes validation; this is a current-state guard.
+
+This checkout had AX selection readers but no existing target identity/range
+helpers. `selectedText` is shared by the old selection reader and target capture.
+`CommandTarget` is the new immutable value carried by command flow and the
+existing queue. `InjectionClipboard` is a narrow boundary implemented by
+`NSPasteboard` and the in-memory test fake. Tests reuse the actual `PasteReceipt`;
+there is no additional receipt type or scheduler.
+
+Acceptance checks are in `Tests/LocalFlowTests/TargetedDeliveryTests.swift`.
+They use in-memory clipboard receipts, local AX identity objects and attribute
+readers, a fake clock/scheduler, fake typing, and stubbed paste events. No test
+requires a system pasteboard, AX server requests, model inference, or microphone.
+The delayed-reader case waits 550 ms, checks the first receipt is still present,
+then verifies FIFO delivery after reads and restoration as a separate completion.
+Other cases cover timeout, changed clipboard, cancellation, duplicate signals,
+empty input, paste failure, typing success/failure, target changes during
+recognition/rewrite/queue wait, unchanged replacement, cursor-only commands,
+unavailable identity, a target change while reading the previous clipboard,
+and ordinary dictation focus policy. Existing
+`TextInjectorTests` now use the same in-memory clipboard boundary.
+
+Verification limits: the receipt observes the first reader, which need not be
+the target app. The existing transient marker asks compliant clipboard managers
+to skip these items. The target guard compares current AX state before event
+dispatch; it cannot make focus and event delivery atomic or prove insertion.
+Command phase tests simulate recognition/rewrite completion at the delivery
+boundary. Real AppDelegate hotkey/STT/model wiring is compiled but not exercised
+end to end. Flo maintainers own live AX, clipboard-manager, target-app,
+installation, and assembled-stack acceptance.
+
+Verified on macOS 27.0.1, arm64, Swift 6.4, in this worktree. The local `.build`
+was copied from the completed E1 worktree, then SwiftPM rebuilt for this path
+with automatic resolution disabled. Evidence prefix: `/tmp/flo-r3-`. The patch
+artifact `final.diff` is relative to the unchanged E1 cherry-pick above; the R3
+commit SHA is returned in the implementation handoff.
+
+Exact final commands:
+
+```sh
+swift test --disable-automatic-resolution --filter 'InjectionCoordinatorTests|TextInjectorTests|TargetedDeliveryTests|DictationDeliveryTests|DictationTraceTests|DictationSessionPipelineTests|DictationSessionStallTests|DictationAudioPreparationTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|AppTerminationTests|AudioCaptureLifecycleTests|UserFacingIssueTests'
+swift test -c release --disable-automatic-resolution --filter 'InjectionCoordinatorTests|TextInjectorTests|TargetedDeliveryTests|DictationDeliveryTests|DictationTraceTests|DictationSessionPipelineTests|DictationSessionStallTests|DictationAudioPreparationTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|AppTerminationTests|AudioCaptureLifecycleTests|UserFacingIssueTests'
+git diff --check
+git diff --exit-code dc5df59821180d6ca224b282eb65ae6f0eefc656 b0873cd980a8211a29a9ba758dbb4263501f00d8
+```
+
+- PASS, exit 0: final debug selection, 123 tests, zero failures or skips,
+  `final-debug.log`. This includes 16 new `TargetedDeliveryTests` and one new
+  coordinator callback/FIFO test.
+- PASS, exit 0: the same final selection in release, 123 tests, zero failures
+  or skips, `final-release.log`.
+- PASS, exit 0: the earlier focused selection, 54 tests, `focused-final.log`.
+  Earlier expanded debug/release selections each passed 122 tests in
+  `expanded-debug.log` and `expanded-release.log` before the snapshot-read case.
+- EXPECTED FAIL, exit 1: temporarily replacing readiness pacing with the former
+  400 ms timer, one delayed-reader test and four failed assertions,
+  `pacing-mutation.log`. It caught the second dictation replacing the unread first.
+- EXPECTED FAIL, exit 1: temporarily bypassing target validation, four tests and
+  13 failed assertions, zero unexpected failures, `target-mutation-final.log`.
+  Recognition, rewrite, queued delivery, and clipboard-snapshot changes all
+  caught forbidden events. Both mutations were restored before final checks.
+- PASS, exit 0: whitespace/diff check, `diff-check.log`; identical E1 tree check,
+  `prerequisite-check.log`.
+- NOT RUN: full Swift suite, shell/Python checks for unrelated packaging/startup,
+  live app, system clipboard, AX requests, microphone, installed-app replay,
+  model inference, packaging, installation, push, PR, merge, or delegation.
+
+Initial diagnostics are retained rather than counted as passed checks.
+`baseline-tests.log` was interrupted during compilation before tests ran to avoid
+its old private-pasteboard harness. `focused-tests.log` and `focused-rerun.log`
+failed to compile new actor-isolated default closures. `focused-pass.log`
+reached tests and exposed an unowned fake-harness lifetime during teardown.
+Actor annotations/default construction and harness teardown retention were fixed
+before `focused-final.log`. `target-mutation.log` is an earlier validation-bypass
+run with a secondary unread-paste failure; `target-mutation-final.log` supersedes
+it. Existing compiler concurrency/capture warnings remain visible in build logs.
+
+R3 integration with R1 updates the abandonment-retry fixture to the new delivery
+callback's separate queue-ready and restoration-complete signals. The initial
+combined build exposed its old two-argument signature and removed interval
+argument; production code compiled. The corrected fixture passed 39 focused
+stall, target, and queue tests, exit 0. Evidence:
+`/tmp/flo-session-stack-through-r4-debug.log` (initial compile failure) and
+`/tmp/flo-r3-r1-fixture-integration.log` (pass). Full assembled validation follows.
+
+## R4: verbatim snippets and literal formatting
+
+Owner: Flo maintainers. The October 16, 2026 R4 request authorizes exact snippet
+insertion and a literal-formatting preference. Per-app preferences and other
+feature proposals are outside this change.
+
+`AppDelegate.captureDictationContext` and `DictationReplay.run` snapshot the new
+`literalFormatting` preference into `DictationSessionContext`. It defaults to
+false, preserving spoken command formatting. Settings > Dictation exposes the
+switch through `SettingsModel` and `SettingsApplication`. When enabled, the
+pipeline skips both spoken commands and automatic ordinal lists. Corrections
+and optional prose cleanup still apply. This is a formatting preference, not a
+promise of verbatim recognition or verbatim prose from a text model.
+
+`Snippets.parts` matches the original assembled transcript before corrections
+or voice formatting. Matching remains case-insensitive, uses word boundaries,
+accepts flexible spaces, and consumes at most one trailing punctuation mark.
+Earlier positions win. At one position the longest trimmed saved trigger wins,
+measured in UTF-16 units, then saved order breaks ties. Accepted matches consume
+that original range once. Overlapping occurrences are considered even within
+one trigger. Empty triggers and empty expansions are ignored. Repeated original
+matches expand independently; saved expansions and correction-created trigger
+phrases are never searched again.
+
+`Snippets.Part` distinguishes prose from verbatim text. The existing expansion
+API, pipeline, and VoiceFormatter reuse it. Only prose receives corrections,
+voice formatting, or cleanup. Explicit list state and line-break commands carry
+across snippets without trimming or capitalizing saved content. Automatic
+ordinal-list detection stays within each prose span. With no snippets, the
+existing formatter and whole-transcript cleanup behavior remain unchanged.
+Polished cleans prose spans sequentially, preserving their boundary whitespace,
+then joins them with untouched expansions in spoken order. No placeholders enter
+a model. One E3 deadline covers all spans. Its fallback retains the entire
+pre-cleanup composition, including after partial cleanup; the release deadline
+uses the same `completeCleanup` boundary. Late results cannot deliver twice or
+start cleanup of later spans after completion or cancellation. Diagnostics keep
+`cleanupInput` as the composed pre-cleanup transcript, rather than one event per
+model request.
+
+The Settings snippet editor no longer strips expansion whitespace. The public
+snippet API and legacy string-array preference remain unchanged. When tabs or
+backslashes require lossless storage, `verbatimSnippets` saves exact pairs plus
+the legacy array they encode. The reader uses those pairs only while that array
+still matches, so external or older-app edits cannot restore stale content.
+Simple entries retain the original encoding without a companion value. Older
+versions retain their previous interpretation of the public array, including its
+existing limitations with tabs and literal backslash-n. Already-lost content
+cannot be reconstructed. Tests verify UTF-8 bytes after persistence, including
+outer whitespace, multiline code, URLs, tabs, and literal backslash-n. They also
+verify legacy edits invalidate the companion value.
+
+Verification uses macOS 27.0.1, arm64, Swift 6.4. The base is `47f1bb9` plus
+unchanged prerequisite cherry-picks `2574a72` and `3d7f8e7`. Their patch IDs match
+originals `673876a` and `debf9fc`. R4 is the local commit containing this section;
+its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
+`/tmp/flo-r4-final.diff`.
+
+- FAIL, expected regression evidence: `swift test --disable-automatic-resolution --filter VerbatimSnippetPipelineTests`,
+  exit 1, three tests with three assertion failures before pipeline protection.
+  Log: `/tmp/flo-r4-pipeline-red.log`.
+- PASS: `swift test --disable-automatic-resolution --filter 'VerbatimSnippet|DictationCleanupDeadlineTests|VoiceFormatterTests|DictationDiffTests|SettingsModelCorrectionTests'`,
+  exit 0, 56 tests. Log: `/tmp/flo-r4-focused-final.log`. Cases cover overlaps,
+  recursive expansion, trigger/correction ordering, code preservation, rewriting
+  and failed cleaners, both deadlines, partial-cleanup fallback, late results,
+  literal spoken commands, default formatting, persistence, and session snapshots.
+- PASS: `env -u LOCALFLOW_RENDER_DIR swift test --disable-automatic-resolution --skip TextInjectorTests`,
+  exit 0, 387 tests, one optional HUD render skip, zero failures.
+  Log: `/tmp/flo-r4-broad-final.log`. The 21-test clipboard class is excluded
+  under this task's no-clipboard restriction.
+- PASS: `python3 Tests/TranscribeCLITests.py`, exit 0, two tests;
+  `python3 -B Tests/StartupReadinessTests.py`, exit 0, four tests.
+  Logs: `/tmp/flo-r4-cli.log` and `/tmp/flo-r4-startup.log`.
+- PASS: `git diff --check`, exit 0. Log: `/tmp/flo-r4-diff-check.log`.
+- NOT RUN: rendered Settings interaction, real models, audio replay, microphone,
+  clipboard, target-app insertion, release packaging, installation, or deployment.
+  The maintainer owns assembled-stack and live verification. Dependency cache
+  files were copied into this worktree; no package installation was performed.

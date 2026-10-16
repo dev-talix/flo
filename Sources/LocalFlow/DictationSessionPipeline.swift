@@ -42,6 +42,7 @@ struct DictationSessionContext {
     let styleProfile: AppStyleProfile
     let corrections: [(wrong: String, right: String)]
     let snippets: [(trigger: String, expansion: String)]
+    let literalFormatting: Bool
     let ollamaModel: String
     let incrementalCadence: IncrementalCadence
 
@@ -50,6 +51,7 @@ struct DictationSessionContext {
         styleProfile: AppStyleProfile,
         corrections: [(wrong: String, right: String)],
         snippets: [(trigger: String, expansion: String)],
+        literalFormatting: Bool = false,
         ollamaModel: String = "",
         incrementalCadence: IncrementalCadence = .whisper
     ) {
@@ -57,6 +59,7 @@ struct DictationSessionContext {
         self.styleProfile = styleProfile
         self.corrections = corrections
         self.snippets = snippets
+        self.literalFormatting = literalFormatting
         self.ollamaModel = ollamaModel
         self.incrementalCadence = incrementalCadence
     }
@@ -71,12 +74,14 @@ enum DictationTranscriptionSegment: Equatable, Codable, Sendable {
 
 /// Shared admission and decoder preparation for live dictation, commands, and replay.
 struct DictationAudioPreparation {
+    let originalSamples: [Float]
     let samples: [Float]
     let voicedSeconds: Double
     let voicedDBFS: Float
     let rawVoicedSeconds: Double
 
     init(samples: [Float]) {
+        originalSamples = samples
         rawVoicedSeconds = AudioRecorder.voicedMetrics(of: samples).voicedSeconds
         self.samples = AudioRecorder.trimmingSilence(samples)
         let voice = AudioRecorder.voicedMetrics(of: self.samples)
@@ -97,6 +102,8 @@ struct DictationTranscriptionRequest {
     let segment: DictationTranscriptionSegment
     let samples: [Float]
     let lowEnergy: Bool
+    var purpose: TranscriptionPurpose = .authoritative
+    var lifetime: TranscriptionLifetime? = nil
 }
 
 struct DictationCleanupRequest {
@@ -151,9 +158,11 @@ final class DictationSessionPipeline {
         var capturedAudioSaved = false
         var pendingChunks: [IncrementalChunk] = []
         var activeTask: Task<Void, Never>?
-        /// Normal release and Escape leave inference running. Only explicit
-        /// interruption or a stall deadline cancels it and quarantines the engine.
+        /// Escape gives active inference a bounded grace period at Transcriber.
+        /// Explicit interruption and the release deadline cancel it immediately.
         var previewTask: Task<Void, Never>?
+        var previewLifetime: TranscriptionLifetime?
+        var inferenceLifetimes: [UUID: TranscriptionLifetime] = [:]
         var lastPreviewRange: Range<Int>?
         var displayedPreview: DisplayedPreview?
         var nextChunkSnapshotSamples = 0
@@ -170,6 +179,8 @@ final class DictationSessionPipeline {
         var incrementalFailed = false
         var cancelled = false
         var releaseTimeout: DispatchWorkItem?
+        var cleanupDeadline: DispatchWorkItem?
+        var cleanupFallbackText: String?
 
         var incrementalAnalysisStart: Int {
             // Keep the previous cut's quiet run as context if a pause continues
@@ -192,6 +203,7 @@ final class DictationSessionPipeline {
     private let onOutcome: OutcomeHandler
     private let onPartialTranscript: ((Int, String) -> Void)?
     private let stalledGenerationTimeout: TimeInterval
+    private let cleanupTimeout: TimeInterval
     private var sessions: [Int: Session] = [:]
     private var generationOrder: [Int] = []
     private var completed: [Int: (outcome: DictationSessionOutcome, trace: DictationTrace?)] = [:]
@@ -202,13 +214,15 @@ final class DictationSessionPipeline {
         cleanup: @escaping Cleanup,
         onOutcome: @escaping OutcomeHandler,
         onPartialTranscript: ((Int, String) -> Void)? = nil,
-        stalledGenerationTimeout: TimeInterval = 90
+        stalledGenerationTimeout: TimeInterval = 90,
+        cleanupTimeout: TimeInterval = 3
     ) {
         self.transcribe = transcribe
         self.cleanup = cleanup
         self.onOutcome = onOutcome
         self.onPartialTranscript = onPartialTranscript
         self.stalledGenerationTimeout = stalledGenerationTimeout
+        self.cleanupTimeout = cleanupTimeout
     }
 
     func begin(generation: Int, context: DictationSessionContext, trace: DictationTrace? = DictationTrace.current,
@@ -343,17 +357,21 @@ final class DictationSessionPipeline {
         let audio = DictationAudioPreparation(samples: Array(samples[(start - sampleOffset)..<samples.count]))
         guard audio.isAdmitted else { return }
         session.lastPreviewRange = range
+        let lifetime = TranscriptionLifetime()
+        session.previewLifetime = lifetime
         let request = DictationTranscriptionRequest(
             generation: session.generation,
             segment: .preview,
             samples: audio.samples,
-            lowEnergy: audio.lowEnergy
+            lowEnergy: audio.lowEnergy,
+            purpose: .preview(lifetime)
         )
         session.previewTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             // Failures are already in the trace and must not change the dictation.
             let text = try? await runTranscription(request, session: session)
             session.previewTask = nil
+            session.previewLifetime = nil
             guard let text, !text.isEmpty, isCurrent(session),
                   session.releaseAudio == nil,
                   session.completedSampleEnd == committedEnd else { return }
@@ -423,9 +441,24 @@ final class DictationSessionPipeline {
         guard let session = sessions[generation],
               !session.cancelled,
               session.releaseAudio == nil else { return }
-
         recordCapturedAudio(generation: generation, samples: fullSamples)
-        let full = DictationAudioPreparation(samples: fullSamples)
+        release(generation: generation, audio: DictationAudioPreparation(samples: fullSamples),
+                tailSamples: tailSamples)
+    }
+
+    func release(
+        generation: Int,
+        audio full: DictationAudioPreparation,
+        tailSamples: [Float]? = nil
+    ) {
+        guard let session = sessions[generation],
+              !session.cancelled,
+              session.releaseAudio == nil else { return }
+
+        session.previewLifetime?.invalidate()
+
+        let fullSamples = full.originalSamples
+        recordCapturedAudio(generation: generation, samples: fullSamples)
         guard full.isAdmitted else {
             session.activeTask?.cancel()
             session.activeTask = nil
@@ -436,15 +469,20 @@ final class DictationSessionPipeline {
         let derivedTail: [Float]
         if let tailSamples {
             derivedTail = tailSamples
+        } else if session.incrementalSampleEnd == 0 {
+            derivedTail = fullSamples
         } else if session.incrementalSampleEnd <= fullSamples.count {
             derivedTail = Array(fullSamples[session.incrementalSampleEnd...])
         } else {
             derivedTail = []
             session.incrementalFailed = true
         }
+        // Submitted chunks include queued and in-flight work, even before the
+        // first chunk completes. Only those sessions can need a separate tail.
+        let reusesFull = session.nextChunkIndex == 0 || session.incrementalFailed
+            || (tailSamples == nil && session.incrementalSampleEnd == 0)
         session.releaseAudio = ReleaseAudio(
-            full: full,
-            tail: DictationAudioPreparation(samples: derivedTail)
+            full: full, tail: reusesFull ? full : DictationAudioPreparation(samples: derivedTail)
         )
         session.trace?.record(.audioReleased, fields: [
             .samples: Double(fullSamples.count), .tailSamples: Double(derivedTail.count),
@@ -455,17 +493,17 @@ final class DictationSessionPipeline {
         scheduleReleaseTimeout(for: session)
     }
 
-    /// `interruptInference: false` abandons the session without cancelling
-    /// its running task. Cancelling a task inside speech inference makes the
-    /// transcriber quarantine its engine, which is right for a stall but would
-    /// unload the model on every Escape. The abandoned task's result is
-    /// dropped by `isCurrent` when it returns, and the transcription gate
-    /// holds any new dictation until then. Text cleanup is still cancelled.
+    /// Escape invalidates queued work and gives active inference a grace period
+    /// owned by Transcriber. Explicit interruption still cancels immediately.
+    /// Session identity rejects all late results. Text cleanup is always cancelled.
     func cancel(generation: Int, interruptInference: Bool = true) {
         let trace = sessions[generation]?.trace ?? completed[generation]?.trace
         trace?.record(.cancellationRequested)
         if let session = sessions.removeValue(forKey: generation) {
+            session.previewLifetime?.invalidate()
+            for lifetime in session.inferenceLifetimes.values { lifetime.invalidate() }
             session.releaseTimeout?.cancel()
+            session.cleanupDeadline?.cancel()
             session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
             session.personalVoice?.finish(status: "cancelled")
             session.cancelled = true
@@ -634,15 +672,18 @@ final class DictationSessionPipeline {
     private func finalize(_ session: Session, transcript: String) {
         session.diagnostics?.record(.init(stage: "assembledTranscript", text: transcript))
         session.personalVoice?.setRawTranscript(transcript)
-        let composed = Snippets.expand(
-            VoiceFormatter.apply(
-                TranscriptCorrections.apply(
-                    transcript,
-                    corrections: session.context.corrections
-                )
-            ),
-            snippets: session.context.snippets
-        )
+        // Find triggers before corrections or formatting can change their words.
+        // Only prose enters those transforms or a model. Snippet bytes stay local.
+        let correctedParts = Snippets.parts(in: transcript, snippets: session.context.snippets).map { part in
+            switch part {
+            case .verbatim: return part
+            case .transcript(let text):
+                let corrected = TranscriptCorrections.apply(text, corrections: session.context.corrections)
+                return .transcript(corrected)
+            }
+        }
+        let parts = session.context.literalFormatting ? correctedParts : VoiceFormatter.apply(correctedParts)
+        let composed = parts.map(\.text).joined()
         session.diagnostics?.record(.init(stage: "cleanupInput", text: composed))
         guard !composed.isEmpty else {
             complete(session, with: .emptyTranscript(generation: session.generation))
@@ -657,37 +698,79 @@ final class DictationSessionPipeline {
             return
         }
 
-        let request = DictationCleanupRequest(
-            generation: session.generation,
-            text: composed,
-            context: session.context
-        )
         session.activeTaskIsCleanup = true
+        session.cleanupFallbackText = composed
+        let deadline = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session, self.isCurrent(session),
+                  let fallback = session.cleanupFallbackText else { return }
+            session.activeTask?.cancel()
+            self.completeCleanup(session, result: .init(text: fallback, succeeded: false))
+        }
+        session.cleanupDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + cleanupTimeout, execute: deadline)
         session.activeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             session.trace?.record(.cleanupStarted)
             let result = await DictationTrace.$current.withValue(session.trace) {
                 await DictationDiagnosticStore.Recording.$current.withValue(session.diagnostics) {
-                    await self.cleanup(request)
+                    // One deadline covers all prose spans. A timeout restores
+                    // the entire deterministic composition, never a partial edit.
+                    var output = ""
+                    var succeeded = true
+                    let hasSnippets = parts.contains { if case .verbatim = $0 { return true }; return false }
+                    for part in parts {
+                        guard self.isCurrent(session), !Task.isCancelled else {
+                            return TranscriptCleanupResult(text: composed, succeeded: false)
+                        }
+                        switch part {
+                        case .verbatim(let text): output += text
+                        case .transcript(let text):
+                            // Preserve spacing at snippet boundaries even when a
+                            // cleaner trims its input or rewrites all of the prose.
+                            let body = hasSnippets ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+                            guard !body.isEmpty else { output += text; continue }
+                            let result = await self.cleanup(.init(
+                                generation: session.generation, text: body, context: session.context
+                            ))
+                            succeeded = succeeded && result.succeeded
+                            if hasSnippets {
+                                let leading = text.prefix(while: { $0.isWhitespace })
+                                let trailing = text.reversed().prefix(while: { $0.isWhitespace }).reversed()
+                                output += leading + result.text.trimmingCharacters(in: .whitespacesAndNewlines) + String(trailing)
+                            } else {
+                                output += result.text
+                            }
+                        }
+                    }
+                    return TranscriptCleanupResult(text: output, succeeded: succeeded)
                 }
             }
             guard isCurrent(session) else { return }
-            session.diagnostics?.record(.init(stage: "cleanupOutput", text: result.text,
-                                              status: result.succeeded ? "success" : "fallback"))
-            session.trace?.record(.cleanupFinished, status: Task.isCancelled ? .cancelled : (result.succeeded ? .success : .fallback))
-            guard isCurrent(session) else { return }
-            session.activeTask = nil
-            complete(
-                session,
-                with: .finalTranscript(generation: session.generation, text: result.text)
-            )
+            completeCleanup(session, result: result)
         }
+    }
+
+    private func completeCleanup(_ session: Session, result: TranscriptCleanupResult) {
+        guard isCurrent(session), session.cleanupFallbackText != nil else { return }
+        session.cleanupDeadline?.cancel()
+        session.cleanupDeadline = nil
+        session.cleanupFallbackText = nil
+        session.activeTask = nil
+        session.activeTaskIsCleanup = false
+        session.diagnostics?.record(.init(stage: "cleanupOutput", text: result.text,
+                                          status: result.succeeded ? "success" : "fallback"))
+        session.trace?.record(.cleanupFinished, status: result.succeeded ? .success : .fallback)
+        complete(session, with: .finalTranscript(generation: session.generation, text: result.text))
     }
 
     private func complete(_ session: Session, with outcome: DictationSessionOutcome) {
         guard isCurrent(session) else { return }
+        session.previewLifetime?.invalidate()
+        for lifetime in session.inferenceLifetimes.values { lifetime.invalidate() }
         session.releaseTimeout?.cancel()
         session.releaseTimeout = nil
+        session.cleanupDeadline?.cancel()
+        session.cleanupDeadline = nil
         let status: DictationTrace.Status
         switch outcome {
         case .finalTranscript: status = .success
@@ -743,6 +826,12 @@ final class DictationSessionPipeline {
     private func runTranscription(_ request: DictationTranscriptionRequest, session: Session) async throws -> String {
         try Task.checkCancellation()
         guard isCurrent(session) else { throw CancellationError() }
+        let id = UUID()
+        let lifetime = TranscriptionLifetime()
+        session.inferenceLifetimes[id] = lifetime
+        defer { session.inferenceLifetimes.removeValue(forKey: id) }
+        var request = request
+        request.lifetime = lifetime
         // A preview runs every second. Keeping its audio and text would bloat
         // the opt-in diagnostic archive, so only the trace sees it.
         let diagnostics = request.segment == .preview ? nil : session.diagnostics
@@ -785,6 +874,11 @@ final class DictationSessionPipeline {
         let work = DispatchWorkItem { [weak self, weak session] in
             guard let self, let session, self.isCurrent(session) else { return }
             session.releaseTimeout = nil
+            if let fallback = session.cleanupFallbackText {
+                session.activeTask?.cancel()
+                self.completeCleanup(session, result: .init(text: fallback, succeeded: false))
+                return
+            }
             session.trace?.record(.cancellationRequested)
             session.previewTask?.cancel()
             session.previewTask = nil

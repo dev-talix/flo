@@ -96,6 +96,32 @@ final class DictationDeliveryTests: XCTestCase {
         XCTAssertFalse(delivery.isBusy)
     }
 
+    func testPreparedReleaseAndManualRetryKeepOriginalWindowMetrics() async {
+        let effects = Effects()
+        let original = speech(0) + Array(speech().prefix(4_480)) + speech(0)
+        let prepared = DictationAudioPreparation(samples: original)
+        var requests: [DictationTranscriptionRequest] = []
+        let delivery = makeDelivery(effects: effects) { request in
+            requests.append(request)
+            return ""
+        }
+        let generation = delivery.begin(configuration())
+        delivery.release(generation: generation, samples: original)
+        await waitUntil { effects.outcomes.count == 1 }
+        XCTAssertEqual(requests.count, 1, "Admission must not change the original-window retry decision")
+        XCTAssertEqual(effects.outcomes, [.emptyTranscript(generation: generation)])
+        XCTAssertEqual(effects.releases.first?.duration, prepared.duration)
+        XCTAssertEqual(delivery.retryCount, 1)
+
+        delivery.retryFailedDictations { self.configuration() }
+        await waitUntil { effects.outcomes.count == 2 }
+        XCTAssertEqual(requests.count, 2, "Manual retry must retain the original, not the trimmed request")
+        XCTAssertTrue(requests.allSatisfy { $0.samples == prepared.samples && !$0.lowEnergy })
+        XCTAssertEqual(delivery.retryCount, 1)
+        XCTAssertTrue(effects.history.isEmpty)
+        XCTAssertTrue(effects.injected.isEmpty)
+    }
+
     /// Escape can land between release and the audio handoff. The cancel
     /// has nothing to report yet (the caller hides the HUD itself), and the
     /// late handoff must not revive the dictation.
@@ -199,13 +225,17 @@ final class DictationDeliveryTests: XCTestCase {
         DictationDelivery(
             transcribe: transcribe,
             cleanup: { .init(text: $0.text, succeeded: true) },
-            inject: { text, completion in effects.injected.append(text); effects.completions.append(completion) },
+            inject: { text, _, ready, completion in
+                effects.injected.append(text)
+                effects.completions.append(completion)
+                ready()
+            },
             recordTranscript: { effects.history.append($0) },
             onOutcome: { outcome, release in effects.outcomes.append(outcome); effects.releases.append(release) },
             onCancelled: { effects.cancelled.append($0) },
             onCommandCancelled: { effects.cancelledCommands.append($0) },
             onProcessingCountChange: { effects.processingCounts.append($0) },
-            stallTimeout: stallTimeout, injectionInterval: 0
+            stallTimeout: stallTimeout
         )
     }
 

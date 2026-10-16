@@ -12,7 +12,8 @@ final class InjectionCoordinatorTests: XCTestCase {
 
         let coordinator = InjectionCoordinator(
             stallTimeout: 0,
-            onInject: { text in
+            onInject: { text, _, ready in
+                defer { ready() }
                 pasted.append(text)
                 laterPasted.fulfill()
             },
@@ -66,9 +67,9 @@ final class InjectionCoordinatorTests: XCTestCase {
         var scheduled: [(TimeInterval, DispatchWorkItem)] = []
         let coordinator = InjectionCoordinator(
             stallTimeout: 0.4,
-            injectionInterval: 0,
             scheduleStall: { scheduled.append(($0, $1)) },
-            onInject: { text in
+            onInject: { text, _, ready in
+                defer { ready() }
                 events.append("paste:\(text)")
                 drained.fulfill()
             },
@@ -122,9 +123,8 @@ final class InjectionCoordinatorTests: XCTestCase {
         var counts: [Int] = []
         let coordinator = InjectionCoordinator(
             stallTimeout: 90,
-            injectionInterval: 0,
             scheduleStall: { _, work in timers.append(work) },
-            onInject: { _ in XCTFail("Timed out command must not paste") },
+            onInject: { _, _, ready in XCTFail("Timed out command must not paste"); ready() },
             onCancel: { sequence, _ in cancelled.append(sequence) },
             onProcessingCountChange: { counts.append($0) }
         )
@@ -139,6 +139,33 @@ final class InjectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.pendingCount, 0)
         XCTAssertEqual(counts.last, 0)
         coordinator.complete(first, with: .inject("late first"))
+    }
+
+    func testReadinessCallbackIsOneShotAndKeepsFollowersInOrder() {
+        var delivered: [String] = []
+        var ready: [() -> Void] = []
+        let coordinator = InjectionCoordinator(
+            stallTimeout: 90,
+            onInject: { text, _, callback in delivered.append(text); ready.append(callback) },
+            onCancel: { _, _ in XCTFail("Unexpected cancellation") },
+            onProcessingCountChange: { _ in }
+        )
+        let first = coordinator.begin(kind: .dictation)
+        let second = coordinator.begin(kind: .command)
+        let third = coordinator.begin(kind: .dictation)
+        coordinator.complete(third, with: .inject("third"))
+        coordinator.complete(second, with: .inject("second"))
+        coordinator.complete(first, with: .inject("first"))
+        XCTAssertEqual(delivered, ["first"])
+        ready[0]()
+        XCTAssertEqual(delivered, ["first", "second"])
+        ready[0]()
+        XCTAssertEqual(delivered, ["first", "second"])
+        ready[1]()
+        XCTAssertEqual(delivered, ["first", "second", "third"])
+        ready[1]()
+        ready[2]()
+        XCTAssertEqual(coordinator.pendingCount, 0)
     }
 
     private func settleAsyncWork() async {

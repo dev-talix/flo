@@ -46,7 +46,7 @@ final class DictationAudioPreparationTests: XCTestCase {
             delivered.fulfill()
         })
         pipeline.begin(generation: 1, context: context, diagnostics: recording)
-        pipeline.release(generation: 1, fullSamples: original)
+        pipeline.release(generation: 1, audio: DictationAudioPreparation(samples: original))
         await fulfillment(of: [delivered], timeout: 2)
         XCTAssertEqual(requests.map(\.segment), [.fullUtterance, .fullUtterance])
         for request in requests {
@@ -150,6 +150,32 @@ final class DictationAudioPreparationTests: XCTestCase {
         pipeline.release(generation: 1, fullSamples: original)
         await fulfillment(of: [delivered], timeout: 2)
         XCTAssertEqual(requests, 1)
+    }
+
+    func testPreparedReleaseKeepsOriginalSamplesAndHalfFrameRetryMetrics() async {
+        let original = audio(0, seconds: 1) + audio(0.2, seconds: 0.28) + audio(0, seconds: 1)
+        let prepared = DictationAudioPreparation(samples: original)
+        XCTAssertEqual(prepared.originalSamples, original)
+        XCTAssertLessThan(prepared.samples.count, original.count)
+        XCTAssertTrue(prepared.isAdmitted)
+        XCTAssertFalse(prepared.canRetryEmptyResult)
+        XCTAssertEqual(prepared.rawVoicedSeconds, 0.28)
+        XCTAssertEqual(prepared.voicedSeconds, 0.3)
+
+        var requests: [DictationTranscriptionRequest] = []
+        let delivered = expectation(description: "prepared release without extra retry")
+        let pipeline = DictationSessionPipeline(transcribe: { request in
+            requests.append(request)
+            return ""
+        }, cleanup: { request in .init(text: request.text, succeeded: true) }, onOutcome: { outcome in
+            XCTAssertEqual(outcome, .emptyTranscript(generation: 1))
+            delivered.fulfill()
+        })
+        pipeline.begin(generation: 1, context: context)
+        pipeline.release(generation: 1, audio: prepared)
+        await fulfillment(of: [delivered], timeout: 2)
+        XCTAssertEqual(requests.map(\.segment), [.fullUtterance])
+        XCTAssertEqual(requests.first?.samples, prepared.samples)
     }
 
     func testEmptyTailPreservesCommittedTranscriptWithoutDecoderOrFallback() async {

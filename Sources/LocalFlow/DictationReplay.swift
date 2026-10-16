@@ -103,7 +103,8 @@ enum DictationReplay {
         let duration = Double(samples.count) / AudioRecorder.sampleRate
         guard duration <= 300 else { throw ReplayError.audioTooLong(duration) }
 
-        guard DictationAudioPreparation(samples: samples).isAdmitted else {
+        let audio = DictationAudioPreparation(samples: samples)
+        guard audio.isAdmitted else {
             throw ReplayError.insufficientVoice
         }
 
@@ -118,10 +119,7 @@ enum DictationReplay {
         let receiver = OutcomeReceiver()
         let pipeline = DictationSessionPipeline(
             transcribe: { request in
-                try await transcriber.transcribe(
-                    samples: request.samples,
-                    lowEnergy: request.lowEnergy
-                )
+                try await transcriber.transcribe(request)
             },
             cleanup: { request in
                 do {
@@ -143,6 +141,7 @@ enum DictationReplay {
             styleProfile: .general,
             corrections: Settings.corrections,
             snippets: Settings.snippets,
+            literalFormatting: Settings.literalFormatting,
             ollamaModel: options.ollamaModel,
             incrementalCadence: .forModel(options.whisperModel)
         )
@@ -178,7 +177,7 @@ enum DictationReplay {
                 }
                 let releasedAt = DispatchTime.now().uptimeNanoseconds
                 trace?.record(.hotkeyReleased, at: releasedAt)
-                pipeline.release(generation: generation, fullSamples: samples)
+                pipeline.release(generation: generation, audio: audio)
 
                 let timeout = Task { @MainActor in
                     try? await Task.sleep(for: .seconds(180))

@@ -24,7 +24,7 @@ final class DictationDelivery {
         let release: Release
     }
 
-    typealias Inject = (String, @escaping () -> Void) -> Void
+    typealias Inject = (String, TextInjector.CommandTarget?, @escaping () -> Void, @escaping () -> Void) -> Void
 
     private let transcribe: DictationSessionPipeline.Transcribe
     private let cleanup: DictationSessionPipeline.Cleanup
@@ -36,7 +36,6 @@ final class DictationDelivery {
     private let onProcessingCountChange: (Int) -> Void
     private let onPartialTranscript: (Int, String) -> Void
     private let stallTimeout: TimeInterval
-    private let injectionInterval: TimeInterval
 
     private var nextGeneration = 0
     private var configurations: [Int: Configuration] = [:]
@@ -55,8 +54,10 @@ final class DictationDelivery {
     )
     private lazy var injections = InjectionCoordinator(
         stallTimeout: stallTimeout,
-        injectionInterval: injectionInterval,
-        onInject: { [weak self] in self?.deliver($0) },
+        onInject: { [weak self] text, target, ready in
+            guard let self else { ready(); return }
+            self.deliver(text, target: target, ready: ready)
+        },
         onCancel: { [weak self] sequence, kind in
             guard let self else { return }
             switch kind {
@@ -81,8 +82,7 @@ final class DictationDelivery {
         onCancelled: @escaping (Release) -> Void,
         onCommandCancelled: @escaping (Int) -> Void,
         onProcessingCountChange: @escaping (Int) -> Void,
-        stallTimeout: TimeInterval = 90,
-        injectionInterval: TimeInterval = 0.4
+        stallTimeout: TimeInterval = 90
     ) {
         self.transcribe = transcribe
         self.cleanup = cleanup
@@ -94,7 +94,6 @@ final class DictationDelivery {
         self.onProcessingCountChange = onProcessingCountChange
         self.onPartialTranscript = onPartialTranscript
         self.stallTimeout = stallTimeout
-        self.injectionInterval = injectionInterval
     }
 
     var retryCount: Int { retrySamples.count }
@@ -129,7 +128,7 @@ final class DictationDelivery {
         ))
         if let sequence { generationsBySequence[sequence] = generation }
         pipeline.recordCapturedAudio(generation: generation, samples: samples, nativeAudio: nativeAudio)
-        pipeline.release(generation: generation, fullSamples: samples)
+        pipeline.release(generation: generation, audio: audio)
     }
 
     /// See `DictationSessionPipeline.cancel(generation:interruptInference:)`.
@@ -165,7 +164,7 @@ final class DictationDelivery {
 
     func completeCommand(_ sequence: Int, with outcome: InjectionCoordinator.Outcome) {
         guard pendingCommands.remove(sequence) != nil else { return }
-        if case .inject(let text) = outcome { recordTranscript(text) }
+        if case .inject(let text, _) = outcome { recordTranscript(text) }
         injections.complete(sequence, with: outcome)
     }
 
@@ -192,9 +191,9 @@ final class DictationDelivery {
         onOutcome(outcome, completed.release)
     }
 
-    private func deliver(_ text: String) {
+    private func deliver(_ text: String, target: TextInjector.CommandTarget?, ready: @escaping () -> Void) {
         let id = UUID()
         activeInjections.insert(id)
-        inject(text) { [weak self] in self?.activeInjections.remove(id) }
+        inject(text, target, ready) { [weak self] in self?.activeInjections.remove(id) }
     }
 }

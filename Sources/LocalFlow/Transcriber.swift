@@ -1,36 +1,55 @@
 import Foundation
 import WhisperKit
 
-/// A one-permit FIFO gate. WhisperKit's inference entry point is async but
+/// A one-permit gate, FIFO within each purpose, with authoritative work first.
+/// WhisperKit's inference entry point is async but
 /// mutates shared decoder/progress state, so actor reentrancy alone is not a
 /// sufficient serialization boundary.
 actor TranscriptionGate {
+    enum GateError: Error { case replaced }
     private struct Waiter {
         let id: UUID
+        let isPreview: Bool
         let continuation: CheckedContinuation<Void, Error>
     }
     private var occupied = false
+    private var retired = false
     private var waiters: [Waiter] = []
 
-    func acquire() async throws {
+    func acquire(purpose: TranscriptionPurpose = .authoritative, lifetime: TranscriptionLifetime? = nil) async throws {
         try Task.checkCancellation()
+        try lifetime?.checkCurrent()
+        guard !retired else { throw GateError.replaced }
+        let preview = purpose.preview
+        try preview?.checkCurrent()
         if !occupied {
             occupied = true
             return
         }
         let id = UUID()
+        defer {
+            preview?.stopObserving()
+            lifetime?.stopObserving()
+        }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                waiters.append(Waiter(id: id, continuation: continuation))
+                waiters.append(Waiter(id: id, isPreview: preview != nil, continuation: continuation))
+                let cancel: @Sendable () -> Void = { Task { await self.cancelWaiter(id) } }
+                preview?.observeInvalidation(cancel)
+                lifetime?.observeInvalidation(cancel)
             }
         } onCancel: {
             Task { await self.cancelWaiter(id) }
         }
         // Cancellation can race the handoff. Return the permit if this
         // cancelled request acquired it before cancelWaiter ran.
-        if Task.isCancelled {
+        do {
+            try Task.checkCancellation()
+            try preview?.checkCurrent()
+            try lifetime?.checkCurrent()
+        } catch {
             release()
-            throw CancellationError()
+            throw error
         }
     }
 
@@ -44,7 +63,17 @@ actor TranscriptionGate {
             occupied = false
             return
         }
-        waiters.removeFirst().continuation.resume()
+        let index = waiters.firstIndex { !$0.isPreview } ?? 0
+        waiters.remove(at: index).continuation.resume()
+    }
+
+    /// Wake queued requests to re-evaluate the current engine. The active
+    /// holder keeps its permit until it returns, even if it never cooperates.
+    func retire() {
+        retired = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.continuation.resume(throwing: GateError.replaced) }
     }
 
     var waitingCount: Int { waiters.count }
@@ -70,9 +99,18 @@ actor Transcriber {
 
     typealias ModelLoader = (String, DictationTrace) async throws -> any SpeechEngine
     private let modelLoader: ModelLoader
+    private let abandonedInferenceGrace: TimeInterval
+    private let now: @Sendable () -> TimeInterval
+    private var previewReadyAt: [String: TimeInterval] = [:]
 
-    init(modelLoader: @escaping ModelLoader = Transcriber.loadEngine) {
+    init(
+        modelLoader: @escaping ModelLoader = Transcriber.loadEngine,
+        abandonedInferenceGrace: TimeInterval = 90,
+        now: @escaping @Sendable () -> TimeInterval = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
+    ) {
         self.modelLoader = modelLoader
+        self.abandonedInferenceGrace = abandonedInferenceGrace
+        self.now = now
     }
 
     private var engine: (any SpeechEngine)?
@@ -80,7 +118,8 @@ actor Transcriber {
     private var loadGeneration = 0
     private var transcriptionGate = TranscriptionGate()
     private var engineGeneration = 0
-    private var activeEngineGenerations: Set<Int> = []
+    private var activeEngineGenerations: [Int: UUID] = [:]
+    private var abandonmentDeadlines: [Int: Task<Void, Never>] = [:]
     private var quarantinedEngineGenerations: Set<Int> = []
     // One CoreML pipeline construction at a time: rapid model switches could
     // otherwise build several multi-hundred-MB pipelines concurrently.
@@ -96,14 +135,17 @@ actor Transcriber {
     func load(model: String) async throws {
         let trace = DictationTrace(source: .modelLoad)
         trace.record(.modelLoadRequested, model: model)
+        // Even a warm shortcut is the newest request and invalidates older loads.
+        loadGeneration += 1
+        let generation = loadGeneration
         if loadedModel == model, engine != nil {
             trace.record(.modelLoadFinished, status: .warm, model: model)
             return
         }
-        guard quarantinedEngineGenerations.count < 2 else { throw TranscriberError.recoveryBusy }
-        loadGeneration += 1
-        let generation = loadGeneration
-
+        // Every unresolved holder retains its engine, including abandoned work
+        // still inside grace. Count it before replacement so model switches
+        // cannot bypass the two-quarantined-engine limit.
+        guard activeEngineGenerations.count < 2 else { throw TranscriberError.recoveryBusy }
         trace.record(.modelLoadWaitStarted)
         try await loadGate.acquire()
         trace.record(.modelLoadAcquired)
@@ -117,7 +159,7 @@ actor Transcriber {
 
         let pipe: any SpeechEngine
         do {
-            guard quarantinedEngineGenerations.count < 2 else { throw TranscriberError.recoveryBusy }
+            guard activeEngineGenerations.count < 2 else { throw TranscriberError.recoveryBusy }
             pipe = try await modelLoader(model, trace)
         } catch {
             await loadGate.release()
@@ -140,11 +182,13 @@ actor Transcriber {
             return
         }
         try Task.checkCancellation()
-        guard quarantinedEngineGenerations.count < 2 else { throw TranscriberError.recoveryBusy }
+        guard activeEngineGenerations.count < 2 else { throw TranscriberError.recoveryBusy }
         engineGeneration += 1
+        let previousGate = transcriptionGate
         transcriptionGate = TranscriptionGate()
         engine = pipe
         loadedModel = model
+        await previousGate.retire()
         trace.record(.modelLoadFinished, status: .success)
     }
 
@@ -168,12 +212,15 @@ actor Transcriber {
     /// people legitimately dictate "thank you".
     func transcribe(
         samples: [Float],
-        lowEnergy: Bool = false
+        lowEnergy: Bool = false,
+        purpose: TranscriptionPurpose = .authoritative,
+        lifetime: TranscriptionLifetime? = nil
     ) async throws -> String {
         guard engine != nil else { throw TranscriberError.notLoaded }
+        try checkPreviewBudget(purpose, model: loadedModel)
         let trace = DictationTrace.current
         trace?.record(.engineWaitStarted)
-        let lease = try await acquireEngine()
+        let lease = try await acquireEngine(purpose: purpose, lifetime: lifetime)
         let gate = lease.gate
         let engine = lease.engine
         trace?.record(.engineAcquired, model: lease.model)
@@ -186,6 +233,7 @@ actor Transcriber {
         let isHallucination: Bool
         let raw: String
         do {
+            try checkPreviewBudget(purpose, model: lease.model)
             if let trace {
                 let voice = AudioRecorder.voicedMetrics(of: samples)
                 var inputFields = DictationTrace.runtimeFields()
@@ -195,11 +243,11 @@ actor Transcriber {
                     inputFields[.voicedDBFS] = Double(voice.voicedDBFS)
                 }
                 inputFields[.lowEnergy] = lowEnergy ? 1 : 0
-                inputFields.merge(await engine.inferenceStartFields(lowEnergy: lowEnergy)) { _, engineValue in engineValue }
+                inputFields.merge(await engine.inferenceStartFields(lowEnergy: lowEnergy, purpose: purpose)) { _, engineValue in engineValue }
                 trace.record(.inferenceStarted, fields: inputFields)
             }
-            result = try await runInference(generation: lease.generation) {
-                try await engine.transcribe(samples: samples, lowEnergy: lowEnergy)
+            result = try await runInference(generation: lease.generation, purpose: purpose, model: lease.model, lifetime: lifetime) {
+                try await engine.transcribe(samples: samples, lowEnergy: lowEnergy, purpose: purpose)
             }
             try Task.checkCancellation()
             let inferenceFinishedAt = DispatchTime.now().uptimeNanoseconds
@@ -245,6 +293,7 @@ actor Transcriber {
         // Retrying a result we already filtered as non-speech repeats the delay.
         if isHallucination { throw TranscriberError.noSpeech }
         try Task.checkCancellation()
+        try lifetime?.checkCurrent()
         return text
     }
 
@@ -255,12 +304,32 @@ actor Transcriber {
         return try await transcribe(samples: WhisperEngine.loadSamples(path: path))
     }
 
-    private func acquireEngine() async throws -> (
+    func transcribe(_ request: DictationTranscriptionRequest) async throws -> String {
+        try await transcribe(samples: request.samples, lowEnergy: request.lowEnergy, purpose: request.purpose, lifetime: request.lifetime)
+    }
+
+    private func checkPreviewBudget(_ purpose: TranscriptionPurpose, model: String?) throws {
+        guard let preview = purpose.preview else { return }
+        try preview.checkCurrent()
+        if let model, let readyAt = previewReadyAt[model], now() < readyAt {
+            // A skipped preview has no effect on recovery or engine health.
+            throw CancellationError()
+        }
+    }
+
+    var waitingInferenceCount: Int { get async { await transcriptionGate.waitingCount } }
+
+    private func acquireEngine(purpose: TranscriptionPurpose, lifetime: TranscriptionLifetime?) async throws -> (
         gate: TranscriptionGate, engine: any SpeechEngine, generation: Int, model: String?
     ) {
         while true {
             let gate = transcriptionGate
-            try await gate.acquire()
+            do {
+                try await gate.acquire(purpose: purpose, lifetime: lifetime)
+            } catch TranscriptionGate.GateError.replaced {
+                guard engine != nil else { throw TranscriberError.notLoaded }
+                continue
+            }
             if Task.isCancelled {
                 await gate.release()
                 throw CancellationError()
@@ -278,33 +347,66 @@ actor Transcriber {
 
     private func runInference(
         generation: Int,
+        purpose: TranscriptionPurpose,
+        model: String?,
+        lifetime: TranscriptionLifetime?,
         _ infer: () async throws -> EngineTranscription
     ) async throws -> EngineTranscription {
         try Task.checkCancellation()
-        activeEngineGenerations.insert(generation)
+        try purpose.preview?.checkCurrent()
+        try lifetime?.checkCurrent()
+        let started = now()
+        let inferenceID = UUID()
+        activeEngineGenerations[generation] = inferenceID
+        lifetime?.observeInvalidation {
+            Task { await self.abandonInference(generation: generation, inferenceID: inferenceID) }
+        }
         defer {
-            activeEngineGenerations.remove(generation)
+            lifetime?.stopObserving()
+            abandonmentDeadlines.removeValue(forKey: generation)?.cancel()
+            if purpose.preview != nil, let model, generation == engineGeneration,
+               !Task.isCancelled, lifetime?.isInvalidated != true {
+                // Rest for the observed inference duration. Slow models get
+                // fewer disposable calls; final requests never use this budget.
+                let finished = now()
+                previewReadyAt[model] = finished + max(0, finished - started)
+            }
+            activeEngineGenerations.removeValue(forKey: generation)
             quarantinedEngineGenerations.remove(generation)
         }
         return try await withTaskCancellationHandler {
             let result = try await infer()
             try Task.checkCancellation()
+            try lifetime?.checkCurrent()
+            guard !quarantinedEngineGenerations.contains(generation) else { throw CancellationError() }
             return result
         } onCancel: {
-            Task { await self.quarantineEngine(generation: generation) }
+            Task { await self.quarantineEngine(generation: generation, inferenceID: inferenceID) }
         }
     }
 
-    private func quarantineEngine(generation: Int) {
-        guard activeEngineGenerations.contains(generation) else { return }
+    private func abandonInference(generation: Int, inferenceID: UUID) {
+        guard activeEngineGenerations[generation] == inferenceID,
+              abandonmentDeadlines[generation] == nil else { return }
+        let grace = abandonedInferenceGrace
+        abandonmentDeadlines[generation] = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(grace)) } catch { return }
+            await self?.quarantineEngine(generation: generation, inferenceID: inferenceID)
+        }
+    }
+
+    private func quarantineEngine(generation: Int, inferenceID: UUID) async {
+        guard activeEngineGenerations[generation] == inferenceID else { return }
         quarantinedEngineGenerations.insert(generation)
         guard generation == engineGeneration else { return }
         engine = nil
         loadedModel = nil
         // The old call owns its old gate until inference actually returns.
         // Only a new model instance may use this replacement gate.
+        let previousGate = transcriptionGate
         transcriptionGate = TranscriptionGate()
         engineGeneration += 1
+        await previousGate.retire()
     }
 
     /// The transcripts Whisper canonically hallucinates for (near-)silent

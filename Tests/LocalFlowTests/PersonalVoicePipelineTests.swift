@@ -4,6 +4,63 @@ import XCTest
 
 @MainActor
 final class PersonalVoicePipelineTests: XCTestCase {
+    func testDeliveryRetainsOriginalFallbackOnceAcrossManualRetry() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PersonalVoiceStore(folder: root)
+        let context = DictationSessionContext(cleanupEnabled: false, styleProfile: .general, corrections: [], snippets: [])
+        let recording = store.begin(.init(traceID: UUID(), context: context, whisperModel: "test",
+                                          microphone: "synthetic-input", vocabulary: ""))
+        let silence = [Float](repeating: 0, count: 16_000)
+        let original = silence + [Float](repeating: 0.005, count: 16_000) + silence
+        let prepared = DictationAudioPreparation(samples: original)
+        let failed = expectation(description: "failed release retained")
+        let retried = expectation(description: "manual retry completed")
+        var requests = 0
+        let delivery = DictationDelivery(transcribe: { request in
+            XCTAssertEqual(request.samples, prepared.samples)
+            XCTAssertTrue(request.lowEnergy)
+            requests += 1
+            if requests == 1 { throw CocoaError(.fileReadUnknown) }
+            return "retried words"
+        }, cleanup: { .init(text: $0.text, succeeded: true) }, inject: { _, _, ready, completion in completion(); ready() },
+        recordTranscript: { _ in }, onOutcome: { outcome, _ in
+            switch outcome {
+            case .failed: failed.fulfill()
+            case .finalTranscript: retried.fulfill()
+            default: XCTFail("Unexpected outcome")
+            }
+        }, onCancelled: { _ in XCTFail("Unexpected cancellation") }, onCommandCancelled: { _ in },
+        onProcessingCountChange: { _ in })
+        let generation = delivery.begin(.init(context: context, personalVoice: recording))
+        delivery.release(generation: generation, samples: original)
+        await fulfillment(of: [failed], timeout: 2)
+        delivery.retryFailedDictations { .init(context: context, personalVoice: recording) }
+        await fulfillment(of: [retried], timeout: 2)
+
+        let snapshot = try await store.snapshot()
+        XCTAssertEqual(snapshot.clips.count, 1)
+        let clip = try XCTUnwrap(snapshot.clips.first)
+        XCTAssertEqual(clip.sampleRate, AudioRecorder.sampleRate)
+        XCTAssertTrue(clip.failureReason?.contains("status: failed") == true)
+        XCTAssertTrue(clip.rawTranscript.isEmpty, "Manual retry must not update the personal clip")
+        XCTAssertNil(clip.finalTranscript)
+        let file = try AVAudioFile(forReading: store.audioURL(for: clip.id))
+        XCTAssertEqual(file.length, AVAudioFramePosition(original.count))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                                 frameCapacity: AVAudioFrameCount(file.length)))
+        var retained: [Float] = []
+        while file.framePosition < file.length {
+            try file.read(into: buffer)
+            guard buffer.frameLength > 0 else { break }
+            let channel = try XCTUnwrap(buffer.floatChannelData?[0])
+            retained.append(contentsOf: UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+        }
+        XCTAssertEqual(retained, original)
+        XCTAssertEqual(requests, 2)
+        XCTAssertEqual(delivery.retryCount, 0)
+    }
+
     func testNativeOriginalAndRawTranscriptSurviveWithDiagnosticsDisabled() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

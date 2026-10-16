@@ -81,8 +81,9 @@ final class DictationTraceTests: XCTestCase {
         let dispatched = expectation(description: "second output dispatched")
         var outputs: [String] = []
         let queue = InjectionCoordinator(
-            stallTimeout: 1, injectionInterval: 0.01,
-            onInject: { text in
+            stallTimeout: 1,
+            onInject: { text, _, ready in
+                DispatchQueue.main.async { ready() }
                 outputs.append(text)
                 DictationTrace.current?.record(.pasteDispatched)
                 if text == "second" { dispatched.fulfill() }
