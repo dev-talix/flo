@@ -190,6 +190,85 @@ final class DiagnosticsArchiveTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: archive.directory.path).count, 1)
     }
 
+    func testFailedLegacyRecoveryStillStartsExpiryAndKeepsLogForSuccessfulRetry() throws {
+        let archive = DiagnosticsArchive(directory: root.appendingPathComponent("history"))
+        let recordings = root.appendingPathComponent("DiagnosticRecordings")
+        let expired = recordings.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: expired, withIntermediateDirectories: true)
+        // Malformed sidecars fail legacy ingest. Retention must not parse them.
+        try Data([0xff]).write(to: expired.appendingPathComponent("timing.jsonl"))
+        try Data("malformed fixture".utf8).write(to: expired.appendingPathComponent("metadata.json"))
+        try Data("malformed fixture".utf8).write(to: expired.appendingPathComponent("events.jsonl"))
+        let log = root.appendingPathComponent("legacy.log")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let json = String(decoding: try encoder.encode(event()), as: UTF8.self)
+        let original = Data((String(repeating: "x", count: 5_000_001) + "\n0 0 timing " + json + "\n").utf8)
+        try original.write(to: log)
+        let suite = "Flo-R6-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = DictationDiagnosticStore(folder: recordings,
+            now: { Date().addingTimeInterval(8 * 86_400) })
+        var calls = 0
+        let recovered = DiagLog.startSession(archive: archive, log: log, defaults: defaults) {
+            calls += 1
+            XCTAssertTrue(FileManager.default.fileExists(atPath: log.path))
+            store.startMaintenance()
+        }
+        store.flush()
+        XCTAssertFalse(recovered)
+        XCTAssertEqual(calls, 1)
+        XCTAssertFalse(store.hasWriteFailure)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expired.path))
+        XCTAssertEqual(try Data(contentsOf: log), original)
+        XCTAssertEqual(defaults.integer(forKey: "diagLogPrivacyVersion"), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: archive.directory.appendingPathComponent("migration-v1").path))
+
+        // Expiry removed the malformed source, but log evidence survives for this retry.
+        let retried = DiagLog.startSession(archive: archive, log: log, defaults: defaults) {
+            calls += 1
+            XCTAssertFalse(FileManager.default.fileExists(atPath: log.path))
+        }
+        XCTAssertTrue(retried)
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(try archive.read().traces.count, 1)
+        XCTAssertEqual(defaults.integer(forKey: "diagLogPrivacyVersion"), 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archive.directory.appendingPathComponent("migration-v1").path))
+    }
+
+    func testSuccessfulRecoveryPrecedesExpiryAndUnbundledStartupStillCallsMaintenance() throws {
+        let archive = DiagnosticsArchive(directory: root.appendingPathComponent("history"))
+        let log = root.appendingPathComponent("legacy.log")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let json = String(decoding: try encoder.encode(event()), as: UTF8.self)
+        try Data(("0 0 timing " + json + "\n").utf8).write(to: log)
+        let recordings = root.appendingPathComponent("DiagnosticRecordings")
+        let sidecar = recordings.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: sidecar, withIntermediateDirectories: true)
+        try encoder.encode(event()).write(to: sidecar.appendingPathComponent("timing.jsonl"))
+        let store = DictationDiagnosticStore(folder: recordings,
+            now: { Date().addingTimeInterval(8 * 86_400) })
+        let suite = "Flo-R6-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        var calls = 0
+        let recovered = DiagLog.startSession(archive: archive, log: log, defaults: defaults) {
+            calls += 1
+            XCTAssertEqual(try? archive.read().traces.count, 2)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: log.path))
+            store.startMaintenance()
+        }
+        store.flush()
+        XCTAssertTrue(recovered)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sidecar.path))
+        XCTAssertEqual(try archive.read().traces.count, 2)
+        let unbundled = DiagLog.startSession(archive: nil, log: log, defaults: defaults) { calls += 1 }
+        XCTAssertTrue(unbundled)
+        XCTAssertEqual(calls, 2)
+    }
+
     func testStorageFailureIsReported() throws {
         let file = root.appendingPathComponent("not-a-directory")
         try Data().write(to: file)

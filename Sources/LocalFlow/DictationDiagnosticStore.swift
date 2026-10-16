@@ -140,8 +140,9 @@ final class DictationDiagnosticStore: @unchecked Sendable {
     func startMaintenance() {
         queue.async {
             guard self.timer == nil else { return }
+            self.performWrite { try self.pruneNow() }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now(), repeating: 3600)
+            timer.schedule(deadline: .now() + 3600, repeating: 3600)
             timer.setEventHandler { [weak self] in
                 guard let self else { return }
                 self.performWrite { try self.pruneNow() }

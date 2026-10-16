@@ -229,3 +229,73 @@ clipboard interaction, or typing was performed.
 - PASS, exit 0: the same 135-test selection with `swift test -c release --scratch-path .build-e5 --disable-automatic-resolution --filter 'Diagnostics|DictationDiagnostic|AudioCaptureLifecycle|AudioRecorder|NativeAudio|DictationSession|DictationDelivery|DictationTrace|WaveformOverlay'`. Evidence: `/tmp/flo-e5-release.log`.
 - PASS, exit 0: `git diff --check`, repeated after implementation.
 - NOT RUN: full suite, real-device audio/converter continuity, real speech recognition, live HUD appearance, CPU/power profiling, app installation, and external publication. Flo maintainers own these checks after integration. Existing compiler warnings were also present in the baseline.
+
+## R6 recovery-independent expiry, October 16, 2026
+
+Owner: Flo maintainers. The R6 request requires retained-audio expiry to start
+even when legacy timing recovery or personal voice import fails. It also requires
+late diagnostic transcript stages to reach existing personal clips while user
+review decisions survive. The import policy and its acceptance cases are in
+[the R6 personal voice record](personal-voice.md#r6-diagnostic-import-reconciliation-october-16-2026).
+
+`AppDelegate.applicationDidFinishLaunching` calls `DiagLog.startSession`, which
+attempts timing recovery on its serial queue before invoking the existing
+retained-audio maintenance callback. The callback now runs after every attempt,
+including failure. The storage-injected `startSession` overload is shared by
+production startup and synthetic recovery tests. It preserves the legacy log
+and privacy migration version after failed ingest, including logs over 5 MB.
+A successful later attempt permits privacy cleanup and size rotation. Recovery
+failure still makes timing history reads/exports report failure.
+
+`DictationDiagnosticStore.startMaintenance` runs its first reconciliation/prune
+on the existing utility queue before scheduling hourly passes. Expiry does not
+parse event or metadata contents. E5 byte accounting, reconciliation, quota,
+private writes, and serialized deletion remain in use. Recovery still precedes
+expiry so successful ingest can archive timing sidecars before removal. After a
+failed recovery, expired diagnostic folders remain subject to the seven-day and
+1 GB policies, while the legacy log is kept for retry. A malformed source cannot
+disable that retention. Personal voice has no automatic expiry; its permanent
+copies survive diagnostic source deletion.
+
+`DiagnosticsArchiveTests.testFailedLegacyRecoveryStillStartsExpiryAndKeepsLogForSuccessfulRetry`
+uses malformed synthetic sidecars and an oversized legacy log to verify failure,
+maintenance invocation, expiry, retained log evidence, and successful retry.
+`testSuccessfulRecoveryPrecedesExpiryAndUnbundledStartupStillCallsMaintenance`
+verifies log and sidecar ingest before expiry and the unbundled callback path.
+No live app, microphone, clipboard, real diagnostic archive, or personal voice
+data was inspected or deleted.
+
+Verification source: foundation `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`,
+unchanged E5 patch `fd2e38336b8c451dff16d03ab69b80735b57ea52` cherry-picked as
+`412f574`, plus the R6 diff at `/tmp/flo-r6.diff`. The implementation handoff
+supplies the final local R6 commit. Environment: macOS 27.0.1, arm64, Apple Swift
+6.4. Dependencies were copied from the existing E5 cache into this worktree's
+ignored `.build`. Initial baseline preparation failed because copied artifact
+paths referenced E5's old scratch location; correcting only the copied metadata
+resolved that build failure. No dependency installation was needed.
+
+- PASS, exit 0: `swift test --disable-automatic-resolution --filter 'DiagnosticsArchiveTests|PersonalVoiceStoreTests|DictationDiagnosticStoreTests'`,
+  41 baseline tests. Evidence: `/tmp/flo-r6-baseline.log`.
+- EXPECTED FAIL, exit 1: `swift test --disable-automatic-resolution --filter 'PersonalVoiceStoreTests.testDiagnosticImportReconcilesLate|PersonalVoiceStoreTests.testDiagnosticReconciliation|PersonalVoiceStoreTests.testInterruptedImport'`,
+  three new tests against the original import implementation, 13 failed
+  assertions. Evidence: `/tmp/flo-r6-import-red.log`.
+- EXPECTED FAIL, exit 1: `env CFFIXED_USER_HOME=/tmp/flo-r6-test-home swift test --disable-automatic-resolution --filter 'DiagnosticsArchiveTests.testFailedLegacyRecoveryStillStartsExpiry'`,
+  one test with the historical recovery callback gate temporarily restored,
+  six failed assertions. Evidence: `/tmp/flo-r6-recovery-red.log`.
+- EXPECTED FAIL, exit 1: the same recovery command with premature legacy-log
+  purging temporarily restored, one test with three failures, including the
+  missing-log read. Evidence: `/tmp/flo-r6-legacy-preservation-red.log`.
+  Both seeded changes were restored before final verification.
+- PASS, exit 0: `env CFFIXED_USER_HOME=/tmp/flo-r6-test-home swift test --disable-automatic-resolution --filter 'DiagnosticsArchiveTests|PersonalVoiceStoreTests|DictationDiagnosticStoreTests'`,
+  47 tests. Evidence: `/tmp/flo-r6-focused.log`. The synthetic home also redirects
+  incidental diagnostic logging and test preferences away from the user home.
+- PASS, exit 0: `env CFFIXED_USER_HOME=/tmp/flo-r6-test-home swift test --disable-automatic-resolution --filter 'Diagnostics|DictationDiagnostic|PersonalVoice|NativeAudioRecording|DictationSession|DictationTrace|DictationDelivery'`,
+  129 tests. Evidence: `/tmp/flo-r6-regressions.log`.
+- PASS, exit 0: `env CFFIXED_USER_HOME=/tmp/flo-r6-test-home swift test -c release --disable-automatic-resolution --filter 'Diagnostics|DictationDiagnostic|PersonalVoice|NativeAudioRecording|DictationSession|DictationTrace|DictationDelivery'`,
+  129 tests. Evidence: `/tmp/flo-r6-release.log`. Compiler warnings about capture
+  ownership and concurrency were also present in the baseline.
+- PASS, exit 0: `git diff --check`.
+- NOT RUN: full suite, app packaging/installation, live startup, microphone
+  capture, clipboard interaction, real speech recognition, and UI review/export.
+  These are maintainer integration checks. No latency or runtime resource claim
+  follows from the synthetic tests. No push, PR, merge, or publication was done.

@@ -327,6 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Attempt timing recovery first. Retained-audio expiry starts even if recovery fails.
         DiagLog.startSession { DictationDiagnosticStore.shared.startMaintenance() }
         buildSettings()
         buildStatusItem()
