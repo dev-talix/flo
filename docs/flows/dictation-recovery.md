@@ -1049,8 +1049,10 @@ new hold.
 `AudioRecorder.failRecording` owns terminal cleanup, including failed setup.
 Under the sample lock it clears recording/live state, invalidates capture
 callbacks, and releases recognition samples, parked first-syllable samples,
-optional native audio, trace, and per-recording callbacks. It cancels warm
-teardown and releases the capture session. Native teardown removes the error
+optional native audio, trace, and per-recording callbacks. It records the error
+and cancels warm teardown. Runtime failure notification runs before releasing
+the capture session, so the main handler can invalidate inference while shutdown
+blocks. Native teardown removes the error
 observer and output delegate, stops capture, then releases the forwarder and its
 converter/buffer storage. Sample callbacks cannot refill audio while hardware
 shutdown blocks. Setup reports through start completion only; later terminal
@@ -1061,7 +1063,7 @@ existing `Recording.startError` field for an already queued stop.
 its per-start failure callback. `handleCaptureFailure` consumes the matching UI
 generation once, clears command/recording/trace/HUD ownership, cancels that
 held or released dictation and its incremental timer, and reports failure.
-Recorder cleanup needs no extra app-side stop. Incremental ticks carry the
+Invalidated recorder state needs no extra app-side stop. Incremental ticks carry the
 recording UUID, and queued live cues and snapshot callbacks consult
 `AudioRecorder.isCaptureActive` before recognition or UI work, including while
 hardware teardown blocks and the UI failure is still queued. E4 detached
@@ -1551,3 +1553,117 @@ the failed-release guard, and `AudioRecorder.stop`, then run the named tests.
 Review CS1 and CS2 independently. Suggested skills: unslop, code-review,
 review-finished-work, and workflow-capture. Parent integration should preserve
 its separately owned command-lifetime changes when applying this one R2 commit.
+
+
+### R2 notification ordering repair, October 16, 2026
+
+Owner: Flo maintainers. Requirement: the R2-only follow-up for candidate
+`CS-FINAL-1` in
+`/Users/nikhlkapadia/Talix/flo-pr-work/review-capture-final-result.json`.
+Independently reproduced here before changing production code. Parent:
+`4c49ac96b38871b1f43b63d384f24230398fd599`, local
+`pr/r2-capture-failure-health`. Repair branch:
+`fix/capture-notification-before-teardown`, isolated worktree:
+`/Users/nikhlkapadia/.t3/worktrees/localflow/t3-43e61d0a`.
+
+Before: `AudioRecorder.failRecording` invalidated recorder state, then blocked
+in `tearDownSession` / `session.stop` before invoking `onRuntimeFailure`.
+The main AppDelegate handler had no notification yet, so the real session
+pipeline still accepted an in-flight preview or incremental chunk. Completing
+that inference during blocked teardown published obsolete partial text through
+the HUD callback. This reproduces stale partial output, not stale final delivery.
+
+After: under the existing lock, terminal failure clears recording/live state,
+invalidates capture generation and callbacks, and discards both audio formats.
+On the control queue it stores `startError`, cancels warm teardown, records the
+failure, and invokes the captured callback before hardware teardown. AppDelegate
+can now cancel matching pipeline ownership while shutdown is blocked. Hardware
+operations remain serialized on the control queue and outside `sampleQueue`.
+Paired detachment, stale generation rejection, and one-shot notification remain
+unchanged. Failed startup still uses `notify: false` and reports only through
+start completion. A release that discovers failure invokes the same terminal
+path outside `sampleQueue`; its later empty/error handoff remains rejected.
+AppDelegate keeps `interruptInference: false`, leaving R1's existing lifetime
+and abandonment grace in charge of healthy inference.
+
+Source scope is `Sources/LocalFlow/AudioRecorder.swift`, the invalidation comment
+in `Sources/LocalFlow/AppDelegate.swift`,
+`Tests/LocalFlowTests/AudioCaptureLifecycleTests.swift`, and this record. No new
+production or test type, scheduler, timer, framework, cancellation mechanism, or
+second fixture was added. `verifyCaptureFailureDuringInference` reuses
+`SyntheticCaptureInput.onStop`, `CaptureRecoveryEngine`, and real
+DictationDelivery, pipeline, Transcriber, and inference gate. Its two new tests
+are `testCaptureFailureCancelsPreviewBeforeBlockedTeardownReturns` and
+`testCaptureFailureCancelsChunkBeforeBlockedTeardownReturns`.
+
+Both hold teardown once, await the main failure callback, and finish inference
+before releasing the stop semaphore. They reject partial/HUD callbacks, history,
+cleanup, retry audio, outcomes, and delivery from failed audio. They also assert
+one failure transition, a still-loaded engine, and a later successful hold on
+the original engine with one load. Cleanup is enabled in these cases, and only
+the healthy hold reaches it. MainActor waits use bounded async expectations;
+semaphores have deadlines and deferred release. Existing lifecycle assertions
+now require notification before teardown returns, while keeping stale-input and
+queued detached-snapshot checks. The older inference cases still queue the next
+hold behind the abandoned call. The seven Python cases compile the actual
+AppDelegate failure/release/helper methods with inert UI and capture boundaries.
+
+Verification uses macOS 27.0.1, arm64, Swift 6.4. The existing dependency cache
+was cloned locally into ignored `.build`; no packages were downloaded and the
+lockfile is unchanged. Swift commands run with
+`CFFIXED_USER_HOME=/tmp/flo-r2-notification-home` through
+`sandbox-exec -f /tmp/flo-r2-notification-sandbox.sb`, denying network access,
+personal-log writes, production archive access, and writes to the cache source
+worktree. `--disable-sandbox` avoids nested SwiftPM sandboxing. Each named log
+has a matching `.exit` file containing the real subprocess exit code.
+
+- RED, exit 1: `swift test --disable-sandbox --disable-automatic-resolution
+  --filter 'AudioCaptureLifecycleTests.testCaptureFailureCancels'`, two tests,
+  11 failed assertions. Neither main failure callback ran while teardown was
+  held, and both inference completions reached the partial callback before the
+  stop semaphore was released. Log: `/tmp/flo-r2-notification-red.log`.
+- FAIL, exit 1: first post-repair lifecycle selection, 26 tests, two fixture
+  errors from expectations allocated in the older nonblocking mode but never
+  awaited. Those expectations are now created only for the blocking mode.
+  Log: `/tmp/flo-r2-notification-lifecycle-first.log`.
+- PASS, exit 0: `swift test --disable-sandbox --disable-automatic-resolution
+  --filter 'AudioCaptureLifecycleTests'`, 26 tests, zero failures or skips.
+  Log: `/tmp/flo-r2-notification-lifecycle.log`.
+- PASS, exit 0: `python3 -B Tests/CaptureFailureBoundaryTests.py`, seven actual
+  handler cases. Log: `/tmp/flo-r2-notification-boundary.log`.
+- PASS, exit 0: focused debug capture/recovery selection below, 112 tests,
+  zero failures or skips. Log: `/tmp/flo-r2-notification-debug.log`.
+- PASS, exit 0: the same selection with `-c release`, 112 tests, zero failures
+  or skips. Log: `/tmp/flo-r2-notification-release.log`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+  Log: `/tmp/flo-r2-notification-diff-check.log`.
+
+The focused selection command is:
+
+```sh
+swift test --disable-sandbox --disable-automatic-resolution --filter \
+  '^LocalFlowTests\.(AudioCaptureLifecycleTests|AudioRecorderTests|DictationSessionStallTests|PreviewInferenceBudgetTests|TranscriberTests|DictationSessionPipelineTests|DictationDeliveryTests)/'
+```
+
+The verified source diff is `/tmp/flo-r2-notification-final.diff` against the
+parent above; the local commit SHA is supplied in the implementation handoff.
+Full combined checks and independent repair review belong to the parent.
+No delegation, push, PR, merge, installation, app launch/quit, network,
+microphone, clipboard, Accessibility requests, or real user archive operations
+were performed. Live Bluetooth/USB teardown, converter behavior, actual HUD
+visibility, real recognition, insertion, and packaging remain unverified.
+
+
+Implementation ran directly in the current `gpt-6.1-sol` Codex context. The
+accepted scope allows one local commit only, with no material decisions pending.
+No unrelated dirty files were inherited. The four files listed above form that
+commit; the final Git status is checked after committing. The parent owns full
+combined validation and independent review, including reconciling the separate
+read-only verifier's result. No independent repair review ran in this worker.
+
+Next reviewer: compare the local commit with the named parent, inspect
+`AudioRecorder.failRecording`, startup's `notify: false` catch, stop's failure
+branch, and `AppDelegate.handleCaptureFailure`. Run the commands above and check
+that both new tests finish inference before releasing hardware teardown.
+Suggested skills: unslop, code-review, review-finished-work, and workflow-capture.
+Physical-device acceptance remains with the maintainer before publication.

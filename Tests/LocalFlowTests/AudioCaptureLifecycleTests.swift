@@ -333,24 +333,27 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         let clock = CaptureHealthClock()
         let recorder = healthRecorder(input, clock)
         var failures: [AudioRecorder.RuntimeFailure] = []
-        startRecorder(recorder) { failures.append($0) }
+        let failureNotified = expectation(description: "failure notified before teardown returns")
+        startRecorder(recorder) { failures.append($0); failureNotified.fulfill() }
         let source = input.latestSource!
         source.send(converted: [0.1], native: [0.2])
         source.send(converted: [0.3], native: [0.4])
         XCTAssertEqual(drain(recorder).samples, [0.1, 0.3])
         let teardownEntered = expectation(description: "terminal teardown entered")
         let resumeTeardown = DispatchSemaphore(value: 0)
+        defer { input.onStop = nil; resumeTeardown.signal() }
         input.onStop = {
+            input.onStop = nil
             teardownEntered.fulfill()
             _ = resumeTeardown.wait(timeout: .now() + 3)
         }
         source.fail()
-        wait(for: [teardownEntered], timeout: 2)
+        wait(for: [teardownEntered, failureNotified], timeout: 2)
         // Failure invalidates the input before hardware shutdown returns.
         source.send(converted: [0.8], native: [0.8])
         source.send(converted: [0.9], native: [0.9])
         source.queue.sync {}
-        XCTAssertTrue(failures.isEmpty, "Notification follows completed teardown")
+        XCTAssertEqual(failures.count, 1, "Notification precedes hardware teardown completion")
         input.onStop = nil
         resumeTeardown.signal()
         XCTAssertTrue(drain(recorder).samples.isEmpty)
@@ -617,7 +620,8 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         let recorder = healthRecorder(input, clock)
         let id = UUID()
         var failures = 0
-        startRecorder(recorder, id: id) { _ in failures += 1 }
+        let failureNotified = expectation(description: "failure notified while teardown blocks")
+        startRecorder(recorder, id: id) { _ in failures += 1; failureNotified.fulfill() }
         let source = input.latestSource!
         source.send(converted: [0.1], native: [0.2])
         source.send(converted: [0.3], native: [0.4])
@@ -626,7 +630,9 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         XCTAssertFalse(recorder.isCaptureActive(recordingID: UUID()))
         let teardownEntered = DispatchSemaphore(value: 0)
         let resumeTeardown = DispatchSemaphore(value: 0)
+        defer { input.onStop = nil; resumeTeardown.signal() }
         input.onStop = {
+            input.onStop = nil
             teardownEntered.signal()
             _ = resumeTeardown.wait(timeout: .now() + 3)
         }
@@ -638,12 +644,12 @@ final class AudioCaptureLifecycleTests: XCTestCase {
             snapshotDelivered.fulfill()
         }
         source.fail()
-        // Keep main blocked until failure owns the recorder, then deliver
-        // the snapshot before shutdown can deliver the UI failure callback.
+        // Keep main blocked until failure invalidates the recorder. The detached
+        // snapshot was queued first and must reject recognition on its own.
         XCTAssertEqual(teardownEntered.wait(timeout: .now() + 2), .success)
-        wait(for: [snapshotDelivered], timeout: 2)
+        wait(for: [snapshotDelivered, failureNotified], timeout: 2)
         XCTAssertEqual(recognitionCalls, 0)
-        XCTAssertEqual(failures, 0)
+        XCTAssertEqual(failures, 1, "UI failure must not wait for hardware teardown")
         input.onStop = nil
         resumeTeardown.signal()
         XCTAssertTrue(drain(recorder).samples.isEmpty)
@@ -682,7 +688,17 @@ final class AudioCaptureLifecycleTests: XCTestCase {
     }
 
     @MainActor
-    private func verifyCaptureFailureDuringInference(preview: Bool) async throws {
+    func testCaptureFailureCancelsPreviewBeforeBlockedTeardownReturns() async throws {
+        try await verifyCaptureFailureDuringInference(preview: true, holdTeardown: true)
+    }
+
+    @MainActor
+    func testCaptureFailureCancelsChunkBeforeBlockedTeardownReturns() async throws {
+        try await verifyCaptureFailureDuringInference(preview: false, holdTeardown: true)
+    }
+
+    @MainActor
+    private func verifyCaptureFailureDuringInference(preview: Bool, holdTeardown: Bool = false) async throws {
         let engine = CaptureRecoveryEngine()
         var loads = 0
         let transcriber = Transcriber(modelLoader: { _, _ in loads += 1; return engine },
@@ -694,33 +710,55 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         var outcomes: [DictationSessionOutcome] = []
         var requests: [DictationTranscriptionSegment] = []
         var finished: [Int] = []
+        var cleanupCalls = 0
+        let stalePartial = holdTeardown ? expectation(description: "failed inference must not update the HUD") : nil
+        stalePartial?.isInverted = true
         let delivery = DictationDelivery(
             transcribe: { request in
                 requests.append(request.segment)
                 defer { finished.append(request.generation) }
                 return try await transcriber.transcribe(request)
             },
-            cleanup: { .init(text: $0.text, succeeded: true) },
+            cleanup: { cleanupCalls += 1; return .init(text: $0.text, succeeded: true) },
             inject: { text, _, ready, complete in injected.append(text); ready(); complete() },
             recordTranscript: { history.append($0) },
             onOutcome: { outcome, _ in outcomes.append(outcome) },
-            onPartialTranscript: { _, text in partials.append(text) },
+            onPartialTranscript: { _, text in partials.append(text); stalePartial?.fulfill() },
             onCancelled: { _ in }, onCommandCancelled: { _ in },
             onProcessingCountChange: { _ in }
         )
         let context = DictationSessionContext(
-            cleanupEnabled: false, styleProfile: .general, corrections: [], snippets: [],
+            cleanupEnabled: holdTeardown, styleProfile: .general, corrections: [], snippets: [],
             incrementalCadence: preview ? .whisper : .init(startSeconds: 4, tickSeconds: 2)
         )
         let failedGeneration = delivery.begin(.init(context: context))
         let input = SyntheticCaptureInput()
         let recorder = AudioRecorder(makeCaptureSession: input.open)
+        let teardownEntered = holdTeardown ? expectation(description: "failed capture entered hardware teardown") : nil
+        let allowTeardown = DispatchSemaphore(value: 0)
+        let teardownReturned = DispatchSemaphore(value: 0)
+        if let teardownEntered {
+            input.onStop = {
+                input.onStop = nil // Only the failed hold blocks, never the next hold.
+                teardownEntered.fulfill()
+                XCTAssertEqual(allowTeardown.wait(timeout: .now() + 10), .success)
+                teardownReturned.signal()
+            }
+        }
+        defer {
+            input.onStop = nil
+            allowTeardown.signal()
+            Task { await engine.finishAbandoned() }
+        }
+        let failureNotified = expectation(description: "main callback owns capture failure")
         var failures = 0
         await startRecoveryRecorder(recorder) { _ in
+            XCTAssertTrue(Thread.isMainThread)
             failures += 1
             // The Python boundary checks this policy on the actual AppDelegate
             // handler, helper, and failed-release path. Here it reaches real ASR.
             delivery.cancel(generation: failedGeneration, interruptInference: false)
+            failureNotified.fulfill()
         }
         let source = input.latestSource!
         let rate = Int(AudioRecorder.sampleRate)
@@ -737,7 +775,29 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         XCTAssertEqual(requests, [preview ? .preview : .incrementalChunk(index: 0)])
 
         source.fail()
-        await captureEventually { failures == 1 }
+        if let teardownEntered, let stalePartial {
+            await fulfillment(of: [teardownEntered], timeout: 2)
+            await fulfillment(of: [failureNotified], timeout: 1)
+            XCTAssertEqual(failures, 1, "Failure ownership must reach main before hardware stop returns")
+            XCTAssertNil(delivery.incrementalSnapshotRange(generation: failedGeneration),
+                         "Failure must remove pipeline ownership before inference completes")
+            XCTAssertEqual(teardownReturned.wait(timeout: .now()), .timedOut)
+            await engine.finishAbandoned()
+            await captureEventually { finished.contains(failedGeneration) }
+            await fulfillment(of: [stalePartial], timeout: 0.05)
+            XCTAssertEqual(teardownReturned.wait(timeout: .now()), .timedOut,
+                           "Inference must finish while hardware teardown is still held")
+            XCTAssertTrue(partials.isEmpty)
+            XCTAssertTrue(outcomes.isEmpty)
+            XCTAssertTrue(history.isEmpty)
+            XCTAssertTrue(injected.isEmpty)
+            XCTAssertEqual(cleanupCalls, 0)
+            XCTAssertEqual(delivery.retryCount, 0)
+            XCTAssertFalse(delivery.isBusy)
+            allowTeardown.signal()
+        } else {
+            await fulfillment(of: [failureNotified], timeout: 2)
+        }
         let loadedDuringGrace = await transcriber.isLoaded
         XCTAssertTrue(loadedDuringGrace, "Capture failure must not quarantine healthy ASR")
         let failedRecording = try await releaseRecoveryRecorder(recorder)
@@ -759,8 +819,10 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         XCTAssertEqual(healthy.nativeAudio?.samples, [0.3, 0.4])
         XCTAssertEqual(healthy.nativeAudio?.isComplete, true)
         delivery.release(generation: next, samples: healthy.samples, nativeAudio: healthy.nativeAudio)
-        await captureEventually { await transcriber.waitingInferenceCount == 1 }
-        await engine.finishAbandoned()
+        if !holdTeardown {
+            await captureEventually { await transcriber.waitingInferenceCount == 1 }
+            await engine.finishAbandoned()
+        }
         await captureEventually { finished.contains(failedGeneration) && outcomes.count == 1 }
         XCTAssertEqual(outcomes, [.finalTranscript(generation: next, text: "next healthy words")])
         XCTAssertEqual(injected, ["next healthy words"])
@@ -771,6 +833,8 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         let loadedAfterCompletion = await transcriber.isLoaded
         XCTAssertTrue(loadedAfterCompletion)
         XCTAssertEqual(loads, 1, "The next recording must succeed without reloading")
+        XCTAssertEqual(failures, 1, "Failed capture has one terminal transition")
+        XCTAssertEqual(cleanupCalls, holdTeardown ? 1 : 0, "Only healthy audio may reach cleanup")
     }
 
     @MainActor
