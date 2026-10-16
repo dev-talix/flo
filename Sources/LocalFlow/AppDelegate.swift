@@ -890,16 +890,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func runIncrementalTick(generation: Int, cadence: IncrementalCadence) {
         guard activeDictationGeneration == generation, isRecording else { return }
         scheduleIncrementalTick(generation: generation, cadence: cadence, after: cadence.snapshotSeconds)
-        guard dictationDelivery.wantsIncrementalSnapshot(generation: generation) else {
+        guard let range = dictationDelivery.incrementalSnapshotRange(generation: generation) else {
             activeDictationTrace?.record(.incrementalSkipped, status: .busy)
             return
         }
 
-        recorder.snapshot { [weak self] samples in
+        recorder.snapshot(range: range) { [weak self] snapshot in
             guard let self,
                   self.activeDictationGeneration == generation,
                   self.isRecording else { return }
-            self.dictationDelivery.processIncrementalSnapshot(generation: generation, samples: samples)
+            self.dictationDelivery.processIncrementalSnapshot(
+                generation: generation, samples: snapshot.samples, sampleOffset: snapshot.sampleOffset
+            )
         }
     }
 

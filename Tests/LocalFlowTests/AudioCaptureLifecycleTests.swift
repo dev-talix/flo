@@ -3,6 +3,111 @@ import XCTest
 @testable import LocalFlow
 
 final class AudioCaptureLifecycleTests: XCTestCase {
+    func testDelayedBoundedSnapshotDrainsLongCaptureAndPreservesReleaseTail() {
+        let input = SyntheticCaptureInput()
+        let recorder = AudioRecorder(makeCaptureSession: input.open)
+        let started = expectation(description: "started")
+        recorder.start(retainNativeAudio: true) { error in
+            XCTAssertNil(error)
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 2)
+        let source = input.latestSource!
+        let count = Int(AudioRecorder.sampleRate * 300)
+        let first = [Float](repeating: 0.1, count: count / 2)
+        let second = [Float](repeating: 0.2, count: count / 2)
+        let blocked = expectation(description: "conversion blocked")
+        let allowConversion = DispatchSemaphore(value: 0)
+        source.queue.async {
+            blocked.fulfill()
+            _ = allowConversion.wait(timeout: .now() + 3)
+        }
+        wait(for: [blocked], timeout: 2)
+        source.send(converted: first, native: [0.3])
+        source.send(converted: second, native: [0.4])
+        let captured = expectation(description: "bounded snapshot after queued samples")
+        let premature = expectation(description: "snapshot waits for queued conversion")
+        premature.isInverted = true
+        var conversionReleased = false
+        var retained: AudioRecorder.Snapshot?
+        recorder.snapshot(range: { max(0, $0 - 64)..<$0 }) { snapshot in
+            if !conversionReleased { premature.fulfill() }
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertEqual(snapshot.sampleOffset, count - 64)
+            XCTAssertEqual(snapshot.endIndex, count)
+            XCTAssertEqual(snapshot.samples, [Float](repeating: 0.2, count: 64))
+            retained = snapshot
+            captured.fulfill()
+        }
+        wait(for: [premature], timeout: 0.05)
+        conversionReleased = true
+        allowConversion.signal()
+        wait(for: [captured], timeout: 3)
+        let tail = [Float](repeating: 0.5, count: 97)
+        source.send(converted: tail, native: [0.6])
+        let ranged = expectation(description: "absolute range includes new tail")
+        recorder.snapshot(range: { _ in (count - 16)..<(count + tail.count) }) { snapshot in
+            XCTAssertEqual(snapshot.sampleOffset, count - 16)
+            XCTAssertEqual(snapshot.samples, [Float](repeating: 0.2, count: 16) + tail)
+            XCTAssertEqual(retained?.samples, [Float](repeating: 0.2, count: 64))
+            XCTAssertEqual(retained?.endIndex, count)
+            ranged.fulfill()
+        }
+        let stopped = expectation(description: "complete original and tail at release")
+        recorder.stop { recording in
+            XCTAssertEqual(recording.samples.count, count + tail.count)
+            XCTAssertEqual(Array(recording.samples.prefix(first.count)), first)
+            XCTAssertEqual(Array(recording.samples[first.count..<count]), second)
+            XCTAssertEqual(Array(recording.samples.suffix(tail.count)), tail)
+            XCTAssertEqual(recording.nativeAudio?.samples, [0.3, 0.4, 0.6])
+            stopped.fulfill()
+        }
+        wait(for: [ranged, stopped], timeout: 3)
+    }
+
+    func testSnapshotsClampRangesAndDetachEvenFullCaptureStorage() {
+        let input = SyntheticCaptureInput()
+        let recorder = AudioRecorder(makeCaptureSession: input.open)
+        let started = expectation(description: "started")
+        recorder.start { _ in started.fulfill() }
+        wait(for: [started], timeout: 2)
+        input.latestSource!.send(converted: [0.1, 0.2], native: [])
+        input.latestSource!.send(converted: [0.3, 0.4], native: [])
+        var first: AudioRecorder.Snapshot?
+        let firstCopy = expectation(description: "first detached copy")
+        recorder.snapshot(range: { _ in -10..<100 }) { snapshot in
+            XCTAssertEqual(snapshot.sampleOffset, 0)
+            XCTAssertEqual(snapshot.samples, [0.1, 0.2, 0.3, 0.4])
+            first = snapshot
+            firstCopy.fulfill()
+        }
+        wait(for: [firstCopy], timeout: 2)
+        let secondCopy = expectation(description: "second detached copy")
+        recorder.snapshot { snapshot in
+            first!.samples.withUnsafeBufferPointer { firstBuffer in
+                snapshot.samples.withUnsafeBufferPointer { secondBuffer in
+                    XCTAssertNotEqual(firstBuffer.baseAddress, secondBuffer.baseAddress)
+                }
+            }
+            secondCopy.fulfill()
+        }
+        let beyondEnd = expectation(description: "range beyond capture is empty")
+        recorder.snapshot(range: { _ in 100..<200 }) { snapshot in
+            XCTAssertEqual(snapshot.sampleOffset, 4)
+            XCTAssertTrue(snapshot.samples.isEmpty)
+            beyondEnd.fulfill()
+        }
+        let stopped = expectation(description: "stopped")
+        recorder.stop { _ in stopped.fulfill() }
+        let idle = expectation(description: "snapshot after stop is empty")
+        recorder.snapshot { snapshot in
+            XCTAssertEqual(snapshot.endIndex, 0)
+            XCTAssertTrue(snapshot.samples.isEmpty)
+            idle.fulfill()
+        }
+        wait(for: [secondCopy, beyondEnd, stopped, idle], timeout: 2)
+    }
+
     func testStopDrainsQueuedTailAndHandsOffBothFormatsTogether() {
         let input = SyntheticCaptureInput()
         let recorder = AudioRecorder(makeCaptureSession: input.open)
@@ -134,7 +239,8 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         original.send(converted: [0.1], native: [0.2])
         original.send(converted: [0.3], native: [0.4])
         let captured = expectation(description: "captured before failure")
-        recorder.snapshot { samples in
+        recorder.snapshot { snapshot in
+            let samples = snapshot.samples
             XCTAssertEqual(samples, [0.1, 0.3])
             captured.fulfill()
         }
@@ -144,7 +250,8 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         let recovered = expectation(description: "recovery preserves captured samples")
         // snapshot drains the control queue after the failure callback, then
         // drains sample conversion, so assertions observe completed recovery.
-        recorder.snapshot { samples in
+        recorder.snapshot { snapshot in
+            let samples = snapshot.samples
             XCTAssertEqual(samples, [0.1, 0.3])
             XCTAssertEqual(input.openCount, 2)
             XCTAssertEqual(input.stopCount, 1)
@@ -158,7 +265,8 @@ final class AudioCaptureLifecycleTests: XCTestCase {
 
         original.fail()
         let staleFailureIgnored = expectation(description: "old failure leaves replacement running")
-        recorder.snapshot { samples in
+        recorder.snapshot { snapshot in
+            let samples = snapshot.samples
             XCTAssertEqual(samples, [0.1, 0.3, 0.5, 0.7])
             XCTAssertEqual(input.openCount, 2)
             XCTAssertEqual(input.stopCount, 1)
@@ -187,12 +295,13 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         let source = input.latestSource!
         source.send(converted: [0.1], native: [0.2])
         source.send(converted: [0.3], native: [0.4])
-        let snapshot = expectation(description: "snapshot")
-        recorder.snapshot { samples in
+        let snapshotted = expectation(description: "snapshot")
+        recorder.snapshot { snapshot in
+            let samples = snapshot.samples
             XCTAssertEqual(samples, [0.1, 0.3])
-            snapshot.fulfill()
+            snapshotted.fulfill()
         }
-        wait(for: [snapshot], timeout: 2)
+        wait(for: [snapshotted], timeout: 2)
         source.send(converted: [0.5], native: [0.6])
         let stopped = expectation(description: "stopped")
         recorder.stop { recording in

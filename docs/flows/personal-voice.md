@@ -1,5 +1,14 @@
 # Personal voice collection and review
 
+## E4: bounded shared WAV writes
+
+Authorized efficiency item E4 changes the shared `RetainedAudioFile` writer to
+reuse at most 16,384 PCM frames. Full native and recognition recordings, sample
+rates, private staging, and collection/retry contracts remain intact. Owner: Flo
+maintainers. Synthetic round-trip, error-path, and integration evidence is in
+[E4 WAV buffers](diagnostic-recordings.md#e4-bounded-retained-wav-buffers)
+and [E4 capture snapshots](dictation-recovery.md#e4-bounded-capture-snapshots).
+
 ## Requirement source, owner, and non-goals
 
 The user requested longer local retention of their dictations for future voice

@@ -12,6 +12,141 @@ import XCTest
 final class DictationSessionPipelineTests: XCTestCase {
     private let speech = [Float](repeating: 0.2, count: Int(AudioRecorder.sampleRate))
 
+    func testRangedAnalysisKeepsTheWholePauseWhenSilenceContinuesAcrossSnapshots() async throws {
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in "First." },
+            cleanup: { request in .init(text: request.text, succeeded: true) }, onOutcome: { _ in }
+        )
+        let rate = Int(AudioRecorder.sampleRate)
+        let first = [Float](repeating: 0.2, count: rate * 8) + [Float](repeating: 0, count: rate * 4)
+        let context = DictationSessionContext(cleanupEnabled: false, styleProfile: .general,
+                                             corrections: [], snippets: [],
+                                             incrementalCadence: .init(startSeconds: 8, tickSeconds: 4))
+        pipeline.begin(generation: 100, context: context)
+        pipeline.processIncrementalSnapshot(generation: 100, samples: first)
+        await settleAsyncWork()
+        let committed = try XCTUnwrap(pipeline.incrementalSampleEnd(generation: 100))
+        XCTAssertGreaterThan(committed, rate * 8)
+        let extended = first + [Float](repeating: 0, count: rate * 4)
+        let range = try XCTUnwrap(pipeline.incrementalSnapshotRange(generation: 100))(extended.count)
+        XCTAssertGreaterThan(range.lowerBound, 0)
+        let ranged = Array(extended[range])
+        let fullCut = try XCTUnwrap(AudioRecorder.incrementalCutPoint(in: extended, after: committed))
+        let localCut = try XCTUnwrap(AudioRecorder.incrementalCutPoint(in: ranged, after: committed - range.lowerBound))
+        XCTAssertEqual(localCut + range.lowerBound, fullCut)
+        XCTAssertEqual(AudioRecorder.incrementalPauseSeconds(in: ranged, around: localCut),
+                       AudioRecorder.incrementalPauseSeconds(in: extended, around: fullCut))
+        XCTAssertEqual(AudioRecorder.incrementalPauseSeconds(in: ranged, around: localCut), 8)
+        pipeline.cancel(generation: 100)
+    }
+
+    func testLongCaptureRequestsOnlyPreviewWindowBetweenChunkTicks() async throws {
+        let transcriber = ControlledTranscriber()
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: OutcomeRecorder())
+        let rate = Int(AudioRecorder.sampleRate)
+        pipeline.begin(generation: 101, context: context())
+        let firstRange = try XCTUnwrap(pipeline.incrementalSnapshotRange(generation: 101))
+        XCTAssertEqual(firstRange(rate * 30), 0..<(rate * 30))
+        pipeline.processIncrementalSnapshot(generation: 101, samples: [Float](repeating: 0.2, count: rate * 30))
+        expectTrue(await waitForCall(.preview, generation: 101, in: transcriber))
+        expectTrue(await transcriber.succeed("recent", segment: .preview, generation: 101))
+        await settleAsyncWork()
+        let nextRange = try XCTUnwrap(pipeline.incrementalSnapshotRange(generation: 101))
+        XCTAssertEqual(nextRange(rate * 31), (rate * 16)..<(rate * 31))
+        XCTAssertEqual(nextRange(rate * 35), 0..<(rate * 35))
+        pipeline.processIncrementalSnapshot(generation: 101, samples: [Float](repeating: 0.3, count: rate * 15),
+                                            sampleOffset: rate * 16)
+        expectTrue(await waitForCall(.preview, generation: 101, in: transcriber, minimumCount: 2))
+        expectEqual(await transcriber.sampleCounts(.preview, generation: 101), [rate * 15, rate])
+        pipeline.cancel(generation: 101)
+        expectTrue(await transcriber.succeed("ignored", segment: .preview, generation: 101))
+        XCTAssertNil(pipeline.incrementalSnapshotRange(generation: 101))
+    }
+
+    func testRangedChunksPreserveAbsoluteHalfFrameBoundariesPausesAndReleaseTail() async throws {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        let events = TraceEvents()
+        let trace = DictationTrace(sink: { events.append($0) })
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged), outcomes: outcomes)
+        let rate = Int(AudioRecorder.sampleRate)
+        var full = [Float](repeating: 0.2, count: rate * 5 / 2)
+        full.append(contentsOf: [Float](repeating: 0, count: 21 * 320))
+        full.append(contentsOf: [Float](repeating: 0.3, count: rate * 3))
+        full.append(contentsOf: [Float](repeating: 0, count: rate * 2))
+        full.append(contentsOf: [Float](repeating: 0.4, count: rate * 2))
+        let firstEnd = rate * 4 + 21 * 320
+        let firstSnapshot = Array(full[..<firstEnd])
+        let firstCut = try XCTUnwrap(AudioRecorder.incrementalCutPoint(in: firstSnapshot, after: 0))
+        XCTAssertEqual(firstCut % 320, 160)
+        let cadence = IncrementalCadence(startSeconds: 4, tickSeconds: 2)
+        let context = DictationSessionContext(cleanupEnabled: false, styleProfile: .general,
+                                             corrections: [], snippets: [], incrementalCadence: cadence)
+        pipeline.begin(generation: 102, context: context, trace: trace)
+        pipeline.processIncrementalSnapshot(generation: 102, samples: firstSnapshot)
+        expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: 102, in: transcriber))
+        XCTAssertEqual(pipeline.incrementalSampleEnd(generation: 102), firstCut)
+        XCTAssertNil(pipeline.incrementalSnapshotRange(generation: 102))
+        expectTrue(await transcriber.succeed("First.", segment: .incrementalChunk(index: 0), generation: 102))
+        await settleAsyncWork()
+
+        let selectRange = try XCTUnwrap(pipeline.incrementalSnapshotRange(generation: 102))
+        let range = selectRange(full.count)
+        XCTAssertLessThanOrEqual(range.lowerBound, rate * 5 / 2)
+        XCTAssertGreaterThan(range.lowerBound, 0)
+        XCTAssertEqual(range.lowerBound % 320, 0)
+        let secondCut = try XCTUnwrap(AudioRecorder.incrementalCutPoint(in: full, after: firstCut))
+        pipeline.processIncrementalSnapshot(generation: 102, samples: Array(full[range]), sampleOffset: range.lowerBound)
+        expectTrue(await waitForCall(.incrementalChunk(index: 1), generation: 102, in: transcriber))
+        XCTAssertEqual(pipeline.incrementalSampleEnd(generation: 102), secondCut)
+        expectEqual(await transcriber.samples(.incrementalChunk(index: 1), generation: 102),
+                    [DictationAudioPreparation(samples: Array(full[firstCut..<secondCut])).samples])
+        // Release while the ranged chunk is in flight. Submitted and completed
+        // offsets differ until it returns; the release tail uses the submitted cut.
+        pipeline.release(generation: 102, fullSamples: full)
+        let released = try XCTUnwrap(events.events.first { $0.name == .audioReleased })
+        XCTAssertEqual(released.fields["submittedEnd"], Double(secondCut))
+        XCTAssertEqual(released.fields["completedEnd"], Double(firstCut))
+        expectTrue(await transcriber.succeed("Second.", segment: .incrementalChunk(index: 1), generation: 102))
+        expectTrue(await waitForCall(.releaseTail, generation: 102, in: transcriber))
+        expectEqual(await transcriber.samples(.releaseTail, generation: 102),
+                    [DictationAudioPreparation(samples: Array(full[secondCut...])).samples])
+        expectTrue(await transcriber.succeed("Last.", segment: .releaseTail, generation: 102))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 102, text: "First. Second.\n\nLast.")])
+    }
+
+    func testDelayedPreviewRangeCannotSubmitTruncatedChunkOrSurviveRelease() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        var partials: [String] = []
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes) { _, text in partials.append(text) }
+        let rate = Int(AudioRecorder.sampleRate)
+        pipeline.begin(generation: 103, context: context(cleanupEnabled: false))
+        let window = [Float](repeating: 0.2, count: rate * 10)
+            + [Float](repeating: 0, count: rate)
+            + [Float](repeating: 0.3, count: rate * 4)
+        pipeline.processIncrementalSnapshot(generation: 103, samples: window, sampleOffset: rate * 16)
+        expectTrue(await waitForCall(.preview, generation: 103, in: transcriber))
+        XCTAssertEqual(pipeline.incrementalSampleEnd(generation: 103), 0)
+        expectFalse(await transcriber.hasCall(.incrementalChunk(index: 0), generation: 103))
+        let full = [Float](repeating: 0.1, count: rate * 16) + window + speech
+        pipeline.release(generation: 103, fullSamples: full)
+        // A queued snapshot arriving after release cannot restart live work.
+        pipeline.processIncrementalSnapshot(generation: 103, samples: window, sampleOffset: rate * 16)
+        expectTrue(await waitForCall(.fullUtterance, generation: 103, in: transcriber))
+        expectEqual(await transcriber.samples(.fullUtterance, generation: 103), [full])
+        expectTrue(await transcriber.succeed("Complete.", segment: .fullUtterance, generation: 103))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        expectTrue(await transcriber.succeed("stale preview", segment: .preview, generation: 103))
+        await settleAsyncWork()
+        XCTAssertTrue(partials.isEmpty)
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 103, text: "Complete.")])
+        XCTAssertNil(pipeline.incrementalSnapshotRange(generation: 103))
+    }
+
     func testReleaseWaitsForActiveChunkBeforeTranscribingTailAndEmitting() async {
         let transcriber = ControlledTranscriber()
         let cleaner = RecordingCleaner(mode: .unchanged)
@@ -752,7 +887,9 @@ final class DictationSessionPipelineTests: XCTestCase {
             let prefix = hasCommittedPrefix ? "committed " : ""
             for (index, text) in ["earlier words", "new words", "new words again"].enumerated() {
                 let samples = [Float](repeating: 0.2, count: speech.count * (seconds + index))
-                pipeline.processIncrementalSnapshot(generation: generation, samples: samples)
+                let range = pipeline.incrementalSnapshotRange(generation: generation)?(samples.count) ?? 0..<0
+                pipeline.processIncrementalSnapshot(generation: generation, samples: Array(samples[range]),
+                                                    sampleOffset: range.lowerBound)
                 expectTrue(await waitForCall(.preview, generation: generation, in: transcriber, minimumCount: index + 1))
                 expectTrue(await transcriber.succeed(text, segment: .preview, generation: generation))
                 await settleAsyncWork()
@@ -924,6 +1061,10 @@ private actor ControlledTranscriber {
 
     func sampleCounts(_ segment: DictationTranscriptionSegment, generation: Int) -> [Int] {
         calls.filter { $0.generation == generation && $0.segment == segment }.map(\.samples.count)
+    }
+
+    func samples(_ segment: DictationTranscriptionSegment, generation: Int) -> [[Float]] {
+        calls.filter { $0.generation == generation && $0.segment == segment }.map(\.samples)
     }
 
     func callCount(_ segment: DictationTranscriptionSegment, generation: Int) -> Int {

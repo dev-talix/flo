@@ -234,10 +234,12 @@ enum DictationReplay {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
             guard elapsed < totalDuration else { break }
             let available = min(samples.count, Int(elapsed * AudioRecorder.sampleRate))
-            pipeline.processIncrementalSnapshot(
-                generation: generation,
-                samples: Array(samples.prefix(available))
-            )
+            if let selectRange = pipeline.incrementalSnapshotRange(generation: generation) {
+                let range = selectRange(available)
+                pipeline.processIncrementalSnapshot(
+                    generation: generation, samples: Array(samples[range]), sampleOffset: range.lowerBound
+                )
+            }
             // Live capture schedules the next tick from the actual callback,
             // not the original deadline. Do not catch up with extra passes.
             tick = elapsed + cadence.snapshotSeconds

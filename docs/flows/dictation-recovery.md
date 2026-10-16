@@ -421,6 +421,99 @@ not rerun for this repair.
 The full release suite also passed 387 tests, zero failures and the same optional
 HUD render skip: `/tmp/flo-preview-continuity-release.log` (exit 0).
 
+## E4: bounded capture snapshots
+
+Requirement source: authorized efficiency report item E4, based on
+`47f1bb906e8f3b2291a617f13dd9bb0b11300e74`. Owner: Flo maintainers.
+Bound temporary audio copies while preserving original capture, recognition
+defaults, quiet-speech recovery, cancellation, retry, and retention. Device
+watchdogs, archive cleanup, and preview decoder policy are outside E4.
+
+`AudioRecorder.snapshot(range:completion:)` drains the existing control and
+conversion queues, resolves an absolute range against the captured count, clamps
+it to available audio, and copies only that range into independent storage.
+`AudioRecorder.Snapshot` carries samples and their absolute `sampleOffset`.
+Retained snapshots cannot share the growing capture array's storage. Its
+main-queue callback leaves full recognition and native capture intact for stop.
+
+`DictationSessionPipeline.incrementalSnapshotRange` captures immutable session
+values for the recorder's selector. Due chunk ticks request unsubmitted audio
+plus the preceding pause as context, aligned to the original 20 ms frame grid.
+Other ticks request the existing preview window, at most 15 seconds and starting
+after completed audio. The pause context protects half-frame cuts and silence
+continuing across snapshots. Without a usable boundary, due chunk ticks can
+still require all unsubmitted audio. E4 adds no truncation policy.
+
+`AppDelegate.runIncrementalTick`, `DictationDelivery`, and file replay pass those
+ranges and offsets through the same pipeline. Cadence, submitted/completed
+positions, preview invalidation, and release tails use absolute sample indices.
+A delayed range missing the next chunk's beginning cannot submit a shortened
+chunk. Existing generation and release guards discard late work. Complete release
+audio remains available for diagnostics, personal voice, fallback, and retry.
+
+Acceptance evidence:
+
+- `AudioCaptureLifecycleTests.testDelayedBoundedSnapshotDrainsLongCaptureAndPreservesReleaseTail`
+  checks a delayed 64-sample snapshot of 300 seconds of synthetic capture, a
+  later absolute range, immutable samples, and complete dual-format release.
+- `testSnapshotsClampRangesAndDetachEvenFullCaptureStorage` checks range limits,
+  idle snapshots, and distinct storage for two retained full snapshots.
+- `DictationSessionPipelineTests.testLongCaptureRequestsOnlyPreviewWindowBetweenChunkTicks`
+  checks preview bounds and due-chunk ranges against absolute counts.
+- `testRangedChunksPreserveAbsoluteHalfFrameBoundariesPausesAndReleaseTail`
+  checks exact chunk/tail inputs, submitted/completed offsets during release,
+  and preserved paragraph breaks.
+- `testRangedAnalysisKeepsTheWholePauseWhenSilenceContinuesAcrossSnapshots`
+  compares ranged and full-array cut and pause analysis for continuing silence.
+- `testDelayedPreviewRangeCannotSubmitTruncatedChunkOrSurviveRelease` checks
+  delayed range rejection and late-preview suppression with full release audio.
+
+Verification environment: macOS 27.0.1, arm64, Apple Swift 6.4. Builds use this
+isolated worktree's `.build` and locked dependencies, without model downloads.
+Verified source is the base above plus `/tmp/flo-e4.diff`, committed with this
+section. Exact commands and results:
+
+- PASS, exit 0: `swift test --disable-automatic-resolution --filter
+  'AudioCaptureLifecycleTests|IncrementalCutPointTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDiagnosticStoreTests|PersonalVoiceStoreTests'`.
+  Baseline: 66 tests, zero failures. Log: `/tmp/flo-e4-baseline.log`.
+- PASS, exit 0: `swift test --disable-automatic-resolution --filter
+  'AudioCaptureLifecycleTests|IncrementalCutPointTests|DictationSessionPipelineTests|DictationAudioPreparationTests|RetainedAudioFileTests'`.
+  Initial focused coverage: 51 tests, zero failures. Log: `/tmp/flo-e4-focused.log`.
+- PASS, exit 0: `swift test --disable-automatic-resolution --filter
+  'AudioCaptureLifecycleTests|IncrementalCutPointTests|Dictation|RetainedAudioFileTests|PersonalVoice|NativeAudioRecordingTests'`.
+  Final integration coverage: 147 tests, zero failures. Log:
+  `/tmp/flo-e4-integration.log`.
+- PASS, exit 0: `swift test -c release --disable-automatic-resolution --filter
+  'AudioCaptureLifecycleTests|IncrementalCutPointTests|Dictation|RetainedAudioFileTests|PersonalVoice|NativeAudioRecordingTests'`.
+  Final release coverage: 147 tests, zero failures, including compilation of the
+  application. Log: `/tmp/flo-e4-release.log`. No selected tests were skipped.
+- PASS, exit 0: `git diff --check`. Log: `/tmp/flo-e4-diff-check.log`.
+
+Two development attempts failed to compile new test fixtures and were corrected.
+A subsequent run failed two assertions because macOS accepts replacing a
+directory with a file. The corrected publication-error fixture uses an overlong
+final filename and passes. Earlier log:
+`/tmp/flo-e4-publication-fixture-failure.log`.
+Existing compiler warnings in diagnostic retention, text injection, and test
+fixtures remain. No new warning was introduced in the changed implementation.
+
+NOT RUN: live microphone capture, clipboard or typing, real-model inference,
+app packaging/installation, and performance measurement. Tests use synthetic
+audio and temporary folders. They establish buffer bounds and content contracts,
+not a measured speedup. See [E4 WAV verification](diagnostic-recordings.md#e4-bounded-retained-wav-buffers).
+
+Stack integration retains bounded-preview continuity using absolute sample
+offsets. The continuity regression now feeds ranges selected by the capture
+policy, including preview-only ticks after the window advances.
+E4 integration passed `swift test --disable-automatic-resolution`: 398 tests,
+zero failures, one optional HUD render skip. Evidence:
+`/tmp/flo-capture-stack-e4-debug-final.log` (exit 0). The first assembled run
+failed one input-size expectation that assumed the old rolling window. The
+repaired preview decodes one new second after freezing its full window; the
+assertion now checks that input. Earlier displayed words are covered by the
+continuity regression. Initial evidence: `/tmp/flo-capture-stack-e4-debug.log`
+(exit 1). Live capture and measured performance remain unverified.
+
 ## E1: Prepare each released recording once
 
 Owner: Flo maintainers. The October 15, 2026 efficiency report E1 authorizes

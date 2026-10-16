@@ -129,6 +129,8 @@ final class DictationSessionPipeline {
     typealias Cleanup = (DictationCleanupRequest) async -> TranscriptCleanupResult
     typealias OutcomeHandler = (DictationSessionOutcome) -> Void
 
+    private static let previewWindowSamples = Int(15 * AudioRecorder.sampleRate)
+
     private struct IncrementalChunk {
         let index: Int
         let audio: DictationAudioPreparation
@@ -179,6 +181,13 @@ final class DictationSessionPipeline {
         var releaseTimeout: DispatchWorkItem?
         var cleanupDeadline: DispatchWorkItem?
         var cleanupFallbackText: String?
+
+        var incrementalAnalysisStart: Int {
+            // Keep the previous cut's quiet run as context if a pause continues
+            // across snapshots. Round down to the original 20 ms frame grid.
+            let pauseSamples = Int(ceil(nextPauseSeconds * AudioRecorder.sampleRate))
+            return AudioRecorder.incrementalAnalysisStart(after: max(0, incrementalSampleEnd - pauseSamples))
+        }
 
         init(generation: Int, context: DictationSessionContext, trace: DictationTrace?, diagnostics: DictationDiagnosticStore.Recording?, personalVoice: PersonalVoiceStore.Recording?) {
             self.generation = generation
@@ -240,46 +249,63 @@ final class DictationSessionPipeline {
         sessions[generation]?.incrementalSampleEnd
     }
 
-    /// Lets capture skip copying audio when no chunk or preview could start.
-    func wantsIncrementalSnapshot(generation: Int) -> Bool {
-        guard let session = sessions[generation] else { return false }
-        return canAcceptIncrementalChunk(generation: generation) || canStartPreview(session)
+    /// Capture and replay select from the actual drained count, without sharing
+    /// session state with the recorder queues. Chunk ticks need all unsubmitted
+    /// audio; other ticks need only the existing 15-second preview window.
+    func incrementalSnapshotRange(generation: Int) -> ((Int) -> Range<Int>)? {
+        guard let session = sessions[generation] else { return nil }
+        let chunkReady = canAcceptIncrementalChunk(generation: generation)
+        guard chunkReady || canStartPreview(session) else { return nil }
+        let chunkStart = session.incrementalAnalysisStart
+        let chunkThreshold = max(session.nextChunkSnapshotSamples,
+                                 Int(session.context.incrementalCadence.startSeconds * AudioRecorder.sampleRate))
+        let completedEnd = session.completedSampleEnd
+        return { count in
+            let start = chunkReady && count >= chunkThreshold
+                ? chunkStart : max(completedEnd, count - Self.previewWindowSamples)
+            return min(start, count)..<count
+        }
     }
 
     /// Shared by live capture and file replay so benchmarks use the same
     /// thresholds and chunk acceptance rules as dictation.
-    func processIncrementalSnapshot(generation: Int, samples: [Float]) {
+    func processIncrementalSnapshot(generation: Int, samples: [Float], sampleOffset: Int = 0) {
         guard let session = sessions[generation] else { return }
         // Previews bring snapshots faster than the chunk tick, but chunk
         // attempts keep the chunk tick.
-        if samples.count >= session.nextChunkSnapshotSamples {
-            processChunkSnapshot(session, samples: samples)
+        if sampleOffset + samples.count >= session.nextChunkSnapshotSamples {
+            processChunkSnapshot(session, samples: samples, sampleOffset: sampleOffset)
         }
-        startPreviewIfNeeded(session, samples: samples)
+        startPreviewIfNeeded(session, samples: samples, sampleOffset: sampleOffset)
     }
 
-    private func processChunkSnapshot(_ session: Session, samples: [Float]) {
+    private func processChunkSnapshot(_ session: Session, samples: [Float], sampleOffset: Int) {
         let generation = session.generation
         let cadence = session.context.incrementalCadence
         let trace = session.trace
-        trace?.record(.incrementalAttempt, fields: [.samples: Double(samples.count)])
-        guard samples.count >= Int(cadence.startSeconds * AudioRecorder.sampleRate) else {
+        let end = sampleOffset + samples.count
+        trace?.record(.incrementalAttempt, fields: [.samples: Double(end)])
+        guard end >= Int(cadence.startSeconds * AudioRecorder.sampleRate) else {
             trace?.record(.incrementalSkipped, status: .tooShort)
             return
         }
+        let start = session.incrementalSampleEnd
+        // A delayed preview-only snapshot can lack the beginning of the next
+        // chunk. It must never submit a truncated chunk or move its cadence.
+        guard sampleOffset <= session.incrementalAnalysisStart,
+              start <= end else { return }
         // Half a snapshot interval of slack absorbs timer and audio buffer jitter.
-        session.nextChunkSnapshotSamples = samples.count
+        session.nextChunkSnapshotSamples = end
             + Int((cadence.tickSeconds - cadence.snapshotSeconds / 2) * AudioRecorder.sampleRate)
         guard canAcceptIncrementalChunk(generation: generation) else {
             trace?.record(.incrementalSkipped, status: .busy)
             return
         }
-        let start = incrementalSampleEnd(generation: generation) ?? 0
-        guard let cut = AudioRecorder.incrementalCutPoint(in: samples, after: start) else {
+        guard let cut = AudioRecorder.incrementalCutPoint(in: samples, after: start - sampleOffset) else {
             trace?.record(.incrementalSkipped, status: .noBoundary)
             return
         }
-        let chunk = DictationAudioPreparation(samples: Array(samples[start..<cut]))
+        let chunk = DictationAudioPreparation(samples: Array(samples[(start - sampleOffset)..<cut]))
         guard chunk.isAdmitted else {
             trace?.record(.incrementalSkipped, status: .insufficientVoice)
             return
@@ -287,7 +313,7 @@ final class DictationSessionPipeline {
         processIncrementalChunk(
             generation: generation, audio: chunk,
             pauseSecondsAfterChunk: AudioRecorder.incrementalPauseSeconds(in: samples, around: cut),
-            sourceEndIndex: cut
+            sourceEndIndex: sampleOffset + cut
         )
     }
 
@@ -305,28 +331,30 @@ final class DictationSessionPipeline {
     /// Transcribes the audio after the last committed chunk for the HUD.
     /// The result is shown only if no chunk committed meanwhile, and it never
     /// reaches the committed text, the final transcript, or failure handling.
-    private func startPreviewIfNeeded(_ session: Session, samples: [Float]) {
+    private func startPreviewIfNeeded(_ session: Session, samples: [Float], sampleOffset: Int) {
         let cadence = session.context.incrementalCadence
+        let end = sampleOffset + samples.count
         guard canStartPreview(session),
-              samples.count >= Int(cadence.previewStartSeconds * AudioRecorder.sampleRate),
-              session.completedSampleEnd < samples.count else { return }
+              end >= Int(cadence.previewStartSeconds * AudioRecorder.sampleRate),
+              session.completedSampleEnd < end else { return }
         let committedEnd = session.completedSampleEnd
         // A long hold without a pause must not re-decode minutes of audio
         // every second or leave release waiting behind that preview.
         let displayed = session.displayedPreview
         var start = max(committedEnd, displayed?.range.lowerBound ?? committedEnd)
         var prefix = start == committedEnd ? session.committedText : displayed?.prefix ?? ""
-        if samples.count - start > Int(15 * AudioRecorder.sampleRate) {
+        if end - start > Self.previewWindowSamples {
             // Freeze the displayed hypothesis before starting another bounded
             // window. This prefix is for the HUD only, never final delivery.
             start = max(committedEnd, displayed?.range.upperBound ?? 0,
-                        samples.count - Int(15 * AudioRecorder.sampleRate))
+                        end - Self.previewWindowSamples)
             prefix = (displayed?.range.upperBound ?? 0) > committedEnd
                 ? displayed?.text ?? session.committedText : session.committedText
         }
-        let range = start..<samples.count
+        guard start >= sampleOffset else { return }
+        let range = start..<end
         guard range != session.lastPreviewRange else { return }
-        let audio = DictationAudioPreparation(samples: Array(samples[range]))
+        let audio = DictationAudioPreparation(samples: Array(samples[(start - sampleOffset)..<samples.count]))
         guard audio.isAdmitted else { return }
         session.lastPreviewRange = range
         let lifetime = TranscriptionLifetime()
