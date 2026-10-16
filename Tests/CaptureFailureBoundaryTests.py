@@ -36,10 +36,14 @@ final class Key {
 }
 final class Delivery {
     var cancelled: Set<Int> = []
+    var interruptions: [Bool] = []
     var incrementalCalls = 0
     func incrementalSnapshotRange(generation: Int) -> ((Int) -> Range<Int>)? { { 0..<$0 } }
     func processIncrementalSnapshot(generation: Int, samples: [Float], sampleOffset: Int) { incrementalCalls += 1 }
-    func cancel(generation: Int) { cancelled.insert(generation) }
+    func cancel(generation: Int, interruptInference: Bool = true) {
+        cancelled.insert(generation)
+        interruptions.append(interruptInference)
+    }
 }
 final class Recorder {
     struct Recording {
@@ -61,7 +65,7 @@ final class AppDelegate {
     var recordingGeneration = 1
     var isRecording = true
     var recordingIsCommand = false
-    var recordingCommandTarget: Result<TextInjector.CommandTarget, TextInjector.SelectionError>? = .failure(.unavailable)
+    var recordingCommandTarget: TextInjector.CommandTarget? = TextInjector.CommandTarget()
     var activeDictationTrace: DictationTrace? = DictationTrace()
     var activeDictationGeneration: Int? = 10
     var hudDictationGeneration: (dictation: Int, hud: Int)? = (10, 1)
@@ -77,17 +81,11 @@ final class AppDelegate {
     let hotkey = Key()
     let dictationDelivery = Delivery()
     let recorder = Recorder()
-    func cancelActiveDictationSession() {
-        incrementalTimer?.cancel()
-        incrementalTimer = nil
-        if let generation = activeDictationGeneration { dictationDelivery.cancel(generation: generation) }
-        activeDictationGeneration = nil
-    }
     func scheduleIncrementalTick(generation: Int, recordingID: UUID, cadence: IncrementalCadence, after: TimeInterval) {}
     func playCue(_ name: String) { cues += 1 }
     func scheduleFailureRecovery() { recoveries += 1 }
     func process(samples: [Float], releasedAt: Date, hudGeneration: Int,
-                 asCommand: Bool, commandTarget: Result<TextInjector.CommandTarget, TextInjector.SelectionError>?,
+                 asCommand: Bool, commandTarget: TextInjector.CommandTarget?,
                  dictationGeneration: Int?, nativeAudio: NativeAudioRecording?) {
         processCalls += 1
     }
@@ -104,6 +102,8 @@ CASES = r'''
             precondition(activeDictationTrace == nil && activeDictationGeneration == nil && recordingCommandTarget == nil)
             precondition(incrementalTimer == nil && hudDictationGeneration == nil && releasedDictation == nil)
             precondition(dictationDelivery.cancelled == [10])
+            precondition(!dictationDelivery.interruptions.isEmpty && dictationDelivery.interruptions.allSatisfy { !$0 },
+                         "Capture failure must preserve healthy inference")
             precondition(overlay.hides == 1 && cancelKey.deactivations == 1 && cues == 1 && recoveries == 1)
             precondition(recorder.completions.isEmpty && processCalls == 0)
         case "release-race":
@@ -113,7 +113,22 @@ CASES = r'''
             recorder.completions[0](.init(samples: [], startError: Failure.stopped))
             precondition(pendingAudioHandoffs == 0 && processCalls == 0)
             precondition(dictationDelivery.cancelled == [10])
+            precondition(!dictationDelivery.interruptions.isEmpty && dictationDelivery.interruptions.allSatisfy { !$0 },
+                         "Capture failure must preserve healthy inference")
             precondition(releasedDictation == nil && overlay.hides == 1 && cues == 1 && recoveries == 1)
+        case "failed-handoff":
+            hotkeyReleased()
+            recorder.completions[0](.init(samples: [], startError: Failure.stopped))
+            precondition(processCalls == 0 && pendingAudioHandoffs == 0)
+            precondition(dictationDelivery.cancelled == [10] && dictationDelivery.interruptions == [false])
+            handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "late notification")
+            precondition(recordingGeneration == 2 && cues == 1 && recoveries == 1)
+            precondition(dictationDelivery.interruptions == [false, false])
+        case "startup-failure":
+            handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "startup")
+            handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "duplicate")
+            precondition(dictationDelivery.cancelled == [10] && dictationDelivery.interruptions == [false])
+            precondition(!isRecording && cues == 1 && recoveries == 1)
         case "stale-failure":
             recordingGeneration = 2
             activeDictationGeneration = 20
@@ -168,7 +183,7 @@ class CaptureFailureBoundaryTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         source = (root / "Sources/LocalFlow/AppDelegate.swift").read_text()
         methods = "\n".join(method(source, name) for name in (
-            "handleCaptureFailure", "hotkeyReleased", "dismissHud", "commandKeyReleased", "runIncrementalTick"))
+            "handleCaptureFailure", "cancelActiveDictationSession", "hotkeyReleased", "dismissHud", "commandKeyReleased", "runIncrementalTick"))
         harness = directory / "main.swift"
         harness.write_text(STUBS + methods + CASES)
         cls.binary = directory / "capture-failure-boundary"
@@ -188,6 +203,12 @@ class CaptureFailureBoundaryTests(unittest.TestCase):
 
     def test_failure_racing_release_cancels_without_recognition(self):
         self.run_case("release-race")
+
+    def test_failed_handoff_before_ui_notification_preserves_healthy_inference(self):
+        self.run_case("failed-handoff")
+
+    def test_startup_failure_cancels_once_without_interrupting_inference(self):
+        self.run_case("startup-failure")
 
     def test_old_failure_cannot_clear_or_cancel_new_recording(self):
         self.run_case("stale-failure")
