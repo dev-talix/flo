@@ -82,10 +82,6 @@ struct DiagnosticsSnapshot: Sendable {
     static func parse(_ text: String) -> Self {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let environmentKeys: Set<String> = [
-            "schemaVersion", "pid", "osVersion", "processorCount", "memoryBytes",
-            "hardwareModel", "chip", "appVersion", "buildConfiguration", "buildCommit", "buildDirty"
-        ]
         var result = Self()
         var grouped: [UUID: [DictationTrace.Event]] = [:]
         var environments: [UUID: [String: String]] = [:]
@@ -96,26 +92,16 @@ struct DiagnosticsSnapshot: Sendable {
             guard parts.count == 3 else { continue }
             let message = parts[2]
             if message.hasPrefix("timing_environment ") {
-                let data = Data(message.dropFirst("timing_environment ".count).utf8)
-                result.environment = ((try? decoder.decode([String: String].self, from: data)) ?? [:])
-                    .filter { environmentKeys.contains($0.key) }
+                result.environment = sanitizedEnvironment(String(message))
             } else if message.hasPrefix("timing ") {
                 let data = Data(message.dropFirst("timing ".count).utf8)
-                guard let event = try? decoder.decode(DictationTrace.Event.self, from: data),
-                      event.schemaVersion == 1, event.ordinal >= 0 else {
+                guard let decoded = try? decoder.decode(DictationTrace.Event.self, from: data),
+                      let event = sanitized(decoded) else {
                     result.ignoredTimingLines += 1
                     continue
                 }
                 if grouped[event.traceID] == nil { environments[event.traceID] = result.environment }
-                let safeEvent = DictationTrace.Event(
-                    schemaVersion: event.schemaVersion, traceID: event.traceID, source: event.source,
-                    ordinal: event.ordinal, name: event.name, uptimeNs: event.uptimeNs,
-                    sinceStartMs: event.sinceStartMs, sinceReleaseMs: event.sinceReleaseMs,
-                    startedAt: event.startedAt, status: event.status,
-                    fields: event.fields.filter { DictationTrace.Field(rawValue: $0.key) != nil },
-                    model: event.model, segment: event.segment, microphone: event.microphone
-                )
-                grouped[event.traceID, default: []].append(safeEvent)
+                grouped[event.traceID, default: []].append(event)
             }
         }
         result.traces = grouped.map { id, events in
@@ -125,6 +111,30 @@ struct DiagnosticsSnapshot: Sendable {
             return $0.id.uuidString < $1.id.uuidString
         }
         return result
+    }
+
+    /// Shared by typed live writes and parsed legacy files. Keep the archive content-free.
+    static func sanitized(_ event: DictationTrace.Event) -> DictationTrace.Event? {
+        guard event.schemaVersion == 1, event.ordinal >= 0 else { return nil }
+        return DictationTrace.Event(
+            schemaVersion: event.schemaVersion, traceID: event.traceID, source: event.source,
+            ordinal: event.ordinal, name: event.name, uptimeNs: event.uptimeNs,
+            sinceStartMs: event.sinceStartMs, sinceReleaseMs: event.sinceReleaseMs,
+            startedAt: event.startedAt, status: event.status,
+            fields: event.fields.filter { DictationTrace.Field(rawValue: $0.key) != nil },
+            model: event.model, segment: event.segment, microphone: event.microphone
+        )
+    }
+
+    static func sanitizedEnvironment(_ message: String) -> [String: String] {
+        guard message.hasPrefix("timing_environment ") else { return [:] }
+        let environmentKeys: Set<String> = [
+            "schemaVersion", "pid", "osVersion", "processorCount", "memoryBytes",
+            "hardwareModel", "chip", "appVersion", "buildConfiguration", "buildCommit", "buildDirty"
+        ]
+        let data = Data(message.dropFirst("timing_environment ".count).utf8)
+        return ((try? JSONDecoder().decode([String: String].self, from: data)) ?? [:])
+            .filter { environmentKeys.contains($0.key) }
     }
 
     /// Use a single file handle so rotation cannot mix two files. Bound both I/O

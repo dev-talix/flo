@@ -218,10 +218,15 @@ final class AudioRecorder {
     /// buffer — drives the waveform overlay. Callee must hop to main itself.
     var onLevel: ((Float) -> Void)?
 
-    /// Called on the capture queue with 12 coarse band magnitudes (low
-    /// frequencies first, ~120 Hz – 3.8 kHz, log-spaced) per captured buffer.
-    /// Raw energies — the overlay normalizes them. Callee hops to main itself.
+    /// Called on the capture queue with 12 coarse band magnitudes, low
+    /// frequencies first, about 120 Hz to 3.8 kHz, at most 30 times per second.
+    /// The overlay normalizes raw energies. Callee hops to main itself.
     var onSpectrum: (([Float]) -> Void)?
+
+    /// Thread-safe renderer demand. Nil preserves spectrum delivery for other consumers.
+    var needsSpectrum: (() -> Bool)?
+    private var lastSpectrumTime: TimeInterval? // sample queue only
+    private static let spectrumInterval: TimeInterval = 1.0 / 30
 
     /// Goertzel center frequencies: 12 log-spaced bands across the speech range.
     private static let bandFrequencies: [Float] = {
@@ -552,6 +557,7 @@ final class AudioRecorder {
             lock.lock()
             let routeFailed = runtimeFailed
             samples.removeAll(keepingCapacity: true)
+            lastSpectrumTime = nil
             nativeAudio = retainNativeAudio ? NativeAudioAccumulator() : nil
             captureLive = false
             audibleStreak = 0
@@ -915,8 +921,6 @@ final class AudioRecorder {
         }
         let count = Int(converted.frameLength)
         let buffer = UnsafeBufferPointer(start: channel[0], count: count)
-        let metrics = Self.signalMetrics(of: buffer)
-
         lock.lock()
         // A warm idle session keeps delivering buffers; none of them are
         // part of a recording — no accumulation, no HUD levels, no
@@ -934,6 +938,7 @@ final class AudioRecorder {
         }
         lastConvertedAt = now()
         conversionFailures = 0
+        let metrics = Self.signalMetrics(of: buffer)
         let wasLive = captureLive
         // A Bluetooth mic mid-A2DP→HFP negotiation can emit a spurious
         // buffer (or a few) before the real stream stabilizes — a single
@@ -1013,24 +1018,26 @@ final class AudioRecorder {
             onLevel(min(1, metrics.rms.squareRoot() * 2.2))
         }
 
-        // Coarse spectrum for the pitch-aware HUD themes: one Goertzel filter
-        // per band over the tail of the buffer. 12 × ≤512 multiplies — cheap.
-        if let onSpectrum {
-            let n = min(count, 512)
-            let start = count - n
-            var bands = [Float](repeating: 0, count: Self.goertzelCoefficients.count)
-            for (bi, coeff) in Self.goertzelCoefficients.enumerated() {
-                var s1: Float = 0, s2: Float = 0
-                for i in start..<count {
-                    let s0 = channel[0][i] + coeff * s1 - s2
-                    s2 = s1
-                    s1 = s0
-                }
-                let power = s1 * s1 + s2 * s2 - coeff * s1 * s2
-                bands[bi] = max(0, power).squareRoot() / Float(n)
+        // The HUD renders at 30 fps. Analyze only when its active theme uses
+        // spectrum, without changing conversion, capture, or live-signal gating.
+        guard let onSpectrum, needsSpectrum?() ?? true else { return }
+        let now = now()
+        guard lastSpectrumTime.map({ now - $0 >= Self.spectrumInterval }) ?? true else { return }
+        lastSpectrumTime = now
+        let n = min(count, 512)
+        let start = count - n
+        var bands = [Float](repeating: 0, count: Self.goertzelCoefficients.count)
+        for (bi, coeff) in Self.goertzelCoefficients.enumerated() {
+            var s1: Float = 0, s2: Float = 0
+            for i in start..<count {
+                let s0 = channel[0][i] + coeff * s1 - s2
+                s2 = s1
+                s1 = s0
             }
-            onSpectrum(bands)
+            let power = s1 * s1 + s2 * s2 - coeff * s1 * s2
+            bands[bi] = max(0, power).squareRoot() / Float(n)
         }
+        onSpectrum(bands)
     }
 }
 

@@ -37,21 +37,25 @@ struct DiagnosticsArchive {
     }
 
     func record(_ event: DictationTrace.Event, environment: String, now: Date = Date()) throws {
-        guard isRetained(event.startedAt, now: now) else { return }
+        guard isRetained(event.startedAt, now: now),
+              let safeEvent = DiagnosticsSnapshot.sanitized(event) else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        let json = String(decoding: try encoder.encode(event), as: UTF8.self)
-        let snapshot = DiagnosticsSnapshot.parse("0 0 " + environment + "\n0 0 timing " + json)
-        guard let trace = snapshot.traces.first else { return }
+        let json = String(decoding: try encoder.encode(safeEvent), as: UTF8.self)
+        let trace = DiagnosticsSnapshot.Trace(id: event.traceID, events: [safeEvent], environment: [:])
         let url = traceURL(trace)
+        let line = "0 0 timing " + json + "\n"
         if FileManager.default.fileExists(atPath: url.path) {
             let handle = try FileHandle(forWritingTo: url)
             defer { try? handle.close() }
             try handle.seekToEnd()
-            let safeJSON = String(decoding: try encoder.encode(trace.events[0]), as: UTF8.self)
-            try handle.write(contentsOf: Data(("\n0 0 timing " + safeJSON + "\n").utf8))
+            try handle.write(contentsOf: Data(("\n" + line).utf8))
         } else {
-            try merge(snapshot, now: now)
+            try createDirectory()
+            let environment = DiagnosticsSnapshot.sanitizedEnvironment(environment)
+            let header = "0 0 timing_environment " + String(decoding: try encoder.encode(environment), as: UTF8.self) + "\n"
+            try Data((header + line).utf8).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 
@@ -151,7 +155,7 @@ struct DiagnosticsArchive {
     }
 
     private func traceURL(_ trace: DiagnosticsSnapshot.Trace) -> URL {
-        let name = String(format: "%020.0f", trace.startedAt.timeIntervalSince1970) + "-" + trace.id.uuidString + ".log"
+        let name = String(format: "%020.0f", floor(trace.startedAt.timeIntervalSince1970)) + "-" + trace.id.uuidString + ".log"
         return directory.appendingPathComponent(name)
     }
 

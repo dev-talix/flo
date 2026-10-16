@@ -25,6 +25,19 @@ final class WaveformOverlay {
     nonisolated(unsafe) private var pendingLevel: Float?
     nonisolated(unsafe) private var pendingSpectrum: [Float]?
     nonisolated(unsafe) private var inputDrainScheduled = false
+    nonisolated(unsafe) private var spectrumEnabled = false
+
+    nonisolated func needsSpectrum() -> Bool {
+        inputLock.lock()
+        defer { inputLock.unlock() }
+        return spectrumEnabled
+    }
+
+    private func setSpectrumEnabled(_ enabled: Bool) {
+        inputLock.lock()
+        spectrumEnabled = enabled
+        inputLock.unlock()
+    }
 
     init() {
         content = HudContentView(theme: HudTheme.current, liveTranscript: Settings.liveTranscript)
@@ -127,6 +140,7 @@ final class WaveformOverlay {
     func show() {
         cancelPreview()
         present(phase: .warming)
+        setSpectrumEnabled(content.theme.usesSpectrum)
     }
 
     /// First real audio buffer arrived — snap to the full-brightness waveform.
@@ -138,6 +152,7 @@ final class WaveformOverlay {
     /// until the pipeline resolves and the caller hides it (or a new press
     /// takes the panel over via show()).
     func beginProcessing() {
+        setSpectrumEnabled(false)
         content.setPhase(.processing)
     }
 
@@ -149,6 +164,7 @@ final class WaveformOverlay {
     }
 
     func hide() {
+        setSpectrumEnabled(false)
         cancelPreview()
         acceptsTranscript = false
         hideGeneration += 1
