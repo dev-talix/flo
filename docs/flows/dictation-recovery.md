@@ -1419,3 +1419,135 @@ actual process exit was captured. No dependency resolution or download ran.
 The offline build emits existing concurrency/capture and trailing-closure
 warnings. Swift also reports that `--skip-update` is deprecated. No check failed
 after the repair.
+
+
+### R2 repair handoff, October 16, 2026
+
+Owner: Flo maintainers. The user authorized repair of independently confirmed
+CS1 and CS2 from `/Users/nikhlkapadia/Talix/flo-pr-work/review-r2-result.json`
+and `verify-r2-engine-result.txt` / `verify-r2-detachment-result.txt` in that
+directory. This section supersedes the earlier R2 verification for cancellation
+and release ordering. Base: `4f428f6dd5e2e45ea0bfce8cbca9747948690d71`, local
+`pr/r2-capture-failure-health`, including E4, R1, and session/R3/R4 prerequisites.
+Implementation branch: `fix/capture-handoff-recovery` in
+`/Users/nikhlkapadia/.t3/worktrees/localflow/t3-8c3d22f1`.
+
+#### Capture failure and engine ownership
+
+`AppDelegate.handleCaptureFailure` cancels matching held or released dictations
+with `interruptInference: false`. The failed `hotkeyReleased` handoff uses the
+same policy, including when it arrives before the UI failure notification.
+Generation checks, immediate session invalidation, and timer cancellation reject
+stale recognition, HUD updates, history, retry audio, and delivery. Startup and
+terminal errors consume the UI generation once; stale errors leave a newer hold
+and command target intact. The boundary fixture now uses the actual
+`TextInjector.CommandTarget?` shape and extracts the real cancellation helper.
+
+A healthy inference can finish warm while its rejected result releases the gate
+for the next recording. R1's `TranscriptionLifetime` remains the sole owner of
+abandoned inference and its default 90-second grace. Capture failure itself
+never requests immediate quarantine. If inference remains stuck past grace,
+R1 quarantines it and wakes followers; authoritative follower failures retain
+complete retry audio. Existing `AppDelegate.retryFailedDictation` synchronizes
+`modelLoaded`, runs the bounded model-load path, and then retries. This repair
+adds no automatic reload policy or second abandonment deadline.
+
+`AudioCaptureLifecycleTests.testCaptureFailureDuringPreviewKeepsEngineWarmAndNextRecordingUsable`
+and `testCaptureFailureDuringChunkKeepsEngineWarmAndNextRecordingUsable` use the
+real recorder, delivery, pipeline, Transcriber, and gate with synthetic capture
+and a suspended fake engine. They fail capture during active inference, reject a
+late release, queue the next healthy recording behind the old call, then finish
+that call. Only the new recording reaches history and inert delivery. Both
+complete on the original engine with one load. The Python boundary separately
+checks the actual AppDelegate policy in all three cancellation locations.
+Existing `DictationSessionStallTests` cover grace expiry, replacement, queued
+followers, stale callbacks, and bounded engine ownership.
+
+#### Atomic paired audio release
+
+`AudioRecorder.stop` validates and detaches recognition and native originals
+inside one `sampleQueue.sync` block under the recorder lock. Whole raw/converted
+callbacks serialize with detachment. A failure decision leaves that block with
+its recording UUID and error; terminal teardown runs on the control queue after
+leaving `sampleQueue`. The decision latches runtime failure before unlocking,
+so later callbacks cannot append before cleanup. Startup gating, first syllables,
+ongoing health, generation checks, warm capture, E4 ranges, and native retention
+keep their existing contracts. No new production abstraction or test hook was
+introduced. Tests reuse the existing capture factory and session-running closure;
+`CaptureRecoveryEngine` is a test-only `SpeechEngine` implementation.
+
+`testStopSerializesDetachmentWithCallbackArrivingDuringSessionValidation` launches
+a new callback from the fake session-running getter after the old empty drain
+barrier. It pauses between raw and converted delivery. Stop must wait and return
+both tails with complete native audio. The red run returned a native tail while
+recognition omitted it. `testReleaseChecksHealthBeforeTimerAndNeverHandsOffIncompleteAudio`
+now makes teardown drain the sample queue, exercising the failure decision outside
+that queue. Existing lifecycle tests cover failed/stale release, delayed snapshots,
+terminal cleanup, first syllables, silence, startup budgets, and complete originals.
+
+#### Verification and review state
+
+Implementation ran directly in this Codex context, using `gpt-6.1-sol`; no child
+agents or alternate model subprocesses were used. One local R2 commit is
+authorized. Push, PR creation, merge, install, network access, live app, microphone,
+clipboard, and Accessibility operations are outside authorization. Independent
+repair review belongs to the parent. No material product decisions remain open.
+Only these five tracked files changed: `Sources/LocalFlow/AppDelegate.swift`,
+`Sources/LocalFlow/AudioRecorder.swift`, `Tests/CaptureFailureBoundaryTests.py`,
+`Tests/LocalFlowTests/AudioCaptureLifecycleTests.swift`, and this flow record.
+No unrelated dirty files were present. The final commit SHA is in the implementation
+handoff; `/tmp/flo-r2-repair-final.diff` identifies the verified diff against base.
+
+Environment: macOS 27.0.1, arm64, Swift 6.4. The existing dependency cache was
+cloned locally into ignored `.build`, with the lockfile unchanged. Swift checks
+run inside a network-denying `sandbox-exec` wrapper. `--disable-sandbox` avoids
+nested SwiftPM manifest sandbox failure while the outer network denial remains.
+Broader debug and release checks use `CFFIXED_USER_HOME=/tmp/flo-r2-repair-home`
+and deny writes to personal logs and reads/writes to production app data.
+Tests use synthetic capture, inert injection, and temporary persistence fixtures.
+
+- RED, exit 1: actual-handler Python boundary before repair, three failed cases
+  exposing immediate interruption. Log: `/tmp/flo-r2-repair-boundary-red.log`.
+- RED, exit 1: deterministic release race before recorder repair, two assertions
+  exposing missing converted tail and premature handoff. Log and exit status:
+  `/tmp/flo-r2-repair-race-red.log` and `.exit`.
+- RED, exit 1: the new preview/chunk integrations replaying the original default
+  interrupting policy, 12 failed assertions including engine quarantine and
+  next-hold `notLoaded`. Log: `/tmp/flo-r2-repair-engine-red.log` and `.exit`.
+- PASS, exit 0: `python3 -B Tests/CaptureFailureBoundaryTests.py`, seven cases.
+  Log: `/tmp/flo-r2-repair-boundary-green.log`.
+- PASS, exit 0: `swift test --disable-sandbox --disable-automatic-resolution --filter
+  'AudioCaptureLifecycleTests|DictationSessionStallTests|PreviewInferenceBudgetTests|TranscriberTests'`,
+  65 tests, zero failures. Log: `/tmp/flo-r2-repair-focused.log` and `.exit`.
+- PASS, exit 0: `swift test --disable-sandbox --disable-automatic-resolution --filter
+  '^LocalFlowTests\.(AudioCaptureLifecycleTests|AudioRecorderTests|VoicedAudioTests|IncrementalCutPointTests|Dictation[A-Za-z]*Tests|RetainedAudioFileTests|PersonalVoice[A-Za-z]*Tests|NativeAudioRecordingTests|AppTerminationTests|TranscriberTests|PreviewInferenceBudgetTests|TranscriptionModelTests)/'`,
+  221 tests, zero failures, no skips. Log: `/tmp/flo-r2-repair-debug.log` and `.exit`.
+- PASS, exit 0: the same selection with `-c release`, 221 tests, zero failures,
+  no skips, including compilation of the production application. Log:
+  `/tmp/flo-r2-repair-release.log` and `.exit`.
+- PASS, exit 0: final Python boundary, seven cases. Log:
+  `/tmp/flo-r2-repair-boundary-final.log` and `.exit`.
+- PASS, exit 0: `python3 -B Tests/StartupReadinessTests.py`, four cases. Log:
+  `/tmp/flo-r2-repair-startup.log` and `.exit`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`. Log:
+  `/tmp/flo-r2-repair-diff-check.log` and `.exit`.
+
+NOT RUN: full suite, TextInjector/TargetedDelivery fixtures, live devices, real
+recognition, actual UI visibility or insertion, packaging, installation, and
+external Git operations. The selected suites avoid clipboard and Accessibility.
+A first integration-fixture attempt used synchronous XCTest waits from an async
+MainActor test and timed out; async bounded expectations replaced those waits
+before the behavioral red run. Nested manifest and boundary macro sandbox
+attempts were blocked by `sandbox_apply: Operation not permitted`. Swift checks
+use the outer sandbox with SwiftPM's nested sandbox disabled. The standalone
+boundary command passes without an outer sandbox and has no network operations.
+Its blocked wrapper log is `/tmp/flo-r2-repair-boundary-nested-sandbox.log`.
+Release compilation reports inherited diagnostic/text-injection warnings and
+relocated-cache warnings. No changed production code or capture test warning
+was reported.
+
+Next reviewer: compare the commit with base, inspect `handleCaptureFailure`,
+the failed-release guard, and `AudioRecorder.stop`, then run the named tests.
+Review CS1 and CS2 independently. Suggested skills: unslop, code-review,
+review-finished-work, and workflow-capture. Parent integration should preserve
+its separately owned command-lifetime changes when applying this one R2 commit.

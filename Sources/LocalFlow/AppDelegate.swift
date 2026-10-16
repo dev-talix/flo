@@ -817,10 +817,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recordingIsCommand = false
         recordingCommandTarget = nil
         activeDictationTrace = nil
+        // Reject the failed hold's results while healthy inference finishes
+        // warm. Transcriber owns R1's bounded grace for abandoned requests.
         if activeDictationGeneration == dictationGeneration {
-            cancelActiveDictationSession()
+            cancelActiveDictationSession(interruptInference: false)
         } else if let dictationGeneration {
-            dictationDelivery.cancel(generation: dictationGeneration)
+            dictationDelivery.cancel(generation: dictationGeneration, interruptInference: false)
         }
         hudDictationGeneration = nil
         releasedDictation = nil
@@ -1020,7 +1022,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 defer { self.pendingAudioHandoffs -= 1 }
                 if recording.startError != nil {
                     if let dictationGeneration {
-                        self.dictationDelivery.cancel(generation: dictationGeneration)
+                        self.dictationDelivery.cancel(generation: dictationGeneration, interruptInference: false)
                     }
                     self.dismissHud(generation)
                     return
