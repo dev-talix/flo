@@ -61,4 +61,5 @@ jobs:
         run: |
           swift test
           python3 Tests/TranscribeCLITests.py
+          python3 -B Tests/CaptureFailureBoundaryTests.py
           python3 -B Tests/CommandAbandonmentBoundaryTests.py

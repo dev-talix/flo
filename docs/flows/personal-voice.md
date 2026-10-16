@@ -44,6 +44,12 @@ start error after queued conversion finishes. `NativeAudioAccumulator` caps
 retained samples at 310 seconds or 64 MiB and marks incomplete capture instead
 of silently treating a truncated native recording as complete.
 
+R2 terminal capture failures discard both recognition and native buffers before
+notifying the app. A queued release receives empty audio and a capture error,
+so the cancelled hold cannot become a personal clip or final recognition input.
+Healthy release retains both original arrays. See
+[R2 capture lifecycle and verification](dictation-recovery.md#r2-terminal-capture-cleanup-and-ongoing-stream-health).
+
 `DictationDelivery.release` passes both audio formats to
 `DictationSessionPipeline.recordCapturedAudio`, which retains the first original before
 silence trimming. `finalize` records assembled recognition before corrections,

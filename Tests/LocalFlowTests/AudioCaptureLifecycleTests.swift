@@ -147,6 +147,48 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         wait(for: [stopped], timeout: 2)
     }
 
+    func testStopSerializesDetachmentWithCallbackArrivingDuringSessionValidation() {
+        let input = SyntheticCaptureInput()
+        let recorder = AudioRecorder(makeCaptureSession: input.open)
+        startRecorder(recorder)
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [0.2])
+        source.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+
+        let rawArrived = DispatchSemaphore(value: 0)
+        let allowConversion = DispatchSemaphore(value: 0)
+        let paused = expectation(description: "callback paused between raw and converted tail")
+        // On the broken implementation this getter runs after the empty drain
+        // barrier. Start a new callback there, before controlQueue detaches.
+        input.onIsRunning = {
+            source.send(converted: [0.5], native: [0.6], betweenFormats: {
+                rawArrived.signal()
+                paused.fulfill()
+                XCTAssertEqual(allowConversion.wait(timeout: .now() + 3), .success)
+            })
+            XCTAssertEqual(rawArrived.wait(timeout: .now() + 2), .success)
+        }
+        let stopped = expectation(description: "paired handoff")
+        let premature = expectation(description: "stop waits for conversion counterpart")
+        premature.isInverted = true
+        var conversionReleased = false
+        recorder.stop { recording in
+            if !conversionReleased { premature.fulfill() }
+            XCTAssertNil(recording.startError)
+            XCTAssertEqual(recording.samples, [0.1, 0.3, 0.5])
+            XCTAssertEqual(recording.nativeAudio?.samples, [0.2, 0.4, 0.6])
+            XCTAssertEqual(recording.nativeAudio?.isComplete, true)
+            stopped.fulfill()
+        }
+        wait(for: [paused, premature], timeout: 0.1)
+        input.onIsRunning = nil
+        conversionReleased = true
+        allowConversion.signal()
+        wait(for: [stopped], timeout: 3)
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+    }
+
     func testStopHandsOffBeforeHardwareTeardownFinishesAndNextStartWaits() {
         let input = SyntheticCaptureInput()
         let teardownEntered = expectation(description: "teardown entered")
@@ -226,64 +268,656 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         wait(for: [nextStopped], timeout: 2)
     }
 
-    func testRuntimeFailureRecoversCurrentInputAndIgnoresReplacedInput() {
+    func testStartupRuntimeFailureRebuildsWithinBudgetAndIgnoresReplacedInput() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        startRecorder(recorder)
+        let original = input.latestSource!
+        original.send(converted: [0], native: [0])
+        drain(recorder)
+        original.fail()
+        drain(recorder)
+        clock.tick()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(input.openCount, 2)
+        XCTAssertEqual(input.stopCount, 1)
+        let replacement = input.latestSource!
+        XCTAssertFalse(original === replacement)
+        original.fail()
+        original.send(converted: [0.9], native: [0.9])
+        replacement.send(converted: [0.5], native: [0.6])
+        replacement.send(converted: [0.7], native: [0.8])
+        XCTAssertEqual(drain(recorder).samples, [0.5, 0.7])
+        XCTAssertEqual(input.openCount, 2)
+        let recording = stopRecorder(recorder)
+        XCTAssertNil(recording.startError)
+        XCTAssertEqual(recording.samples, [0.5, 0.7])
+        XCTAssertEqual(recording.nativeAudio?.isComplete, false)
+    }
+
+    func testTerminalStartupSilenceDiscardsBuffersAndNotifiesExactlyOnce() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock, policy: .init(startupSilentChecks: 0))
+        recorder.keepWarm = true
+        let id = UUID()
+        var failures: [AudioRecorder.RuntimeFailure] = []
+        startRecorder(recorder, id: id) { failures.append($0) }
+        let source = input.latestSource!
+        source.send(converted: [0], native: [0.2])
+        source.send(converted: [0.1], native: [0.3]) // parked first syllable
+        drain(recorder)
+        let staleCheck = clock.takeCheck()
+        staleCheck()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.recordingID, id)
+        XCTAssertEqual(input.stopCount, 1)
+        staleCheck()
+        source.fail()
+        source.send(converted: [0.8], native: [0.8])
+        source.send(converted: [0.9], native: [0.9])
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(failures.count, 1)
+        let released = stopRecorder(recorder)
+        XCTAssertNotNil(released.startError)
+        XCTAssertTrue(released.samples.isEmpty)
+        XCTAssertNil(released.nativeAudio)
+        XCTAssertTrue(stopRecorder(recorder).samples.isEmpty)
+        XCTAssertEqual(input.stopCount, 1)
+    }
+
+    func testRuntimeFailureAfterLiveDiscardsAudioBeforeBlockingTeardownAndReleaseIsSafe() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures: [AudioRecorder.RuntimeFailure] = []
+        let failureNotified = expectation(description: "failure notified before teardown returns")
+        startRecorder(recorder) { failures.append($0); failureNotified.fulfill() }
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [0.2])
+        source.send(converted: [0.3], native: [0.4])
+        XCTAssertEqual(drain(recorder).samples, [0.1, 0.3])
+        let teardownEntered = expectation(description: "terminal teardown entered")
+        let resumeTeardown = DispatchSemaphore(value: 0)
+        defer { input.onStop = nil; resumeTeardown.signal() }
+        input.onStop = {
+            input.onStop = nil
+            teardownEntered.fulfill()
+            _ = resumeTeardown.wait(timeout: .now() + 3)
+        }
+        source.fail()
+        wait(for: [teardownEntered, failureNotified], timeout: 2)
+        // Failure invalidates the input before hardware shutdown returns.
+        source.send(converted: [0.8], native: [0.8])
+        source.send(converted: [0.9], native: [0.9])
+        source.queue.sync {}
+        XCTAssertEqual(failures.count, 1, "Notification precedes hardware teardown completion")
+        input.onStop = nil
+        resumeTeardown.signal()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        source.fail()
+        clock.tick()
+        let recording = stopRecorder(recorder)
+        XCTAssertNotNil(recording.startError)
+        XCTAssertTrue(recording.samples.isEmpty)
+        XCTAssertNil(recording.nativeAudio)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(input.stopCount, 1)
+    }
+
+    func testFailedSetupDiscardsAlreadyDeliveredAudioAndQueuedRuntimeFailure() {
+        let input = SyntheticCaptureInput()
+        input.onOpen = { source in
+            source.send(converted: [0.1], native: [0.2])
+            source.send(converted: [0.3], native: [0.4])
+            source.queue.sync {}
+            source.fail()
+            throw AudioRecorder.RecorderError.noInput
+        }
+        let recorder = AudioRecorder(makeCaptureSession: input.open)
+        let failed = expectation(description: "setup failure")
+        var runtimeFailures = 0
+        recorder.start(retainNativeAudio: true, onRuntimeFailure: { _ in runtimeFailures += 1 }) { error in
+            XCTAssertNotNil(error)
+            failed.fulfill()
+        }
+        wait(for: [failed], timeout: 3)
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        let recording = stopRecorder(recorder)
+        XCTAssertTrue(recording.samples.isEmpty)
+        XCTAssertNil(recording.nativeAudio)
+        XCTAssertNotNil(recording.startError)
+        XCTAssertEqual(runtimeFailures, 0, "Setup reports only through completion")
+        input.onOpen = nil
+        startRecorder(recorder)
+        XCTAssertNil(stopRecorder(recorder).startError)
+    }
+
+    func testStaleHealthCheckAndCallbacksCannotFailNewRecording() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        let oldID = UUID()
+        var oldFailures: [AudioRecorder.RuntimeFailure] = []
+        startRecorder(recorder, id: oldID) { oldFailures.append($0) }
+        let oldSource = input.latestSource!
+        let staleCheck = clock.takeCheck()
+        oldSource.send(converted: [0.1], native: [0.2])
+        oldSource.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        oldSource.fail()
+        drain(recorder)
+        XCTAssertEqual(oldFailures.map(\.recordingID), [oldID])
+        var newFailures = 0
+        startRecorder(recorder) { _ in newFailures += 1 }
+        let source = input.latestSource!
+        source.send(converted: [0.5], native: [0.6])
+        source.send(converted: [0.7], native: [0.8])
+        oldSource.fail()
+        oldSource.sendConversionFailure()
+        oldSource.send(converted: [0.9], native: [0.9])
+        staleCheck()
+        XCTAssertEqual(drain(recorder).samples, [0.5, 0.7])
+        XCTAssertEqual(newFailures, 0)
+        XCTAssertEqual(oldFailures.count, 1)
+        let recording = stopRecorder(recorder)
+        XCTAssertNil(recording.startError)
+        XCTAssertEqual(recording.samples, [0.5, 0.7])
+        XCTAssertEqual(recording.nativeAudio?.samples, [0.6, 0.8])
+    }
+
+    func testMissingBuffersAfterLiveFailAtInjectedDeadline() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures: [AudioRecorder.RuntimeFailure] = []
+        startRecorder(recorder) { failures.append($0) }
+        input.latestSource!.send(converted: [0.1], native: [0.2])
+        input.latestSource!.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        clock.advance(by: 2)
+        clock.tick()
+        XCTAssertEqual(drain(recorder).samples, [0.1, 0.3])
+        XCTAssertTrue(failures.isEmpty)
+        clock.advance(by: 1)
+        clock.tick()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.error as? AudioRecorder.RecorderError, .streamStopped)
+        XCTAssertEqual(input.openCount, 1, "Live gaps never join a replacement to partial speech")
+        XCTAssertTrue(stopRecorder(recorder).samples.isEmpty)
+    }
+
+    func testConversionErrorsAfterLiveFailAtInjectedLimit() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures: [AudioRecorder.RuntimeFailure] = []
+        startRecorder(recorder) { failures.append($0) }
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [0.2])
+        source.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        source.sendConversionFailure()
+        drain(recorder)
+        clock.tick()
+        drain(recorder)
+        XCTAssertTrue(failures.isEmpty)
+        source.sendConversionFailure()
+        source.sendConversionFailure()
+        drain(recorder)
+        clock.tick()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.error as? AudioRecorder.RecorderError, .conversionFailed)
+        let recording = stopRecorder(recorder)
+        XCTAssertNotNil(recording.startError)
+        XCTAssertNil(recording.nativeAudio)
+    }
+
+    func testRawBuffersWithoutConvertedProgressFailEvenWithoutErrorStreak() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures: [AudioRecorder.RuntimeFailure] = []
+        startRecorder(recorder) { failures.append($0) }
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [0.2])
+        source.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        for _ in 0..<3 {
+            clock.advance(by: 1)
+            source.sendRawOnly()
+            drain(recorder)
+            clock.tick()
+            drain(recorder)
+        }
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.error as? AudioRecorder.RecorderError, .conversionFailed)
+        XCTAssertTrue(stopRecorder(recorder).samples.isEmpty)
+    }
+
+    func testSilenceAfterLiveRemainsHealthyAndPreservesFirstSyllableAndOriginals() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures = 0
+        startRecorder(recorder) { _ in failures += 1 }
+        let source = input.latestSource!
+        source.send(converted: [0], native: [0])
+        source.send(converted: [0.01], native: [0.02])
+        source.send(converted: [0.03], native: [0.04])
+        drain(recorder)
+        for _ in 0..<12 {
+            clock.advance(by: 1)
+            source.send(converted: [0], native: [0])
+            drain(recorder)
+            clock.tick()
+            drain(recorder)
+        }
+        XCTAssertEqual(failures, 0)
+        XCTAssertEqual(input.openCount, 1)
+        let recording = stopRecorder(recorder)
+        XCTAssertNil(recording.startError)
+        XCTAssertEqual(recording.samples, [0.01, 0.03] + Array(repeating: 0, count: 12))
+        XCTAssertEqual(recording.nativeAudio?.samples, [0, 0.02, 0.04] + Array(repeating: 0, count: 12))
+        XCTAssertEqual(recording.nativeAudio?.isComplete, true)
+    }
+
+    func testReleaseChecksHealthBeforeTimerAndNeverHandsOffIncompleteAudio() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures = 0
+        startRecorder(recorder) { _ in failures += 1 }
+        input.latestSource!.send(converted: [0.1], native: [0.2])
+        input.latestSource!.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        clock.advance(by: 3)
+        // Terminal teardown must run outside sampleQueue, even when stop
+        // discovers the failure during its serialized validation.
+        let source = input.latestSource!
+        input.onStop = { source.queue.sync {} }
+        let recording = stopRecorder(recorder)
+        XCTAssertTrue(recording.samples.isEmpty)
+        XCTAssertNil(recording.nativeAudio)
+        XCTAssertNotNil(recording.startError)
+        XCTAssertEqual(failures, 1)
+        clock.tick()
+        drain(recorder)
+        XCTAssertEqual(failures, 1)
+    }
+
+    func testStartupMissingBuffersUsesFiniteRebuildBudget() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock, policy: .init(startupRebuilds: 1))
+        var failures = 0
+        startRecorder(recorder) { _ in failures += 1 }
+        clock.tick()
+        drain(recorder)
+        XCTAssertEqual(input.openCount, 2)
+        XCTAssertEqual(failures, 0)
+        input.latestSource!.fail()
+        input.latestSource!.fail()
+        drain(recorder)
+        clock.tick()
+        drain(recorder)
+        XCTAssertEqual(input.openCount, 2)
+        XCTAssertEqual(failures, 1)
+        XCTAssertNotNil(stopRecorder(recorder).startError)
+    }
+
+    func testLateBuffersCannotEraseAHealthFailureBeforeTheNextCheck() {
+        for conversionFailure in [false, true] {
+            let input = SyntheticCaptureInput()
+            let clock = CaptureHealthClock()
+            let recorder = healthRecorder(input, clock)
+            var failures = 0
+            startRecorder(recorder) { _ in failures += 1 }
+            let source = input.latestSource!
+            source.send(converted: [0.1], native: [0.2])
+            source.send(converted: [0.3], native: [0.4])
+            drain(recorder)
+            if conversionFailure {
+                for _ in 0..<3 { source.sendConversionFailure() }
+            } else {
+                clock.advance(by: 3)
+            }
+            source.send(converted: [0.5], native: [0.6])
+            source.send(converted: [0.7], native: [0.8])
+            drain(recorder)
+            let recording = stopRecorder(recorder)
+            XCTAssertNotNil(recording.startError)
+            XCTAssertTrue(recording.samples.isEmpty)
+            XCTAssertNil(recording.nativeAudio)
+            XCTAssertEqual(failures, 1)
+        }
+    }
+
+    func testFailedStartupRebuildPerformsTerminalCleanupWithoutRelease() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures = 0
+        startRecorder(recorder) { _ in failures += 1 }
+        input.failStart = true
+        clock.tick()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(input.stopCount, 1)
+        XCTAssertNil(stopRecorder(recorder).nativeAudio)
+        input.failStart = false
+        startRecorder(recorder)
+        XCTAssertNil(stopRecorder(recorder).startError)
+    }
+
+    func testQueuedSnapshotCannotStartRecognitionWhileTerminalTeardownBlocks() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        let id = UUID()
+        var failures = 0
+        let failureNotified = expectation(description: "failure notified while teardown blocks")
+        startRecorder(recorder, id: id) { _ in failures += 1; failureNotified.fulfill() }
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [0.2])
+        source.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        XCTAssertTrue(recorder.isCaptureActive(recordingID: id))
+        XCTAssertFalse(recorder.isCaptureActive(recordingID: UUID()))
+        let teardownEntered = DispatchSemaphore(value: 0)
+        let resumeTeardown = DispatchSemaphore(value: 0)
+        defer { input.onStop = nil; resumeTeardown.signal() }
+        input.onStop = {
+            input.onStop = nil
+            teardownEntered.signal()
+            _ = resumeTeardown.wait(timeout: .now() + 3)
+        }
+        let snapshotDelivered = expectation(description: "queued snapshot delivered during teardown")
+        var recognitionCalls = 0
+        recorder.snapshot { snapshot in
+            XCTAssertEqual(snapshot.samples, [0.1, 0.3], "E4 detached copies stay intact")
+            if recorder.isCaptureActive(recordingID: id) { recognitionCalls += 1 }
+            snapshotDelivered.fulfill()
+        }
+        source.fail()
+        // Keep main blocked until failure invalidates the recorder. The detached
+        // snapshot was queued first and must reject recognition on its own.
+        XCTAssertEqual(teardownEntered.wait(timeout: .now() + 2), .success)
+        wait(for: [snapshotDelivered, failureNotified], timeout: 2)
+        XCTAssertEqual(recognitionCalls, 0)
+        XCTAssertEqual(failures, 1, "UI failure must not wait for hardware teardown")
+        input.onStop = nil
+        resumeTeardown.signal()
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+        XCTAssertEqual(failures, 1)
+        XCTAssertNotNil(stopRecorder(recorder).startError)
+    }
+
+    func testReleaseAfterPreLiveRuntimeErrorDiscardsNativePrefixAndReportsFailure() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures = 0
+        startRecorder(recorder) { _ in failures += 1 }
+        input.latestSource!.send(converted: [0.1], native: [0.2])
+        XCTAssertTrue(drain(recorder).samples.isEmpty, "First audible buffer is still parked")
+        input.latestSource!.fail()
+        let recording = stopRecorder(recorder)
+        XCTAssertNotNil(recording.startError)
+        XCTAssertTrue(recording.samples.isEmpty)
+        XCTAssertNil(recording.nativeAudio)
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(input.openCount, 1, "Release ends the hold instead of starting recovery")
+        clock.tick()
+        drain(recorder)
+        XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
+    func testCaptureFailureDuringPreviewKeepsEngineWarmAndNextRecordingUsable() async throws {
+        try await verifyCaptureFailureDuringInference(preview: true)
+    }
+
+    @MainActor
+    func testCaptureFailureDuringChunkKeepsEngineWarmAndNextRecordingUsable() async throws {
+        try await verifyCaptureFailureDuringInference(preview: false)
+    }
+
+    @MainActor
+    func testCaptureFailureCancelsPreviewBeforeBlockedTeardownReturns() async throws {
+        try await verifyCaptureFailureDuringInference(preview: true, holdTeardown: true)
+    }
+
+    @MainActor
+    func testCaptureFailureCancelsChunkBeforeBlockedTeardownReturns() async throws {
+        try await verifyCaptureFailureDuringInference(preview: false, holdTeardown: true)
+    }
+
+    @MainActor
+    private func verifyCaptureFailureDuringInference(preview: Bool, holdTeardown: Bool = false) async throws {
+        let engine = CaptureRecoveryEngine()
+        var loads = 0
+        let transcriber = Transcriber(modelLoader: { _, _ in loads += 1; return engine },
+                                      abandonedInferenceGrace: 30)
+        try await transcriber.load(model: "test")
+        var injected: [String] = []
+        var history: [String] = []
+        var partials: [String] = []
+        var outcomes: [DictationSessionOutcome] = []
+        var requests: [DictationTranscriptionSegment] = []
+        var finished: [Int] = []
+        var cleanupCalls = 0
+        let stalePartial = holdTeardown ? expectation(description: "failed inference must not update the HUD") : nil
+        stalePartial?.isInverted = true
+        let delivery = DictationDelivery(
+            transcribe: { request in
+                requests.append(request.segment)
+                defer { finished.append(request.generation) }
+                return try await transcriber.transcribe(request)
+            },
+            cleanup: { cleanupCalls += 1; return .init(text: $0.text, succeeded: true) },
+            inject: { text, _, ready, complete in injected.append(text); ready(); complete() },
+            recordTranscript: { history.append($0) },
+            onOutcome: { outcome, _ in outcomes.append(outcome) },
+            onPartialTranscript: { _, text in partials.append(text); stalePartial?.fulfill() },
+            onCancelled: { _ in }, onCommandCancelled: { _ in },
+            onProcessingCountChange: { _ in }
+        )
+        let context = DictationSessionContext(
+            cleanupEnabled: holdTeardown, styleProfile: .general, corrections: [], snippets: [],
+            incrementalCadence: preview ? .whisper : .init(startSeconds: 4, tickSeconds: 2)
+        )
+        let failedGeneration = delivery.begin(.init(context: context))
         let input = SyntheticCaptureInput()
         let recorder = AudioRecorder(makeCaptureSession: input.open)
-        let started = expectation(description: "started")
-        recorder.start(retainNativeAudio: true) { error in
+        let teardownEntered = holdTeardown ? expectation(description: "failed capture entered hardware teardown") : nil
+        let allowTeardown = DispatchSemaphore(value: 0)
+        let teardownReturned = DispatchSemaphore(value: 0)
+        if let teardownEntered {
+            input.onStop = {
+                input.onStop = nil // Only the failed hold blocks, never the next hold.
+                teardownEntered.fulfill()
+                XCTAssertEqual(allowTeardown.wait(timeout: .now() + 10), .success)
+                teardownReturned.signal()
+            }
+        }
+        defer {
+            input.onStop = nil
+            allowTeardown.signal()
+            Task { await engine.finishAbandoned() }
+        }
+        let failureNotified = expectation(description: "main callback owns capture failure")
+        var failures = 0
+        await startRecoveryRecorder(recorder) { _ in
+            XCTAssertTrue(Thread.isMainThread)
+            failures += 1
+            // The Python boundary checks this policy on the actual AppDelegate
+            // handler, helper, and failed-release path. Here it reaches real ASR.
+            delivery.cancel(generation: failedGeneration, interruptInference: false)
+            failureNotified.fulfill()
+        }
+        let source = input.latestSource!
+        let rate = Int(AudioRecorder.sampleRate)
+        let speech = [Float](repeating: 0.2, count: rate)
+        let initial = preview ? speech + speech
+            : Array(repeating: Float(0.2), count: rate * 3)
+                + Array(repeating: Float(0), count: rate)
+                + Array(repeating: Float(0.2), count: rate * 4)
+        source.send(converted: Array(initial.prefix(rate)), native: Array(repeating: 0.2, count: rate * 3))
+        source.send(converted: Array(initial.dropFirst(rate)), native: Array(repeating: 0.2, count: (initial.count - rate) * 3))
+        let initialSnapshot = try await recoverySnapshot(recorder)
+        delivery.processIncrementalSnapshot(generation: failedGeneration, samples: initialSnapshot.samples)
+        await captureEventually { await engine.calls == 1 }
+        XCTAssertEqual(requests, [preview ? .preview : .incrementalChunk(index: 0)])
+
+        source.fail()
+        if let teardownEntered, let stalePartial {
+            await fulfillment(of: [teardownEntered], timeout: 2)
+            await fulfillment(of: [failureNotified], timeout: 1)
+            XCTAssertEqual(failures, 1, "Failure ownership must reach main before hardware stop returns")
+            XCTAssertNil(delivery.incrementalSnapshotRange(generation: failedGeneration),
+                         "Failure must remove pipeline ownership before inference completes")
+            XCTAssertEqual(teardownReturned.wait(timeout: .now()), .timedOut)
+            await engine.finishAbandoned()
+            await captureEventually { finished.contains(failedGeneration) }
+            await fulfillment(of: [stalePartial], timeout: 0.05)
+            XCTAssertEqual(teardownReturned.wait(timeout: .now()), .timedOut,
+                           "Inference must finish while hardware teardown is still held")
+            XCTAssertTrue(partials.isEmpty)
+            XCTAssertTrue(outcomes.isEmpty)
+            XCTAssertTrue(history.isEmpty)
+            XCTAssertTrue(injected.isEmpty)
+            XCTAssertEqual(cleanupCalls, 0)
+            XCTAssertEqual(delivery.retryCount, 0)
+            XCTAssertFalse(delivery.isBusy)
+            allowTeardown.signal()
+        } else {
+            await fulfillment(of: [failureNotified], timeout: 2)
+        }
+        let loadedDuringGrace = await transcriber.isLoaded
+        XCTAssertTrue(loadedDuringGrace, "Capture failure must not quarantine healthy ASR")
+        let failedRecording = try await releaseRecoveryRecorder(recorder)
+        XCTAssertNotNil(failedRecording.startError)
+        XCTAssertTrue(failedRecording.samples.isEmpty)
+        XCTAssertNil(failedRecording.nativeAudio)
+        // Even a late release of the failed hold cannot revive its pipeline.
+        delivery.release(generation: failedGeneration, samples: initial)
+        XCTAssertTrue(injected.isEmpty)
+        XCTAssertEqual(delivery.retryCount, 0, "Incomplete capture must not become retry audio")
+
+        let next = delivery.begin(.init(context: context))
+        await startRecoveryRecorder(recorder)
+        input.latestSource!.send(converted: speech, native: [0.3])
+        input.latestSource!.send(converted: speech, native: [0.4])
+        let healthy = try await releaseRecoveryRecorder(recorder)
+        XCTAssertNil(healthy.startError)
+        XCTAssertEqual(healthy.samples, speech + speech)
+        XCTAssertEqual(healthy.nativeAudio?.samples, [0.3, 0.4])
+        XCTAssertEqual(healthy.nativeAudio?.isComplete, true)
+        delivery.release(generation: next, samples: healthy.samples, nativeAudio: healthy.nativeAudio)
+        if !holdTeardown {
+            await captureEventually { await transcriber.waitingInferenceCount == 1 }
+            await engine.finishAbandoned()
+        }
+        await captureEventually { finished.contains(failedGeneration) && outcomes.count == 1 }
+        XCTAssertEqual(outcomes, [.finalTranscript(generation: next, text: "next healthy words")])
+        XCTAssertEqual(injected, ["next healthy words"])
+        XCTAssertEqual(history, injected)
+        XCTAssertTrue(partials.isEmpty, "Abandoned preview/chunk must not update the HUD")
+        XCTAssertFalse(delivery.isBusy)
+        XCTAssertEqual(delivery.retryCount, 0)
+        let loadedAfterCompletion = await transcriber.isLoaded
+        XCTAssertTrue(loadedAfterCompletion)
+        XCTAssertEqual(loads, 1, "The next recording must succeed without reloading")
+        XCTAssertEqual(failures, 1, "Failed capture has one terminal transition")
+        XCTAssertEqual(cleanupCalls, holdTeardown ? 1 : 0, "Only healthy audio may reach cleanup")
+    }
+
+    @MainActor
+    private func startRecoveryRecorder(_ recorder: AudioRecorder,
+                                       onFailure: @escaping (AudioRecorder.RuntimeFailure) -> Void = { _ in XCTFail("Unexpected capture failure") }) async {
+        let started = expectation(description: "recovery capture started")
+        recorder.start(retainNativeAudio: true, onRuntimeFailure: { failure in
+            DispatchQueue.main.async { onFailure(failure) }
+        }) { error in
             XCTAssertNil(error)
             started.fulfill()
         }
-        wait(for: [started], timeout: 2)
-        let original = input.latestSource!
-        original.send(converted: [0.1], native: [0.2])
-        original.send(converted: [0.3], native: [0.4])
-        let captured = expectation(description: "captured before failure")
-        recorder.snapshot { snapshot in
-            let samples = snapshot.samples
-            XCTAssertEqual(samples, [0.1, 0.3])
-            captured.fulfill()
-        }
-        wait(for: [captured], timeout: 2)
+        await fulfillment(of: [started], timeout: 3)
+    }
 
-        original.fail()
-        let recovered = expectation(description: "recovery preserves captured samples")
-        // snapshot drains the control queue after the failure callback, then
-        // drains sample conversion, so assertions observe completed recovery.
-        recorder.snapshot { snapshot in
-            let samples = snapshot.samples
-            XCTAssertEqual(samples, [0.1, 0.3])
-            XCTAssertEqual(input.openCount, 2)
-            XCTAssertEqual(input.stopCount, 1)
-            recovered.fulfill()
-        }
-        wait(for: [recovered], timeout: 2)
-        let replacement = input.latestSource!
-        XCTAssertFalse(original === replacement)
-        replacement.send(converted: [0.5], native: [0.6])
-        replacement.send(converted: [0.7], native: [0.8])
+    @MainActor
+    private func recoverySnapshot(_ recorder: AudioRecorder) async throws -> AudioRecorder.Snapshot {
+        let drained = expectation(description: "recovery samples drained")
+        var result: AudioRecorder.Snapshot?
+        recorder.snapshot { result = $0; drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 3)
+        return try XCTUnwrap(result)
+    }
 
-        original.fail()
-        let staleFailureIgnored = expectation(description: "old failure leaves replacement running")
-        recorder.snapshot { snapshot in
-            let samples = snapshot.samples
-            XCTAssertEqual(samples, [0.1, 0.3, 0.5, 0.7])
-            XCTAssertEqual(input.openCount, 2)
-            XCTAssertEqual(input.stopCount, 1)
-            XCTAssertTrue(input.latestSource === replacement)
-            staleFailureIgnored.fulfill()
-        }
-        wait(for: [staleFailureIgnored], timeout: 2)
+    @MainActor
+    private func releaseRecoveryRecorder(_ recorder: AudioRecorder) async throws -> AudioRecorder.Recording {
+        let stopped = expectation(description: "recovery capture released")
+        var result: AudioRecorder.Recording?
+        recorder.stop { result = $0; stopped.fulfill() }
+        await fulfillment(of: [stopped], timeout: 3)
+        return try XCTUnwrap(result)
+    }
 
-        let stopped = expectation(description: "recovered recording handoff")
-        recorder.stop { recording in
-            XCTAssertNil(recording.startError)
-            XCTAssertEqual(recording.samples, [0.1, 0.3, 0.5, 0.7])
-            XCTAssertEqual(recording.nativeAudio?.samples, [0.2, 0.4])
-            XCTAssertEqual(recording.nativeAudio?.isComplete, false)
-            stopped.fulfill()
+    @MainActor
+    private func captureEventually(_ condition: () async -> Bool,
+                                  file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<400 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(5))
         }
-        wait(for: [stopped], timeout: 2)
+        XCTFail("Capture recovery condition did not become true", file: file, line: line)
+    }
+
+    private func healthRecorder(
+        _ input: SyntheticCaptureInput, _ clock: CaptureHealthClock,
+        policy: AudioRecorder.HealthPolicy = .init()
+    ) -> AudioRecorder {
+        var policy = policy
+        policy.progressTimeout = 3
+        policy.conversionFailureLimit = 3
+        return AudioRecorder(makeCaptureSession: input.open, healthPolicy: policy,
+                             now: { clock.now }, scheduleHealthCheck: clock.schedule)
+    }
+
+    private func startRecorder(
+        _ recorder: AudioRecorder, id: UUID = UUID(),
+        onFailure: @escaping (AudioRecorder.RuntimeFailure) -> Void = { _ in XCTFail("Unexpected terminal failure") }
+    ) {
+        let started = expectation(description: "started synthetic recording")
+        recorder.start(recordingID: id, retainNativeAudio: true, onRuntimeFailure: { failure in
+            DispatchQueue.main.async { onFailure(failure) }
+        }) { error in
+            XCTAssertNil(error)
+            started.fulfill()
+        }
+        wait(for: [started], timeout: 3)
+    }
+
+    @discardableResult
+    private func drain(_ recorder: AudioRecorder) -> AudioRecorder.Snapshot {
+        let drained = expectation(description: "control and samples drained")
+        var result: AudioRecorder.Snapshot?
+        recorder.snapshot { result = $0; drained.fulfill() }
+        wait(for: [drained], timeout: 3)
+        return result!
+    }
+
+    private func stopRecorder(_ recorder: AudioRecorder) -> AudioRecorder.Recording {
+        let stopped = expectation(description: "released synthetic recording")
+        var result: AudioRecorder.Recording?
+        recorder.stop { result = $0; stopped.fulfill() }
+        wait(for: [stopped], timeout: 3)
+        return result!
     }
 
     func testSnapshotDoesNotDetachNativeAudioOrDiscardLaterSamples() {
@@ -319,11 +953,11 @@ private final class SyntheticCaptureInput {
     final class Source {
         let queue: DispatchQueue
         let onRaw: (AVAudioPCMBuffer?) -> Void
-        let onPCM: (AVAudioPCMBuffer) -> Void
+        let onPCM: (AVAudioPCMBuffer?) -> Void
         let onFailure: () -> Void
 
         init(queue: DispatchQueue, onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
-             onPCM: @escaping (AVAudioPCMBuffer) -> Void,
+             onPCM: @escaping (AVAudioPCMBuffer?) -> Void,
              onFailure: @escaping () -> Void) {
             self.queue = queue
             self.onRaw = onRaw
@@ -333,9 +967,21 @@ private final class SyntheticCaptureInput {
 
         func fail() { onFailure() }
 
-        func send(converted: [Float], native: [Float]) {
+        func sendConversionFailure() {
+            queue.async {
+                self.onRaw(Self.buffer([0.1], rate: 48_000))
+                self.onPCM(nil)
+            }
+        }
+
+        func sendRawOnly() {
+            queue.async { self.onRaw(Self.buffer([0.1], rate: 48_000)) }
+        }
+
+        func send(converted: [Float], native: [Float], betweenFormats: @escaping () -> Void = {}) {
             queue.async {
                 self.onRaw(Self.buffer(native, rate: 48_000))
+                betweenFormats()
                 self.onPCM(Self.buffer(converted, rate: 16_000))
             }
         }
@@ -359,6 +1005,8 @@ private final class SyntheticCaptureInput {
     private var stops = 0
     private var shouldFail = false
     private var stopCallback: (() -> Void)?
+    var onOpen: ((Source) throws -> Void)?
+    var onIsRunning: (() -> Void)?
 
     var latestSource: Source? {
         lock.lock(); defer { lock.unlock() }
@@ -384,7 +1032,7 @@ private final class SyntheticCaptureInput {
     func open(deviceUID: String?, fallbackToDefaultIfUnavailable: Bool,
               targetFormat: AVAudioFormat, sampleQueue: DispatchQueue,
               onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
-              onPCM: @escaping (AVAudioPCMBuffer) -> Void,
+              onPCM: @escaping (AVAudioPCMBuffer?) -> Void,
               onFailure: @escaping () -> Void) throws -> AudioCaptureSession {
         lock.lock()
         opens += 1
@@ -392,15 +1040,72 @@ private final class SyntheticCaptureInput {
             lock.unlock()
             throw AudioRecorder.RecorderError.noInput
         }
-        source = Source(queue: sampleQueue, onRaw: onRaw, onPCM: onPCM, onFailure: onFailure)
+        let source = Source(queue: sampleQueue, onRaw: onRaw, onPCM: onPCM, onFailure: onFailure)
+        self.source = source
         lock.unlock()
+        try onOpen?(source)
         return AudioCaptureSession(deviceUID: deviceUID, microphoneName: "Synthetic input",
-                                   isRunning: { true }, stop: {
+                                   isRunning: { self.onIsRunning?(); return true }, stop: {
             self.lock.lock()
             self.stops += 1
             let callback = self.stopCallback
             self.lock.unlock()
             callback?()
         })
+    }
+}
+
+/// Manual monotonic time and queued checks keep health regressions independent
+/// of hardware, wall-clock sleeps, and scheduler timing.
+private final class CaptureHealthClock {
+    private let lock = NSLock()
+    private var time: TimeInterval = 0
+    private var checks: [() -> Void] = []
+
+    var now: TimeInterval { lock.lock(); defer { lock.unlock() }; return time }
+
+    func advance(by interval: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        time += interval
+    }
+
+    func schedule(after delay: TimeInterval, check: @escaping () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        checks.append(check)
+    }
+
+    func takeCheck() -> () -> Void {
+        lock.lock(); defer { lock.unlock() }
+        precondition(!checks.isEmpty, "Recorder must keep health monitoring armed")
+        return checks.removeFirst()
+    }
+
+    func tick() { takeCheck()() }
+}
+
+/// Ignores cancellation while the first inference is suspended, like a native
+/// model call. Later calls complete immediately without loading another engine.
+private actor CaptureRecoveryEngine: SpeechEngine {
+    private(set) var calls = 0
+    private var pending: CheckedContinuation<EngineTranscription, Never>?
+
+    func transcribe(samples: [Float], lowEnergy: Bool) async throws -> EngineTranscription {
+        calls += 1
+        if calls == 1 {
+            return await withCheckedContinuation { pending = $0 }
+        }
+        return result("next healthy words")
+    }
+
+    func setVocabulary(_ terms: String) async {}
+
+    func finishAbandoned() {
+        pending?.resume(returning: result("stale failed capture words"))
+        pending = nil
+    }
+
+    private func result(_ text: String) -> EngineTranscription {
+        .init(segments: [.init(text: text, start: 0, end: 1)], rawText: text,
+              decodingFallbacks: 0, resultCount: 1)
     }
 }

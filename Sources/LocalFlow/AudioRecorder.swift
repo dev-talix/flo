@@ -15,16 +15,21 @@ final class AudioRecorder {
     enum RecorderError: Error, LocalizedError {
         case noInput
         case noSignal
+        case streamStopped
+        case conversionFailed
 
         var errorDescription: String? {
             switch self {
             case .noInput: return "No microphone input available."
-            case .noSignal: return "Microphone connected but delivering silence."
+            case .noSignal: return "Microphone did not become audible during startup."
+            case .streamStopped: return "Microphone stopped delivering audio."
+            case .conversionFailed: return "Microphone audio could not be converted."
             }
         }
     }
 
-    /// One detached recording, including the outcome of its own queued start.
+    /// One detached recording. startError also carries a terminal stream
+    /// failure, whose samples and native audio have already been discarded.
     struct Recording {
         let samples: [Float]
         let nativeAudio: NativeAudioRecording?
@@ -244,11 +249,21 @@ final class AudioRecorder {
     /// UI cap alone lives on the main queue, which can wedge.
     private static let maxCaptureSamples = Int(sampleRate * 310)
 
-    /// Called on the control queue when capture died mid-recording and could
-    /// not be recovered — without it the app looks like it's recording while
-    /// no audio flows. The session is already torn down when this fires.
-    /// Callee must hop to main itself.
-    var onRuntimeFailure: ((Error) -> Void)?
+    struct RuntimeFailure {
+        let recordingID: UUID
+        let captureGeneration: Int
+        let error: Error
+    }
+
+    /// Startup retains its Bluetooth wakeup allowance. Once live, buffer and
+    /// conversion progress determine health, independently of signal energy.
+    struct HealthPolicy {
+        var checkInterval: TimeInterval = 1.2
+        var progressTimeout: TimeInterval = 3.6
+        var conversionFailureLimit = 5
+        var startupSilentChecks = 8
+        var startupRebuilds = 2
+    }
 
     /// UID of the microphone to record from; nil follows the system default.
     /// Takes effect at the next `start`. Written from the main thread (menu
@@ -280,6 +295,16 @@ final class AudioRecorder {
 
     private var session: AudioCaptureSession?
     private let makeCaptureSession: AudioCaptureSession.Factory
+    private let healthPolicy: HealthPolicy
+    private let now: () -> TimeInterval
+    private let scheduleHealthCheck: ((TimeInterval, @escaping () -> Void) -> Void)?
+    private var recordingID: UUID? // guarded by lock
+    private var onRuntimeFailure: ((RuntimeFailure) -> Void)? // guarded by lock
+    private var lastBufferAt: TimeInterval = 0 // guarded by lock
+    private var lastConvertedAt: TimeInterval = 0 // guarded by lock
+    private var runtimeFailed = false // guarded by lock
+    private var streamFailure: RecorderError? // guarded by lock
+    private var conversionFailures = 0 // guarded by lock
     private var startError: Error? // touched only on `controlQueue`
     private var samples: [Float] = []
     private var nativeAudio: NativeAudioAccumulator? // guarded by `lock`
@@ -293,7 +318,6 @@ final class AudioRecorder {
     private var sessionEpoch = Date() // guarded by `lock`
     private var levelWindowSecond = 0 // guarded by `lock`
     private var peakDBFSWindow: Float = -.infinity // guarded by `lock`
-    private var recordingGeneration = 0 // touched only on `controlQueue`
     private var captureGeneration = 0 // guarded by `lock`
     private let lock = NSLock()
     private var trace: DictationTrace? // guarded by lock
@@ -304,8 +328,19 @@ final class AudioRecorder {
     private let controlQueue = DispatchQueue(label: "LocalFlow.AudioControl", qos: .userInitiated)
     private let sampleQueue = DispatchQueue(label: "LocalFlow.AudioSamples", qos: .userInitiated)
 
-    init(makeCaptureSession: @escaping AudioCaptureSession.Factory = AudioCaptureSession.microphone) {
+    init(
+        makeCaptureSession: @escaping AudioCaptureSession.Factory = AudioCaptureSession.microphone,
+        healthPolicy: HealthPolicy = HealthPolicy(),
+        now: @escaping () -> TimeInterval = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 },
+        scheduleHealthCheck: ((TimeInterval, @escaping () -> Void) -> Void)? = nil
+    ) {
+        precondition(healthPolicy.checkInterval.isFinite && healthPolicy.checkInterval > 0)
+        precondition(healthPolicy.progressTimeout.isFinite && healthPolicy.progressTimeout > 0)
+        precondition(healthPolicy.conversionFailureLimit > 0 && healthPolicy.startupSilentChecks >= 0 && healthPolicy.startupRebuilds >= 0)
         self.makeCaptureSession = makeCaptureSession
+        self.healthPolicy = healthPolicy
+        self.now = now
+        self.scheduleHealthCheck = scheduleHealthCheck
     }
 
     /// Starts capture; `completion` runs on the main queue with nil on
@@ -313,8 +348,15 @@ final class AudioRecorder {
     /// once, on the capture queue, at this recording's first sustained
     /// AUDIBLE audio. Neither session start nor buffer arrival means the
     /// mic is hearing — AirPods stream digital zeros for seconds while
-    /// their mic path spins up — and the "speak now" cue must not lie.
-    func start(trace: DictationTrace? = nil, retainNativeAudio: Bool = false, onCaptureLive: (() -> Void)? = nil, completion: @escaping (Error?) -> Void) {
+    /// their mic path spins up. Runtime failure runs once on the control
+    /// queue after state invalidation, before hardware teardown, and identifies
+    /// this start and its session.
+    func start(
+        recordingID: UUID = UUID(), trace: DictationTrace? = nil,
+        retainNativeAudio: Bool = false, onCaptureLive: (() -> Void)? = nil,
+        onRuntimeFailure: ((RuntimeFailure) -> Void)? = nil,
+        completion: @escaping (Error?) -> Void
+    ) {
         trace?.record(.captureEnqueued)
         controlQueue.async {
             trace?.record(.captureStarted)
@@ -323,19 +365,15 @@ final class AudioRecorder {
             // previous session, so old audio can never fire this callback.
             self.lock.lock()
             self.trace = trace
+            self.recordingID = recordingID
+            self.onRuntimeFailure = onRuntimeFailure
             self.onLiveCallback = onCaptureLive
             self.lock.unlock()
             do {
                 try self.startCapture(retainNativeAudio: retainNativeAudio)
                 DispatchQueue.main.async { completion(nil) }
             } catch {
-                self.startError = error
-                self.lock.lock()
-                self.samples = []
-                self.nativeAudio = nil
-                self.recordingActive = false
-                self.lock.unlock()
-                trace?.record(.captureFailed)
+                self.failRecording(error, recordingID: recordingID, notify: false)
                 DispatchQueue.main.async { completion(error) }
             }
         }
@@ -351,12 +389,19 @@ final class AudioRecorder {
         stopTrace?.record(.stopEnqueued)
         controlQueue.async {
             stopTrace?.record(.stopStarted)
-            self.recordingGeneration += 1
-            // Drain conversion work already queued at release time so the
-            // tail of the utterance is included in the returned samples.
-            let (captured, native, wasLive, warmWanted) = self.sampleQueue.sync {
+            let sessionRunning = self.session?.isRunning ?? false
+            // Serialize validation and detachment with whole raw/converted
+            // callbacks, including callbacks arriving during session validation.
+            let (captured, native, wasLive, warmWanted, failure):
+                ([Float], NativeAudioRecording?, Bool, Bool, (UUID, Error)?) = self.sampleQueue.sync {
                 self.lock.lock()
                 defer { self.lock.unlock() }
+                if let recordingID = self.recordingID,
+                   let error = self.captureFailureLocked() ??
+                    (self.recordingActive && self.captureLive && !sessionRunning ? RecorderError.streamStopped : nil) {
+                    self.runtimeFailed = true
+                    return ([], nil, false, false, (recordingID, error))
+                }
                 let captured = self.samples
                 let native = self.nativeAudio?.recording
                 self.samples = []
@@ -364,8 +409,17 @@ final class AudioRecorder {
                 let wasLive = self.captureLive
                 let warmWanted = self._keepWarm
                 self.recordingActive = false
+                self.captureLive = false
+                self.pendingAudible = []
+                self.onLiveCallback = nil
+                self.onRuntimeFailure = nil
                 self.trace = nil
-                return (captured, native, wasLive, warmWanted)
+                return (captured, native, wasLive, warmWanted, nil)
+            }
+            // Session shutdown can drain sampleQueue. Never tear down from
+            // inside the queue whose callbacks it is waiting to finish.
+            if let (recordingID, error) = failure {
+                self.failRecording(error, recordingID: recordingID)
             }
             let recording = Recording(samples: captured, nativeAudio: native, startError: self.startError)
             self.startError = nil
@@ -406,6 +460,15 @@ final class AudioRecorder {
             let snapshot = Snapshot(samples: captured, sampleOffset: start)
             DispatchQueue.main.async { completion(snapshot) }
         }
+    }
+
+    /// A queued live cue or snapshot must not start recognition after the
+    /// recorder has failed, even while its control queue is stopping hardware.
+    func isCaptureActive(recordingID: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return self.recordingID == recordingID && recordingActive && !runtimeFailed &&
+            streamFailure == nil && captureFailureLocked() == nil
     }
 
     /// Releases a warm (idle) session immediately. Device switches, system
@@ -485,37 +548,43 @@ final class AudioRecorder {
     private func startCapture(retainNativeAudio: Bool) throws {
         warmTeardown?.cancel()
         warmTeardown = nil
-        recordingGeneration += 1
-        sampleQueue.sync {
+        let routeFailed = sampleQueue.sync {
             lock.lock()
+            let routeFailed = runtimeFailed
             samples.removeAll(keepingCapacity: true)
             nativeAudio = retainNativeAudio ? NativeAudioAccumulator() : nil
             captureLive = false
             audibleStreak = 0
             pendingAudible = []
             buffersThisSession = 0
+            runtimeFailed = false
+            streamFailure = nil
             levelWindowSecond = 0
             peakDBFSWindow = -.infinity
             recordingActive = true
             sessionEpoch = Date()
+            lastBufferAt = now()
+            lastConvertedAt = lastBufferAt
+            conversionFailures = 0
             lock.unlock()
+            return routeFailed
         }
         // A warm session on the right device skips spin-up entirely — the
         // next audible buffer (one is usually already in flight) re-fires
         // onCaptureLive. Wrong device (setting changed, default moved, a
         // fallback mic was pinned last time) rebuilds from scratch.
-        if let session, session.isRunning, sessionDeviceUID == currentWantedDeviceUID() {
+        if let session, !routeFailed, session.isRunning, sessionDeviceUID == currentWantedDeviceUID() {
             lock.lock()
             let captureTrace = trace
             lock.unlock()
             captureTrace?.record(.captureReady, status: .warm,
                                  microphone: session.microphoneName)
             DiagLog.log("[diag] reusing warm capture session on %@", sessionDeviceUID ?? "?")
-            armNoAudioWatchdog(rebuildsLeft: 2)
+            armCaptureWatchdog(rebuildsLeft: healthPolicy.startupRebuilds)
             return
         }
         try captureWithFallback()
-        armNoAudioWatchdog(rebuildsLeft: 2)
+        armCaptureWatchdog(rebuildsLeft: healthPolicy.startupRebuilds)
     }
 
     /// The device a fresh capture would land on right now: the selected mic
@@ -559,71 +628,130 @@ final class AudioRecorder {
         }
     }
 
-    /// Watches a started session until audible audio arrives. Two distinct
-    /// stalls need opposite treatment:
-    /// - No buffers at all: the session is stuck (classic first-activation
-    ///   Bluetooth failure) — a rebuild reliably unsticks it.
-    /// - Buffers flowing but all digital zeros: the AirPods mic path is
-    ///   still spinning up behind a healthy HFP stream. Rebuilding thrashes
-    ///   a working session; wait it out, with one late rebuild kick and a
-    ///   hard stop so a genuinely dead route still surfaces as an error.
-    /// Pinned to the recording generation, not the session object — a quick
-    /// press→release→press can't have a stale check tear down the next
-    /// recording's mic, but a session replaced by error recovery stays
-    /// watched.
-    private func armNoAudioWatchdog(rebuildsLeft: Int, checks: Int = 0) {
-        let generation = recordingGeneration
-        // Also pin to the capture session: error recovery replaces the
-        // session (and arms its own watchdog) without bumping the recording
-        // generation, and a stale chain from before the swap must not
-        // rebuild or fail the replacement.
+    /// Every check belongs to both a recording and a capture session. A
+    /// replacement route gets a fresh chain; old checks cannot affect it.
+    private func armCaptureWatchdog(rebuildsLeft: Int, checks: Int = 0) {
         lock.lock()
+        let watchedRecording = recordingID
         let watchedCapture = captureGeneration
         lock.unlock()
-        controlQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self, generation == self.recordingGeneration, self.session != nil else { return }
-            self.lock.lock()
-            let live = self.captureLive
-            let buffers = self.buffersThisSession
-            let captureNow = self.captureGeneration
-            self.lock.unlock()
-            guard captureNow == watchedCapture else { return }
-            guard !live else { return }
-
-            // buffers == 0: stuck session, rebuild is the known fix. Silent
-            // buffers get NO rebuild — measured AirPods wakes take 1.3-1.8s
-            // and occasionally longer, and a rebuild mid-wake restarts the
-            // whole zero cycle (or fails outright: "no microphone input").
-            // Wait it out; only a route silent for ~10s is declared dead.
-            if buffers > 0 {
-                guard checks < 8 else {
-                    DiagLog.log("buffers flowing but silent for ~10s — giving up")
-                    self.tearDownSession()
-                    self.onRuntimeFailure?(RecorderError.noSignal)
-                    return
-                }
-                DiagLog.log("[diag] %d buffers, all silent — waiting for mic to wake", buffers)
-                self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft, checks: checks + 1)
-                return
-            }
-
-            guard rebuildsLeft > 0 else {
-                DiagLog.log("still no audio after rebuilding capture — giving up")
-                self.tearDownSession()
-                self.onRuntimeFailure?(RecorderError.noInput)
-                return
-            }
-            DiagLog.log("no usable audio after %.1fs (%d buffers) — rebuilding capture",
-                  1.2 * Double(checks + 1), buffers)
-            do {
-                try self.captureWithFallback()
-                self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft - 1, checks: checks + 1)
-            } catch {
-                DiagLog.log("capture rebuild failed: %@", error.localizedDescription)
-                self.tearDownSession()
-                self.onRuntimeFailure?(error)
-            }
+        let check = { [weak self] in
+            guard let self else { return }
+            self.checkCaptureHealth(recordingID: watchedRecording, capture: watchedCapture,
+                                    rebuildsLeft: rebuildsLeft, checks: checks)
         }
+        if let scheduleHealthCheck {
+            scheduleHealthCheck(healthPolicy.checkInterval) { [weak self] in
+                self?.controlQueue.async(execute: check)
+            }
+        } else {
+            controlQueue.asyncAfter(deadline: .now() + healthPolicy.checkInterval, execute: check)
+        }
+    }
+
+    private func checkCaptureHealth(recordingID: UUID?, capture: Int, rebuildsLeft: Int, checks: Int) {
+        guard let session else { return }
+        let running = session.isRunning
+        lock.lock()
+        guard let recordingID, self.recordingID == recordingID, recordingActive,
+              capture == captureGeneration else {
+            lock.unlock()
+            return
+        }
+        if captureLive {
+            // A gap after speech starts cannot be repaired by joining audio
+            // from a replacement route. Silence still advances both clocks.
+            let failure = captureFailureLocked() ?? (!running ? RecorderError.streamStopped : nil)
+            if let failure { streamFailure = failure }
+            lock.unlock()
+            if let failure {
+                failRecording(failure, recordingID: recordingID)
+            } else {
+                armCaptureWatchdog(rebuildsLeft: rebuildsLeft, checks: checks)
+            }
+            return
+        }
+
+        // Decide while holding the sample lock. A newly live route wins
+        // before this decision; later callbacks cannot enter a route already
+        // chosen for failure or replacement.
+        let missingBuffers = now() - lastBufferAt >= healthPolicy.progressTimeout
+        let conversionFailed = conversionFailures >= healthPolicy.conversionFailureLimit
+        if buffersThisSession > 0 && !missingBuffers && !conversionFailed && !runtimeFailed && running {
+            // Preserve the digital-zero Bluetooth wakeup allowance.
+            if checks < healthPolicy.startupSilentChecks {
+                lock.unlock()
+                armCaptureWatchdog(rebuildsLeft: rebuildsLeft, checks: checks + 1)
+            } else {
+                runtimeFailed = true
+                lock.unlock()
+                failRecording(RecorderError.noSignal, recordingID: recordingID)
+            }
+            return
+        }
+        guard rebuildsLeft > 0 else {
+            runtimeFailed = true
+            lock.unlock()
+            failRecording(conversionFailed ? RecorderError.conversionFailed : RecorderError.noInput,
+                          recordingID: recordingID)
+            return
+        }
+        captureGeneration &+= 1
+        lock.unlock()
+        DiagLog.log("capture has no usable startup audio; rebuilding (%d attempts left)", rebuildsLeft)
+        do {
+            try captureWithFallback()
+            armCaptureWatchdog(rebuildsLeft: rebuildsLeft - 1, checks: checks + 1)
+        } catch {
+            failRecording(error, recordingID: recordingID)
+        }
+    }
+
+    private func captureFailureLocked() -> RecorderError? {
+        guard recordingActive else { return nil }
+        if runtimeFailed { return .streamStopped }
+        guard captureLive else { return nil }
+        if let streamFailure { return streamFailure }
+        if now() - lastBufferAt >= healthPolicy.progressTimeout { return .streamStopped }
+        if conversionFailures >= healthPolicy.conversionFailureLimit ||
+            now() - lastConvertedAt >= healthPolicy.progressTimeout { return .conversionFailed }
+        return nil
+    }
+
+    /// The control queue owns terminal failure. Invalidate recording and
+    /// sample callbacks atomically, then notify the caller so it can reject
+    /// in-flight inference before hardware teardown can block.
+    private func failRecording(_ error: Error, recordingID: UUID, notify: Bool = true) {
+        lock.lock()
+        guard self.recordingID == recordingID, recordingActive else {
+            lock.unlock()
+            return
+        }
+        let failure = RuntimeFailure(recordingID: recordingID, captureGeneration: captureGeneration, error: error)
+        let callback = notify ? onRuntimeFailure : nil
+        let failedTrace = trace
+        recordingActive = false
+        captureLive = false
+        runtimeFailed = false
+        streamFailure = nil
+        captureGeneration &+= 1
+        samples = []
+        pendingAudible = []
+        nativeAudio = nil
+        audibleStreak = 0
+        buffersThisSession = 0
+        conversionFailures = 0
+        onLiveCallback = nil
+        onRuntimeFailure = nil
+        trace = nil
+        lock.unlock()
+        startError = error
+        warmTeardown?.cancel()
+        warmTeardown = nil
+        failedTrace?.record(.captureFailed)
+        DiagLog.log("capture terminal failure: %@", error.localizedDescription)
+        callback?(failure)
+        tearDownSession()
     }
 
     /// Starts capture on the preferred mic; if that fails (a device
@@ -654,8 +782,8 @@ final class AudioRecorder {
     }
 
     /// Builds a fresh session capturing from the given device UID (nil =
-    /// current system default). Split from `startCapture` so recovery paths
-    /// can rebuild without discarding what was already recorded.
+    /// current system default). Startup recovery rebuilds before speech;
+    /// every replacement must prove its own sustained audible delivery.
     private func beginCapture(
         pinning uid: String?,
         fallbackToDefaultIfUnavailable: Bool = true
@@ -663,14 +791,18 @@ final class AudioRecorder {
         tearDownSession()
         // Stray buffers from a torn-down session must not count toward the
         // fresh session's sustained-delivery threshold. `captureLive` also
-        // resets: a mid-recording rebuild (runtime-error recovery) must
-        // prove the REPLACEMENT route audible — inheriting live state let a
-        // dead replacement record zeros unwatched until release.
+        // resets so a replacement cannot inherit a prior route's live cue.
         lock.lock()
+        samples.removeAll(keepingCapacity: true)
         buffersThisSession = 0
+        runtimeFailed = false
+        streamFailure = nil
         audibleStreak = 0
         pendingAudible = []
         captureLive = false
+        lastBufferAt = now()
+        lastConvertedAt = lastBufferAt
+        conversionFailures = 0
         captureGeneration &+= 1
         let generation = captureGeneration
         lock.unlock()
@@ -693,17 +825,23 @@ final class AudioRecorder {
               session.microphoneName, Date().timeIntervalSince(startBegan) * 1000)
     }
 
-    /// The session hit a runtime error (device yanked, media services
-    /// reset) mid-recording — resume on whatever device is right now,
-    /// keeping the samples already captured.
+    /// Runtime errors before live capture use the bounded startup budget.
+    /// After live capture, terminal failure discards the incomplete hold.
     private func handleRuntimeError(from generation: Int) {
+        lock.lock()
+        let failedRecording = recordingID
+        if generation == captureGeneration { runtimeFailed = true }
+        lock.unlock()
         controlQueue.async {
             self.lock.lock()
-            guard generation == self.captureGeneration, self.session != nil else {
+            guard generation == self.captureGeneration, failedRecording == self.recordingID,
+                  self.session != nil else {
                 self.lock.unlock()
                 return
             }
             let active = self.recordingActive
+            let live = self.captureLive
+            let recordingID = self.recordingID
             self.lock.unlock()
             // A warm idle session that errors (device yanked, media services
             // reset) isn't worth resuming — just let the mic go; the next
@@ -715,23 +853,19 @@ final class AudioRecorder {
                 self.tearDownSession()
                 return
             }
+            guard let recordingID else { return }
+            if live {
+                self.failRecording(RecorderError.streamStopped, recordingID: recordingID)
+                return
+            }
+            // Before speech, allow the existing bounded wakeup/retry path.
+            // Its watchdog budget survives runtime errors on this route.
             self.lock.lock()
             self.nativeAudio?.markIncomplete()
+            self.runtimeFailed = true
             self.lock.unlock()
-            DiagLog.log("capture session error mid-recording — resuming capture")
-            do {
-                try self.captureWithFallback()
-                // An error before the first buffer means the replacement is
-                // just as suspect — keep it under the no-audio watchdog.
-                self.lock.lock()
-                let live = self.captureLive
-                self.lock.unlock()
-                if !live { self.armNoAudioWatchdog(rebuildsLeft: 1) }
-            } catch {
-                DiagLog.log("could not resume capture: %@", error.localizedDescription)
-                self.tearDownSession()
-                self.onRuntimeFailure?(error)
-            }
+            // Let the current watchdog rebuild within its existing budget.
+            // Repeated runtime errors must not create unbounded retry chains.
         }
     }
 
@@ -745,15 +879,21 @@ final class AudioRecorder {
         }
         lock.unlock()
         guard let session else { return }
-        session.stop()
         self.session = nil
         sessionDeviceUID = nil
+        session.stop()
     }
 
     private func appendNative(_ buffer: AVAudioPCMBuffer?, from generation: Int) {
         lock.lock()
         defer { lock.unlock() }
-        guard recordingActive, generation == captureGeneration, let nativeAudio else { return }
+        guard recordingActive, generation == captureGeneration, !runtimeFailed else { return }
+        if captureLive, now() - lastBufferAt >= healthPolicy.progressTimeout {
+            streamFailure = .streamStopped
+        }
+        guard streamFailure == nil else { return }
+        lastBufferAt = now()
+        guard let nativeAudio else { return }
         if let buffer {
             nativeAudio.append(buffer)
         } else {
@@ -761,10 +901,19 @@ final class AudioRecorder {
         }
     }
 
-    private func append(_ converted: AVAudioPCMBuffer, from generation: Int) {
-        guard let channel = converted.floatChannelData else { return }
+    private func append(_ converted: AVAudioPCMBuffer?, from generation: Int) {
+        guard let converted, let channel = converted.floatChannelData, converted.frameLength > 0 else {
+            lock.lock()
+            if recordingActive, generation == captureGeneration {
+                conversionFailures += 1
+                if captureLive, conversionFailures >= healthPolicy.conversionFailureLimit {
+                    streamFailure = .conversionFailed
+                }
+            }
+            lock.unlock()
+            return
+        }
         let count = Int(converted.frameLength)
-        guard count > 0 else { return }
         let buffer = UnsafeBufferPointer(start: channel[0], count: count)
         let metrics = Self.signalMetrics(of: buffer)
 
@@ -772,10 +921,19 @@ final class AudioRecorder {
         // A warm idle session keeps delivering buffers; none of them are
         // part of a recording — no accumulation, no HUD levels, no
         // capture-live transitions.
-        guard recordingActive, generation == captureGeneration else {
+        guard recordingActive, generation == captureGeneration, !runtimeFailed else {
             lock.unlock()
             return
         }
+        if captureLive, now() - lastConvertedAt >= healthPolicy.progressTimeout, streamFailure == nil {
+            streamFailure = .conversionFailed
+        }
+        guard streamFailure == nil else {
+            lock.unlock()
+            return
+        }
+        lastConvertedAt = now()
+        conversionFailures = 0
         let wasLive = captureLive
         // A Bluetooth mic mid-A2DP→HFP negotiation can emit a spurious
         // buffer (or a few) before the real stream stabilizes — a single
@@ -879,11 +1037,13 @@ final class AudioRecorder {
 /// A running input and its teardown. Both microphone and synthetic inputs feed
 /// the recorder through the supplied sample queue and buffer callbacks.
 final class AudioCaptureSession {
+    /// A nil PCM result reports a conversion failure or an input buffer
+    /// with no converted output. Raw delivery and PCM progress are distinct.
     typealias Factory = (
         _ deviceUID: String?, _ fallbackToDefaultIfUnavailable: Bool,
         _ targetFormat: AVAudioFormat, _ sampleQueue: DispatchQueue,
         _ onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
-        _ onPCM: @escaping (AVAudioPCMBuffer) -> Void,
+        _ onPCM: @escaping (AVAudioPCMBuffer?) -> Void,
         _ onFailure: @escaping () -> Void
     ) throws -> AudioCaptureSession
 
@@ -908,7 +1068,7 @@ final class AudioCaptureSession {
         deviceUID uid: String?, fallbackToDefaultIfUnavailable: Bool,
         targetFormat: AVAudioFormat, sampleQueue: DispatchQueue,
         onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
-        onPCM: @escaping (AVAudioPCMBuffer) -> Void,
+        onPCM: @escaping (AVAudioPCMBuffer?) -> Void,
         onFailure: @escaping () -> Void
     ) throws -> AudioCaptureSession {
         var device: AVCaptureDevice?
@@ -947,6 +1107,7 @@ final class AudioCaptureSession {
             isRunning: { session.isRunning },
             stop: {
                 NotificationCenter.default.removeObserver(observer)
+                output.setSampleBufferDelegate(nil, queue: nil)
                 session.stopRunning()
                 // AVCaptureAudioDataOutput does not retain its delegate.
                 withExtendedLifetime(forwarder) {}
@@ -966,11 +1127,11 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
     private var converter: AVAudioConverter?
     private var rawBuffer: AVAudioPCMBuffer?
     private var convertedBuffer: AVAudioPCMBuffer?
-    private let onPCM: (AVAudioPCMBuffer) -> Void
+    private let onPCM: (AVAudioPCMBuffer?) -> Void
     private let onRaw: (AVAudioPCMBuffer?) -> Void
 
     init(targetFormat: AVAudioFormat, onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
-         onPCM: @escaping (AVAudioPCMBuffer) -> Void) {
+         onPCM: @escaping (AVAudioPCMBuffer?) -> Void) {
         self.targetFormat = targetFormat
         self.onPCM = onPCM
         self.onRaw = onRaw
@@ -984,6 +1145,7 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) else {
             onRaw(nil)
+            onPCM(nil)
             return
         }
         let incomingDescription = asbd.pointee
@@ -991,6 +1153,7 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
             guard let format = AVAudioFormat(streamDescription: asbd),
                   let converter = AVAudioConverter(from: format, to: targetFormat) else {
                 onRaw(nil)
+                onPCM(nil)
                 return
             }
             sourceDescription = incomingDescription
@@ -1001,17 +1164,19 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         }
         guard let sourceFormat, let converter else {
             onRaw(nil)
+            onPCM(nil)
             return
         }
 
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frames > 0 else { return }
+        guard frames > 0 else { onPCM(nil); return }
         let raw: AVAudioPCMBuffer
         if let rawBuffer, rawBuffer.frameCapacity >= frames {
             raw = rawBuffer
         } else {
             guard let buffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames) else {
                 onRaw(nil)
+                onPCM(nil)
                 return
             }
             rawBuffer = buffer
@@ -1022,6 +1187,7 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
             sampleBuffer, at: 0, frameCount: Int32(frames), into: raw.mutableAudioBufferList
         ) == noErr else {
             onRaw(nil)
+            onPCM(nil)
             return
         }
         onRaw(raw)
@@ -1032,14 +1198,17 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         if let convertedBuffer, convertedBuffer.frameCapacity >= capacity {
             converted = convertedBuffer
         } else {
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
+                onPCM(nil)
+                return
+            }
             convertedBuffer = buffer
             converted = buffer
         }
         converted.frameLength = 0
         var consumed = false
         var conversionError: NSError?
-        converter.convert(to: converted, error: &conversionError) { _, status in
+        let status = converter.convert(to: converted, error: &conversionError) { _, status in
             if consumed {
                 status.pointee = .noDataNow
                 return nil
@@ -1048,7 +1217,14 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
             status.pointee = .haveData
             return raw
         }
-        guard conversionError == nil, converted.frameLength > 0 else { return }
+        guard conversionError == nil, status != .error, converted.frameLength > 0 else {
+            if conversionError != nil || status == .error {
+                self.converter = nil
+                sourceDescription = nil
+            }
+            onPCM(nil)
+            return
+        }
         onPCM(converted)
     }
 
