@@ -2,18 +2,17 @@ import Foundation
 
 enum TranscriptionPurpose: Sendable {
     case authoritative
-    case preview(PreviewLifetime)
+    case preview(TranscriptionLifetime)
 
-    var preview: PreviewLifetime? {
+    var preview: TranscriptionLifetime? {
         if case .preview(let lifetime) = self { return lifetime }
         return nil
     }
 }
 
-/// Invalidating disposable work removes its gate waiter without cancelling
-/// inference that already started. The pipeline and gate use different actors.
-/// Each preview request owns one lifetime and registers one waiter at a time.
-final class PreviewLifetime: @unchecked Sendable {
+/// Signals that a request is no longer wanted across the pipeline and engine actors.
+/// Each request registers one observer at a time, first at the gate, then during inference.
+final class TranscriptionLifetime: @unchecked Sendable {
     private let lock = NSLock()
     private var obsolete = false
     private var onInvalidation: (@Sendable () -> Void)?
@@ -28,8 +27,10 @@ final class PreviewLifetime: @unchecked Sendable {
         notify?()
     }
 
+    var isInvalidated: Bool { lock.withLock { obsolete } }
+
     func checkCurrent() throws {
-        if lock.withLock({ obsolete }) { throw CancellationError() }
+        if isInvalidated { throw CancellationError() }
     }
 
     func observeInvalidation(_ notify: @escaping @Sendable () -> Void) {

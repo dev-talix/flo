@@ -633,3 +633,99 @@ Stack integration keeps queued-preview invalidation in the prepared-audio releas
 overload shared by live delivery and raw-sample callers. The queued-preview
 regression now exercises prepared-audio release; other release tests retain the
 raw-sample path. Assembled-stack validation is recorded separately.
+
+## R1: Bounded abandoned inference and model-switch recovery, October 15, 2026
+
+Owner: Flo maintainers. Requirement source: the authorized reliability report R1
+and implementation brief. Foundation: `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Prerequisite E2 was cherry-picked unchanged as
+`ee1bf8b2f4d976707efd6e7564fe9e66d308bb00`, from
+`be83e19d79c868f25dffb214659b4c343da179cb`. The R1 commit follows it on
+`fix/abandoned-inference-recovery`. Target selection, clipboard delivery R3,
+other report items, and proposed features are outside this change.
+
+Escape still reaches `DictationSessionPipeline.cancel` through AppDelegate and
+DictationDelivery with `interruptInference: false`. Each `runTranscription`
+request now carries a lifetime. Cancelling or completing a session invalidates
+its outstanding requests. The existing E2 observer implementation is renamed
+`TranscriptionLifetime` and reused for session abandonment and preview
+obsolescence. Those signals remain separate: release invalidates a queued
+preview without treating active preview inference as explicitly cancelled.
+Both AppDelegate and DictationReplay already forward the complete request.
+
+`TranscriptionGate.acquire` removes abandoned queued requests immediately.
+`Transcriber.runInference` owns an active request's abandonment deadline, even
+after the session drops its task handles. The default grace is 90 seconds,
+injected as `abandonedInferenceGrace` for tests. Completion during grace cancels
+the deadline and keeps the model warm. Expiry quarantines a still-active holder;
+its engine and old gate remain isolated until it returns. A per-call identity
+prevents a delayed deadline or cancellation callback from affecting another
+inference on the same engine. Abandoned results cannot return text or update
+the preview budget.
+
+Replacing or quarantining an engine retires its gate. Retirement wakes queued
+acquirers, which re-evaluate the current engine rather than wait for the old
+holder. A loaded replacement serves them; without one, authoritative requests
+fail and retain retry audio through the existing delivery path. Manual Retry
+uses the existing AppDelegate model-load path before retrying retained audio.
+Replacement loads count all unresolved engine holders, including work inside
+grace, against the existing two-engine recovery limit. A third replacement
+fails with `recoveryBusy` until one holder returns. Explicit interruption and
+release deadlines still quarantine immediately.
+
+`Transcriber.load` advances its load generation before the warm-model shortcut.
+For warm A, suspended loading B, then request A, B's late load cannot publish.
+The warm A request does not construct another engine.
+
+Fake suspended engines in `DictationSessionStallTests` verify these acceptance
+examples through the real Transcriber and gate:
+
+- `testEscapeAbandonedFinalExpiresAndQueuedFollowerRetriesOnReplacement` and
+  `testEscapeAbandonedPreviewExpiresAndQueuedFollowerRetriesOnReplacement` check
+  grace, follower failure, retained retry audio, replacement success, and no late
+  original delivery or history after its transcription callback finishes.
+- `testEscapeRemovesQueuedFinalWithoutQuarantiningUnrelatedHolder` checks that
+  abandoning a waiter does not quarantine the active request.
+- `testFinishedAbandonmentDeadlineCannotQuarantineNextInferenceOnSameEngine`,
+  `testKeyboardCancelLeavesRunningInferenceAndModelLoaded`, and the existing E2
+  Escape tests check warm reuse without another load.
+- `testAbandonedOldInferenceGraceCannotQuarantineReplacement` checks that an
+  old generation's expired deadline and late result leave its replacement usable.
+- `testWarmRequestInvalidatesBlockedDifferentModelLoad` covers A-B-A;
+  `testQueuedRequestUsesReplacementAfterOrdinaryModelSwitch` now requires the
+  follower to finish before the original holder returns.
+- `testAbandonmentCapsQuarantinedEnginesUntilOldInferenceReturns`,
+  `testRecoveryCapsQuarantinedEnginesUntilOldInferenceReturns`, and
+  `testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound` check the cap
+  for abandoned, explicitly cancelled, and still-in-grace holders.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1` and the unchanged lockfile. Evidence identifies the prerequisite
+plus the R1 diff saved at `/tmp/flo-r1-final.diff`; the implementation handoff
+provides the final R1 commit SHA.
+
+- RED, exit 1: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'`,
+  34 tests, three failed assertions exposing A-B-A and the stuck old-gate waiter
+  before the source repair. Log: `/tmp/flo-r1-baseline.log`.
+- RED, exit 1: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound`,
+  one test, two failed assertions exposing replacement during grace bypassing
+  the cap. Log: `/tmp/flo-r1-grace-bound-red.log`.
+- PASS, exit 0: `swift test --scratch-path .build/r1 --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'`,
+  119 tests, zero failures. Log: `/tmp/flo-r1-recovery-final.log`.
+- PASS, exit 0: `swift test --scratch-path .build/r1 --disable-automatic-resolution --skip TextInjectorTests`,
+  382 tests, zero failures, one optional HUD render skipped because
+  `LOCALFLOW_RENDER_DIR` was unset. All 21 TextInjector tests were excluded to
+  respect the task's no-clipboard boundary, including private pasteboards.
+  Log: `/tmp/flo-r1-broad-tests.log`.
+- PASS, exit 0: `python3 -B Tests/StartupReadinessTests.py`, four tests.
+  Log: `/tmp/flo-r1-startup-tests.log`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+  Log: `/tmp/flo-r1-diff-check.log`.
+
+NOT RUN: actual Whisper or Parakeet inference, runtime menu interaction,
+microphone capture, clipboard access, target-app insertion, release packaging,
+installation, or performance measurement. Tests use synthetic audio and fake
+engines, delivery, and history callbacks. Existing compiler warnings in
+untouched diagnostic, injection, and startup-test code remain. The parent
+integration owner must assemble the stack and perform any authorized runtime
+validation. This task creates local commits only.

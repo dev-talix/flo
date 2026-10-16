@@ -16,7 +16,7 @@ final class PreviewInferenceBudgetTests: XCTestCase {
         let active = Task { try await transcriber.transcribe(samples: [1]) }
         await expectEventually { await engine.calls.count == 1 }
         let preview = Task {
-            try await transcriber.transcribe(samples: [2], purpose: .preview(PreviewLifetime()))
+            try await transcriber.transcribe(samples: [2], purpose: .preview(TranscriptionLifetime()))
         }
         await expectEventually { await transcriber.waitingInferenceCount == 1 }
         let firstFinal = Task { try await transcriber.transcribe(samples: [3]) }
@@ -194,19 +194,19 @@ final class PreviewInferenceBudgetTests: XCTestCase {
             now: { clock.now }
         )
         try await transcriber.load(model: "slow")
-        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(PreviewLifetime()))
+        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(TranscriptionLifetime()))
         // Slow preview ran from 0 to 4. Its next budget opens at 8.
         await expectPreviewSkipped(transcriber)
         _ = try await transcriber.transcribe(samples: speech)
         try await transcriber.load(model: "fast")
-        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(PreviewLifetime()))
+        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(TranscriptionLifetime()))
         await expectPreviewSkipped(transcriber)
         clock.advance(0.25)
-        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(PreviewLifetime()))
+        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(TranscriptionLifetime()))
         try await transcriber.load(model: "slow")
         await expectPreviewSkipped(transcriber)
         clock.advance(8 - clock.now)
-        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(PreviewLifetime()))
+        _ = try await transcriber.transcribe(samples: speech, purpose: .preview(TranscriptionLifetime()))
         let slowCalls = await slow.calls
         let fastCalls = await fast.calls
         XCTAssertEqual(slowCalls.map(\.isPreview), [true, false, true])
@@ -217,7 +217,7 @@ final class PreviewInferenceBudgetTests: XCTestCase {
         let engine = BudgetEngine(blockFirst: false)
         let transcriber = Transcriber(modelLoader: { _, _ in engine })
         try await transcriber.load(model: "test")
-        let lifetime = PreviewLifetime()
+        let lifetime = TranscriptionLifetime()
         lifetime.invalidate()
         do {
             _ = try await transcriber.transcribe(samples: speech, purpose: .preview(lifetime))
@@ -232,7 +232,7 @@ final class PreviewInferenceBudgetTests: XCTestCase {
 
     func testWhisperPreviewHasNoTemperatureFallbacksAndFinalOptionsStayUnchanged() throws {
         let final = WhisperEngine.decodingOptions(lowEnergy: false, purpose: .authoritative)
-        let preview = WhisperEngine.decodingOptions(lowEnergy: false, purpose: .preview(PreviewLifetime()))
+        let preview = WhisperEngine.decodingOptions(lowEnergy: false, purpose: .preview(TranscriptionLifetime()))
         let quiet = WhisperEngine.decodingOptions(lowEnergy: true, purpose: .authoritative)
         XCTAssertEqual(final.temperatureFallbackCount, DecodingOptions().temperatureFallbackCount)
         XCTAssertEqual(preview.temperatureFallbackCount, 0)
@@ -248,7 +248,7 @@ final class PreviewInferenceBudgetTests: XCTestCase {
 
     private func expectPreviewSkipped(_ transcriber: Transcriber) async {
         do {
-            _ = try await transcriber.transcribe(samples: speech, purpose: .preview(PreviewLifetime()))
+            _ = try await transcriber.transcribe(samples: speech, purpose: .preview(TranscriptionLifetime()))
             XCTFail("Preview inside the observed backoff must be skipped")
         } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
     }

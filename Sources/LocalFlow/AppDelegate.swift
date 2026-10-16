@@ -460,8 +460,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Drops the held recording without transcribing it. Shared by
     /// `abortRecording` (sleep, user switch) and the Escape key. Escape
-    /// passes `interruptInference: false` so a routine cancel leaves any
-    /// running chunk inference alone instead of unloading the model.
+    /// passes `interruptInference: false` so Transcriber gives running inference
+    /// a grace period. A normal completion keeps the model warm.
     private func discardActiveRecording(reason: String, interruptInference: Bool = true) {
         hotkey.cancelHold()
         commandHotkey.cancelHold()

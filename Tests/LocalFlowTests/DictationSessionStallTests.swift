@@ -292,6 +292,139 @@ final class DictationSessionStallTests: XCTestCase {
         XCTAssertEqual(callsAfterLateResult, 1)
     }
 
+    func testEscapeAbandonedFinalExpiresAndQueuedFollowerRetriesOnReplacement() async throws {
+        try await verifyEscapeRecovery(preview: false)
+    }
+
+    func testEscapeAbandonedPreviewExpiresAndQueuedFollowerRetriesOnReplacement() async throws {
+        try await verifyEscapeRecovery(preview: true)
+    }
+
+    private func verifyEscapeRecovery(preview: Bool) async throws {
+        let blocked = NoncooperativeInference()
+        let old = FakeEngine()
+        old.inference = { await blocked.run() }
+        let replacement = FakeEngine()
+        replacement.inference = { syntheticResult("recovered words") }
+        var loads = 0
+        let transcriber = Transcriber(modelLoader: { _, _ in
+            loads += 1
+            return loads == 1 ? old : replacement
+        }, abandonedInferenceGrace: 0.04)
+        try await transcriber.load(model: "test")
+        var outcomes: [DictationSessionOutcome] = []
+        var delivered: [String] = []
+        var history: [String] = []
+        var finishedGenerations: [Int] = []
+        let delivery = DictationDelivery(
+            transcribe: { request in
+                defer { finishedGenerations.append(request.generation) }
+                return try await transcriber.transcribe(request)
+            },
+            cleanup: { .init(text: $0.text, succeeded: true) },
+            inject: { text, complete in delivered.append(text); complete() },
+            recordTranscript: { history.append($0) },
+            onOutcome: { outcome, _ in outcomes.append(outcome) },
+            onCancelled: { _ in }, onCommandCancelled: { _ in },
+            onProcessingCountChange: { _ in }, stallTimeout: 2, injectionInterval: 0
+        )
+        let original = delivery.begin(.init(context: context))
+        if preview {
+            delivery.processIncrementalSnapshot(generation: original, samples: speech + speech)
+        } else {
+            delivery.release(generation: original, samples: speech)
+        }
+        await expectEventually { await blocked.calls == 1 }
+        let follower = delivery.begin(.init(context: context))
+        delivery.release(generation: follower, samples: speech)
+        await expectEventually { await transcriber.waitingInferenceCount == 1 }
+        delivery.cancel(generation: original, interruptInference: false)
+        let warmDuringGrace = await transcriber.isLoaded
+        XCTAssertTrue(warmDuringGrace)
+        await expectEventually { !(await transcriber.isLoaded) && outcomes.count == 1 }
+        guard case .failed(let failedGeneration, _) = outcomes.first else {
+            await blocked.finish()
+            return XCTFail("Queued follower must fail without waiting for the abandoned holder")
+        }
+        XCTAssertEqual(failedGeneration, follower)
+        XCTAssertEqual(delivery.retryCount, 1)
+        XCTAssertFalse(delivery.isBusy)
+        XCTAssertTrue(delivered.isEmpty)
+        XCTAssertTrue(history.isEmpty)
+        let originalCalls = await blocked.calls
+        XCTAssertEqual(originalCalls, 1)
+        try await transcriber.load(model: "test")
+        delivery.retryFailedDictations { .init(context: self.context) }
+        await expectEventually { delivered.count == 1 }
+        XCTAssertEqual(loads, 2)
+        XCTAssertEqual(delivered, ["recovered words"])
+        XCTAssertEqual(history, delivered)
+        XCTAssertEqual(delivery.retryCount, 0)
+        await blocked.finish()
+        await expectEventually { finishedGenerations.contains(original) }
+        await settleAsyncWork()
+        XCTAssertEqual(outcomes.count, 2, "Late original cannot publish into the replacement session")
+        XCTAssertEqual(history, ["recovered words"])
+        let stillLoaded = await transcriber.isLoaded
+        XCTAssertTrue(stillLoaded)
+    }
+
+    func testEscapeRemovesQueuedFinalWithoutQuarantiningUnrelatedHolder() async throws {
+        let blocked = NoncooperativeInference()
+        let engine = FakeEngine()
+        engine.inference = { await blocked.run() }
+        let transcriber = Transcriber(modelLoader: { _, _ in engine }, abandonedInferenceGrace: 0.02)
+        try await transcriber.load(model: "test")
+        let holder = Task { try await transcriber.transcribe(samples: speech) }
+        await expectEventually { await blocked.calls == 1 }
+        var outcomes: [DictationSessionOutcome] = []
+        let pipeline = DictationSessionPipeline(
+            transcribe: { try await transcriber.transcribe($0) },
+            cleanup: { .init(text: $0.text, succeeded: true) },
+            onOutcome: { outcomes.append($0) }
+        )
+        pipeline.begin(generation: 1, context: context)
+        pipeline.release(generation: 1, fullSamples: speech)
+        await expectEventually { await transcriber.waitingInferenceCount == 1 }
+        pipeline.cancel(generation: 1, interruptInference: false)
+        await expectEventually { await transcriber.waitingInferenceCount == 0 }
+        try await Task.sleep(for: .milliseconds(60))
+        let loaded = await transcriber.isLoaded
+        XCTAssertTrue(loaded, "Queued abandonment must not affect the active holder")
+        await blocked.finish()
+        _ = try await holder.value
+        let calls = await blocked.calls
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(outcomes.isEmpty)
+    }
+
+    func testFinishedAbandonmentDeadlineCannotQuarantineNextInferenceOnSameEngine() async throws {
+        let blocked = NoncooperativeInference()
+        let engine = FakeEngine()
+        engine.inference = { await blocked.run() }
+        var loads = 0
+        let transcriber = Transcriber(modelLoader: { _, _ in loads += 1; return engine },
+                                      abandonedInferenceGrace: 0.08)
+        try await transcriber.load(model: "test")
+        let lifetime = TranscriptionLifetime()
+        let first = Task { try await transcriber.transcribe(samples: speech, lifetime: lifetime) }
+        await expectEventually { await blocked.calls == 1 }
+        lifetime.invalidate()
+        await blocked.finish()
+        do { _ = try await first.value; XCTFail("Abandoned text must not return") }
+        catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        let second = Task { try await transcriber.transcribe(samples: speech) }
+        await expectEventually { await blocked.calls == 2 }
+        try await Task.sleep(for: .milliseconds(120))
+        let loaded = await transcriber.isLoaded
+        XCTAssertTrue(loaded, "An expired callback for the first request must not quarantine its successor")
+        await blocked.finish()
+        let text = try await second.value
+        XCTAssertEqual(text, "late abandoned words")
+        try await transcriber.load(model: "test")
+        XCTAssertEqual(loads, 1)
+    }
+
     func testKeyboardCancelLeavesRunningInferenceAndModelLoaded() async throws {
         let blocked = NoncooperativeInference()
         let engine = FakeEngine()
@@ -363,6 +496,35 @@ final class DictationSessionStallTests: XCTestCase {
         XCTAssertFalse(engine.calls.contains("vocabulary: alpha"))
     }
 
+    func testWarmRequestInvalidatesBlockedDifferentModelLoad() async throws {
+        let suspended = SuspendedLoad()
+        let warm = FakeEngine()
+        warm.inference = { syntheticResult("model A") }
+        let stale = FakeEngine()
+        var loads: [String] = []
+        let transcriber = Transcriber(modelLoader: { model, _ in
+            loads.append(model)
+            if model == "B" { await suspended.wait() }
+            return model == "A" ? warm : stale
+        })
+        try await transcriber.load(model: "A")
+        let loadingB = Task { try await transcriber.load(model: "B") }
+        for _ in 0..<10_000 {
+            if await suspended.isWaiting { break }
+            await Task.yield()
+        }
+        let blocked = await suspended.isWaiting
+        XCTAssertTrue(blocked)
+        try await transcriber.load(model: "A")
+        await suspended.resume()
+        try await loadingB.value
+        let loaded = await transcriber.loadedModel
+        XCTAssertEqual(loaded, "A")
+        let text = try await transcriber.transcribe(samples: speech)
+        XCTAssertEqual(text, "model A")
+        XCTAssertEqual(loads, ["A", "B"])
+    }
+
     func testQueuedRequestUsesReplacementAfterOrdinaryModelSwitch() async throws {
         let blocked = NoncooperativeInference()
         let old = FakeEngine()
@@ -376,16 +538,53 @@ final class DictationSessionStallTests: XCTestCase {
             if await blocked.calls == 1 { break }
             await Task.yield()
         }
-        let queued = Task { try await transcriber.transcribe(samples: speech) }
-        await settleAsyncWork()
+        var queuedText: String?
+        let queued = Task { queuedText = try await transcriber.transcribe(samples: speech) }
+        for _ in 0..<10_000 {
+            if await transcriber.waitingInferenceCount == 1 { break }
+            await Task.yield()
+        }
+        let waiting = await transcriber.waitingInferenceCount
+        XCTAssertEqual(waiting, 1)
         let callsBeforeSwitch = await blocked.calls
         XCTAssertEqual(callsBeforeSwitch, 1)
         try await transcriber.load(model: "new")
+        for _ in 0..<10_000 {
+            if queuedText != nil { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(queuedText, "new model", "Replacement must wake queued work before the old holder returns")
         await blocked.finish()
         let activeText = try await active.value
-        let queuedText = try await queued.value
+        try await queued.value
         XCTAssertEqual(activeText, "late abandoned words")
         XCTAssertEqual(queuedText, "new model")
+    }
+
+    func testAbandonedOldInferenceGraceCannotQuarantineReplacement() async throws {
+        let blocked = NoncooperativeInference()
+        let old = FakeEngine()
+        old.inference = { await blocked.run() }
+        let replacement = FakeEngine()
+        replacement.inference = { syntheticResult("new model") }
+        let transcriber = Transcriber(modelLoader: { name, _ in name == "old" ? old : replacement },
+                                      abandonedInferenceGrace: 0.02)
+        try await transcriber.load(model: "old")
+        let lifetime = TranscriptionLifetime()
+        let active = Task { try await transcriber.transcribe(samples: speech, lifetime: lifetime) }
+        await expectEventually { await blocked.calls == 1 }
+        lifetime.invalidate()
+        try await transcriber.load(model: "new")
+        try await Task.sleep(for: .milliseconds(60))
+        let loaded = await transcriber.loadedModel
+        XCTAssertEqual(loaded, "new")
+        let text = try await transcriber.transcribe(samples: speech)
+        XCTAssertEqual(text, "new model")
+        await blocked.finish()
+        do { _ = try await active.value; XCTFail("Late abandoned text must not return") }
+        catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        let afterReturn = await transcriber.loadedModel
+        XCTAssertEqual(afterReturn, "new")
     }
 
     func testCancellingOldInferenceAfterModelSwitchKeepsReplacementUsable() async throws {
@@ -413,7 +612,50 @@ final class DictationSessionStallTests: XCTestCase {
         catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
     }
 
+    func testModelSwitchDuringAbandonmentGraceCannotBypassEngineBound() async throws {
+        let firstBlocked = NoncooperativeInference()
+        let secondBlocked = NoncooperativeInference()
+        let first = FakeEngine()
+        first.inference = { await firstBlocked.run() }
+        let second = FakeEngine()
+        second.inference = { await secondBlocked.run() }
+        var loads: [String] = []
+        let transcriber = Transcriber(modelLoader: { model, _ in
+            loads.append(model)
+            return model == "A" ? first : second
+        }, abandonedInferenceGrace: 60)
+        try await transcriber.load(model: "A")
+        let firstLifetime = TranscriptionLifetime()
+        let firstTask = Task { try await transcriber.transcribe(samples: speech, lifetime: firstLifetime) }
+        await expectEventually { await firstBlocked.calls == 1 }
+        firstLifetime.invalidate()
+        try await transcriber.load(model: "B")
+        let secondLifetime = TranscriptionLifetime()
+        let secondTask = Task { try await transcriber.transcribe(samples: speech, lifetime: secondLifetime) }
+        await expectEventually { await secondBlocked.calls == 1 }
+        secondLifetime.invalidate()
+        do {
+            try await transcriber.load(model: "C")
+            XCTFail("Two unresolved holders must consume the recovery budget during grace too")
+        } catch Transcriber.TranscriberError.recoveryBusy {} catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertEqual(loads, ["A", "B"])
+        await firstBlocked.finish()
+        _ = try? await firstTask.value
+        try await transcriber.load(model: "C")
+        XCTAssertEqual(loads, ["A", "B", "C"])
+        await secondBlocked.finish()
+        _ = try? await secondTask.value
+    }
+
     func testRecoveryCapsQuarantinedEnginesUntilOldInferenceReturns() async throws {
+        try await verifyRecoveryCap(abandon: false)
+    }
+
+    func testAbandonmentCapsQuarantinedEnginesUntilOldInferenceReturns() async throws {
+        try await verifyRecoveryCap(abandon: true)
+    }
+
+    private func verifyRecoveryCap(abandon: Bool) async throws {
         let firstBlocked = NoncooperativeInference()
         let secondBlocked = NoncooperativeInference()
         let first = FakeEngine()
@@ -424,29 +666,25 @@ final class DictationSessionStallTests: XCTestCase {
         let transcriber = Transcriber(modelLoader: { _, _ in
             loads += 1
             return loads == 1 ? first : second
-        })
+        }, abandonedInferenceGrace: 0.01)
         try await transcriber.load(model: "test")
-        let firstTask = Task { try await transcriber.transcribe(samples: speech) }
+        let firstLifetime = TranscriptionLifetime()
+        let firstTask = Task { try await transcriber.transcribe(samples: speech, lifetime: firstLifetime) }
         for _ in 0..<200 {
             if await firstBlocked.calls == 1 { break }
             await Task.yield()
         }
-        firstTask.cancel()
-        for _ in 0..<200 {
-            if !(await transcriber.isLoaded) { break }
-            await Task.yield()
-        }
+        if abandon { firstLifetime.invalidate() } else { firstTask.cancel() }
+        await expectEventually { !(await transcriber.isLoaded) }
         try await transcriber.load(model: "test")
-        let secondTask = Task { try await transcriber.transcribe(samples: speech) }
+        let secondLifetime = TranscriptionLifetime()
+        let secondTask = Task { try await transcriber.transcribe(samples: speech, lifetime: secondLifetime) }
         for _ in 0..<200 {
             if await secondBlocked.calls == 1 { break }
             await Task.yield()
         }
-        secondTask.cancel()
-        for _ in 0..<200 {
-            if !(await transcriber.isLoaded) { break }
-            await Task.yield()
-        }
+        if abandon { secondLifetime.invalidate() } else { secondTask.cancel() }
+        await expectEventually { !(await transcriber.isLoaded) }
         do {
             try await transcriber.load(model: "test")
             XCTFail("Repeated recovery must not build unbounded model engines")
@@ -459,6 +697,17 @@ final class DictationSessionStallTests: XCTestCase {
         XCTAssertEqual(loads, 3)
         await secondBlocked.finish()
         _ = try? await secondTask.value
+    }
+
+    private func expectEventually(
+        file: StaticString = #filePath, line: UInt = #line,
+        _ condition: () async -> Bool
+    ) async {
+        for _ in 0..<400 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Condition did not become true", file: file, line: line)
     }
 
     private var speech: [Float] {
