@@ -42,6 +42,7 @@ struct DictationSessionContext {
     let styleProfile: AppStyleProfile
     let corrections: [(wrong: String, right: String)]
     let snippets: [(trigger: String, expansion: String)]
+    let literalFormatting: Bool
     let ollamaModel: String
     let incrementalCadence: IncrementalCadence
 
@@ -50,6 +51,7 @@ struct DictationSessionContext {
         styleProfile: AppStyleProfile,
         corrections: [(wrong: String, right: String)],
         snippets: [(trigger: String, expansion: String)],
+        literalFormatting: Bool = false,
         ollamaModel: String = "",
         incrementalCadence: IncrementalCadence = .whisper
     ) {
@@ -57,6 +59,7 @@ struct DictationSessionContext {
         self.styleProfile = styleProfile
         self.corrections = corrections
         self.snippets = snippets
+        self.literalFormatting = literalFormatting
         self.ollamaModel = ollamaModel
         self.incrementalCadence = incrementalCadence
     }
@@ -641,15 +644,18 @@ final class DictationSessionPipeline {
     private func finalize(_ session: Session, transcript: String) {
         session.diagnostics?.record(.init(stage: "assembledTranscript", text: transcript))
         session.personalVoice?.setRawTranscript(transcript)
-        let composed = Snippets.expand(
-            VoiceFormatter.apply(
-                TranscriptCorrections.apply(
-                    transcript,
-                    corrections: session.context.corrections
-                )
-            ),
-            snippets: session.context.snippets
-        )
+        // Find triggers before corrections or formatting can change their words.
+        // Only prose enters those transforms or a model. Snippet bytes stay local.
+        let correctedParts = Snippets.parts(in: transcript, snippets: session.context.snippets).map { part in
+            switch part {
+            case .verbatim: return part
+            case .transcript(let text):
+                let corrected = TranscriptCorrections.apply(text, corrections: session.context.corrections)
+                return .transcript(corrected)
+            }
+        }
+        let parts = session.context.literalFormatting ? correctedParts : VoiceFormatter.apply(correctedParts)
+        let composed = parts.map(\.text).joined()
         session.diagnostics?.record(.init(stage: "cleanupInput", text: composed))
         guard !composed.isEmpty else {
             complete(session, with: .emptyTranscript(generation: session.generation))
@@ -664,11 +670,6 @@ final class DictationSessionPipeline {
             return
         }
 
-        let request = DictationCleanupRequest(
-            generation: session.generation,
-            text: composed,
-            context: session.context
-        )
         session.activeTaskIsCleanup = true
         session.cleanupFallbackText = composed
         let deadline = DispatchWorkItem { [weak self, weak session] in
@@ -684,7 +685,36 @@ final class DictationSessionPipeline {
             session.trace?.record(.cleanupStarted)
             let result = await DictationTrace.$current.withValue(session.trace) {
                 await DictationDiagnosticStore.Recording.$current.withValue(session.diagnostics) {
-                    await self.cleanup(request)
+                    // One deadline covers all prose spans. A timeout restores
+                    // the entire deterministic composition, never a partial edit.
+                    var output = ""
+                    var succeeded = true
+                    let hasSnippets = parts.contains { if case .verbatim = $0 { return true }; return false }
+                    for part in parts {
+                        guard self.isCurrent(session), !Task.isCancelled else {
+                            return TranscriptCleanupResult(text: composed, succeeded: false)
+                        }
+                        switch part {
+                        case .verbatim(let text): output += text
+                        case .transcript(let text):
+                            // Preserve spacing at snippet boundaries even when a
+                            // cleaner trims its input or rewrites all of the prose.
+                            let body = hasSnippets ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+                            guard !body.isEmpty else { output += text; continue }
+                            let result = await self.cleanup(.init(
+                                generation: session.generation, text: body, context: session.context
+                            ))
+                            succeeded = succeeded && result.succeeded
+                            if hasSnippets {
+                                let leading = text.prefix(while: { $0.isWhitespace })
+                                let trailing = text.reversed().prefix(while: { $0.isWhitespace }).reversed()
+                                output += leading + result.text.trimmingCharacters(in: .whitespacesAndNewlines) + String(trailing)
+                            } else {
+                                output += result.text
+                            }
+                        }
+                    }
+                    return TranscriptCleanupResult(text: output, succeeded: succeeded)
                 }
             }
             guard isCurrent(session) else { return }

@@ -854,3 +854,81 @@ argument; production code compiled. The corrected fixture passed 39 focused
 stall, target, and queue tests, exit 0. Evidence:
 `/tmp/flo-session-stack-through-r4-debug.log` (initial compile failure) and
 `/tmp/flo-r3-r1-fixture-integration.log` (pass). Full assembled validation follows.
+
+## R4: verbatim snippets and literal formatting
+
+Owner: Flo maintainers. The October 16, 2026 R4 request authorizes exact snippet
+insertion and a literal-formatting preference. Per-app preferences and other
+feature proposals are outside this change.
+
+`AppDelegate.captureDictationContext` and `DictationReplay.run` snapshot the new
+`literalFormatting` preference into `DictationSessionContext`. It defaults to
+false, preserving spoken command formatting. Settings > Dictation exposes the
+switch through `SettingsModel` and `SettingsApplication`. When enabled, the
+pipeline skips both spoken commands and automatic ordinal lists. Corrections
+and optional prose cleanup still apply. This is a formatting preference, not a
+promise of verbatim recognition or verbatim prose from a text model.
+
+`Snippets.parts` matches the original assembled transcript before corrections
+or voice formatting. Matching remains case-insensitive, uses word boundaries,
+accepts flexible spaces, and consumes at most one trailing punctuation mark.
+Earlier positions win. At one position the longest trimmed saved trigger wins,
+measured in UTF-16 units, then saved order breaks ties. Accepted matches consume
+that original range once. Overlapping occurrences are considered even within
+one trigger. Empty triggers and empty expansions are ignored. Repeated original
+matches expand independently; saved expansions and correction-created trigger
+phrases are never searched again.
+
+`Snippets.Part` distinguishes prose from verbatim text. The existing expansion
+API, pipeline, and VoiceFormatter reuse it. Only prose receives corrections,
+voice formatting, or cleanup. Explicit list state and line-break commands carry
+across snippets without trimming or capitalizing saved content. Automatic
+ordinal-list detection stays within each prose span. With no snippets, the
+existing formatter and whole-transcript cleanup behavior remain unchanged.
+Polished cleans prose spans sequentially, preserving their boundary whitespace,
+then joins them with untouched expansions in spoken order. No placeholders enter
+a model. One E3 deadline covers all spans. Its fallback retains the entire
+pre-cleanup composition, including after partial cleanup; the release deadline
+uses the same `completeCleanup` boundary. Late results cannot deliver twice or
+start cleanup of later spans after completion or cancellation. Diagnostics keep
+`cleanupInput` as the composed pre-cleanup transcript, rather than one event per
+model request.
+
+The Settings snippet editor no longer strips expansion whitespace. The public
+snippet API and legacy string-array preference remain unchanged. When tabs or
+backslashes require lossless storage, `verbatimSnippets` saves exact pairs plus
+the legacy array they encode. The reader uses those pairs only while that array
+still matches, so external or older-app edits cannot restore stale content.
+Simple entries retain the original encoding without a companion value. Older
+versions retain their previous interpretation of the public array, including its
+existing limitations with tabs and literal backslash-n. Already-lost content
+cannot be reconstructed. Tests verify UTF-8 bytes after persistence, including
+outer whitespace, multiline code, URLs, tabs, and literal backslash-n. They also
+verify legacy edits invalidate the companion value.
+
+Verification uses macOS 27.0.1, arm64, Swift 6.4. The base is `47f1bb9` plus
+unchanged prerequisite cherry-picks `2574a72` and `3d7f8e7`. Their patch IDs match
+originals `673876a` and `debf9fc`. R4 is the local commit containing this section;
+its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
+`/tmp/flo-r4-final.diff`.
+
+- FAIL, expected regression evidence: `swift test --disable-automatic-resolution --filter VerbatimSnippetPipelineTests`,
+  exit 1, three tests with three assertion failures before pipeline protection.
+  Log: `/tmp/flo-r4-pipeline-red.log`.
+- PASS: `swift test --disable-automatic-resolution --filter 'VerbatimSnippet|DictationCleanupDeadlineTests|VoiceFormatterTests|DictationDiffTests|SettingsModelCorrectionTests'`,
+  exit 0, 56 tests. Log: `/tmp/flo-r4-focused-final.log`. Cases cover overlaps,
+  recursive expansion, trigger/correction ordering, code preservation, rewriting
+  and failed cleaners, both deadlines, partial-cleanup fallback, late results,
+  literal spoken commands, default formatting, persistence, and session snapshots.
+- PASS: `env -u LOCALFLOW_RENDER_DIR swift test --disable-automatic-resolution --skip TextInjectorTests`,
+  exit 0, 387 tests, one optional HUD render skip, zero failures.
+  Log: `/tmp/flo-r4-broad-final.log`. The 21-test clipboard class is excluded
+  under this task's no-clipboard restriction.
+- PASS: `python3 Tests/TranscribeCLITests.py`, exit 0, two tests;
+  `python3 -B Tests/StartupReadinessTests.py`, exit 0, four tests.
+  Logs: `/tmp/flo-r4-cli.log` and `/tmp/flo-r4-startup.log`.
+- PASS: `git diff --check`, exit 0. Log: `/tmp/flo-r4-diff-check.log`.
+- NOT RUN: rendered Settings interaction, real models, audio replay, microphone,
+  clipboard, target-app insertion, release packaging, installation, or deployment.
+  The maintainer owns assembled-stack and live verification. Dependency cache
+  files were copied into this worktree; no package installation was performed.

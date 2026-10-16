@@ -141,6 +141,7 @@ enum DictationReplay {
             styleProfile: .general,
             corrections: Settings.corrections,
             snippets: Settings.snippets,
+            literalFormatting: Settings.literalFormatting,
             ollamaModel: options.ollamaModel,
             incrementalCadence: .forModel(options.whisperModel)
         )

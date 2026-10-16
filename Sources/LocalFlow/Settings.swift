@@ -25,6 +25,7 @@ enum Settings {
         static let hotkey = "hotkey"
         static let whisperModel = "whisperModel"
         static let cleanupEnabled = "cleanupEnabled"
+        static let literalFormatting = "literalFormatting"
         static let ollamaModel = "ollamaModel"
         static let ollamaCommandModel = "ollamaCommandModel"
         static let commandReasoning = "commandReasoning"
@@ -40,6 +41,7 @@ enum Settings {
         static let commandHotkey = "commandHotkey"
         static let commandModeEnabled = "commandModeEnabled"
         static let snippets = "snippets"
+        static let verbatimSnippets = "verbatimSnippets"
         static let automaticUpdates = "automaticUpdates"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
@@ -111,6 +113,13 @@ enum Settings {
         set { defaults.set(newValue, forKey: Key.cleanupEnabled) }
     }
 
+    /// Keep spoken formatting phrases as ordinary words. Missing means the
+    /// existing command formatting remains enabled.
+    static var literalFormatting: Bool {
+        get { defaults.bool(forKey: Key.literalFormatting) }
+        set { defaults.set(newValue, forKey: Key.literalFormatting) }
+    }
+
     /// Superwhisper's transcript normalizer, registered by
     /// scripts/setup-s1-mini.sh. Any other name is treated as a general
     /// instruct model (e.g. "gemma3:4b").
@@ -163,21 +172,37 @@ enum Settings {
         commandModeEnabled && commandHotkey != hotkey && CommandMode.isAvailable
     }
 
-    /// Voice-triggered text expansions, stored as "trigger\texpansion"
-    /// (newlines inside an expansion are escaped as \n).
+    /// Keep the public legacy array unchanged. A companion value preserves
+    /// tabs and literal backslashes that the old newline encoding cannot hold.
     static var snippets: [(trigger: String, expansion: String)] {
-        get {
-            (defaults.stringArray(forKey: Key.snippets) ?? []).compactMap { entry in
-                let parts = entry.components(separatedBy: "\t")
-                guard parts.count == 2 else { return nil }
-                return (parts[0], parts[1].replacingOccurrences(of: "\\n", with: "\n"))
-            }
+        get { loadSnippets(from: defaults) }
+        set { storeSnippets(newValue, in: defaults) }
+    }
+
+    static func loadSnippets(from defaults: UserDefaults) -> [(trigger: String, expansion: String)] {
+        let legacy = defaults.stringArray(forKey: Key.snippets) ?? []
+        if let saved = defaults.dictionary(forKey: Key.verbatimSnippets),
+           let source = saved["legacy"] as? [String], source == legacy,
+           let pairs = saved["pairs"] as? [[String]], pairs.allSatisfy({ $0.count == 2 }) {
+            return pairs.map { ($0[0], $0[1]) }
         }
-        set {
-            defaults.set(
-                newValue.map { "\($0.trigger)\t\($0.expansion.replacingOccurrences(of: "\n", with: "\\n"))" },
-                forKey: Key.snippets
-            )
+        return legacy.compactMap { entry in
+            let parts = entry.components(separatedBy: "\t")
+            guard parts.count == 2 else { return nil }
+            return (parts[0], parts[1].replacingOccurrences(of: "\\n", with: "\n"))
+        }
+    }
+
+    static func storeSnippets(_ snippets: [(trigger: String, expansion: String)], in defaults: UserDefaults) {
+        let legacy = snippets.map { "\($0.trigger)\t\($0.expansion.replacingOccurrences(of: "\n", with: "\\n"))" }
+        defaults.set(legacy, forKey: Key.snippets)
+        if snippets.contains(where: { $0.trigger.contains("\t") || $0.expansion.contains("\t") || $0.expansion.contains("\\") }) {
+            // Bind the exact content to its legacy representation. An older
+            // app or external edit must not resurrect stale companion data.
+            defaults.set(["legacy": legacy, "pairs": snippets.map { [$0.trigger, $0.expansion] }],
+                         forKey: Key.verbatimSnippets)
+        } else {
+            defaults.removeObject(forKey: Key.verbatimSnippets)
         }
     }
 

@@ -19,6 +19,7 @@ final class SettingsApplication {
         var keepMicWarm: Bool
         var liveTranscript: Bool
         var cleanupEnabled: Bool
+        var literalFormatting: Bool
         var commandModeEnabled: Bool
         var theme: HudTheme
         var soundCues: Bool
@@ -42,6 +43,7 @@ final class SettingsApplication {
         case keepMicWarm(Bool)
         case liveTranscript(Bool)
         case cleanupEnabled(Bool)
+        case literalFormatting(Bool)
         case commandModeEnabled(Bool)
         case theme(HudTheme)
         case soundCues(Bool)
@@ -138,6 +140,7 @@ final class SettingsApplication {
         let keepMicWarm = Self.loadBool(from: defaults, key: Settings.Key.keepMicWarm, default: true)
         let liveTranscript = Self.loadBool(from: defaults, key: Settings.Key.liveTranscript, default: true)
         let cleanupEnabled = Self.loadBool(from: defaults, key: Settings.Key.cleanupEnabled, default: false)
+        let literalFormatting = Self.loadBool(from: defaults, key: Settings.Key.literalFormatting, default: false)
         let commandModeEnabled = Self.loadBool(
             from: defaults,
             key: Settings.Key.commandModeEnabled,
@@ -175,6 +178,7 @@ final class SettingsApplication {
             keepMicWarm: keepMicWarm,
             liveTranscript: liveTranscript,
             cleanupEnabled: cleanupEnabled,
+            literalFormatting: literalFormatting,
             commandModeEnabled: commandModeEnabled,
             theme: theme,
             soundCues: soundCues,
@@ -202,6 +206,7 @@ final class SettingsApplication {
         defaults.set(keepMicWarm, forKey: Settings.Key.keepMicWarm)
         defaults.set(liveTranscript, forKey: Settings.Key.liveTranscript)
         defaults.set(cleanupEnabled, forKey: Settings.Key.cleanupEnabled)
+        defaults.set(literalFormatting, forKey: Settings.Key.literalFormatting)
         defaults.set(commandModeEnabled, forKey: Settings.Key.commandModeEnabled)
         defaults.set(theme.rawValue, forKey: Settings.Key.hudTheme)
         defaults.set(soundCues, forKey: Settings.Key.soundCues)
@@ -286,6 +291,11 @@ final class SettingsApplication {
             defaults.set(enabled, forKey: Settings.Key.cleanupEnabled)
             values.cleanupEnabled = enabled
             effects.applyCleanupEnabled(enabled)
+
+        case .literalFormatting(let enabled):
+            guard enabled != values.literalFormatting else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.literalFormatting)
+            values.literalFormatting = enabled
 
         case .commandModeEnabled(let enabled):
             guard enabled != values.commandModeEnabled else { return .success(()) }
