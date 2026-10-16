@@ -846,3 +846,11 @@ Actor annotations/default construction and harness teardown retention were fixed
 before `focused-final.log`. `target-mutation.log` is an earlier validation-bypass
 run with a secondary unread-paste failure; `target-mutation-final.log` supersedes
 it. Existing compiler concurrency/capture warnings remain visible in build logs.
+
+R3 integration with R1 updates the abandonment-retry fixture to the new delivery
+callback's separate queue-ready and restoration-complete signals. The initial
+combined build exposed its old two-argument signature and removed interval
+argument; production code compiled. The corrected fixture passed 39 focused
+stall, target, and queue tests, exit 0. Evidence:
+`/tmp/flo-session-stack-through-r4-debug.log` (initial compile failure) and
+`/tmp/flo-r3-r1-fixture-integration.log` (pass). Full assembled validation follows.

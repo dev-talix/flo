@@ -322,11 +322,11 @@ final class DictationSessionStallTests: XCTestCase {
                 return try await transcriber.transcribe(request)
             },
             cleanup: { .init(text: $0.text, succeeded: true) },
-            inject: { text, complete in delivered.append(text); complete() },
+            inject: { text, _, ready, complete in delivered.append(text); ready(); complete() },
             recordTranscript: { history.append($0) },
             onOutcome: { outcome, _ in outcomes.append(outcome) },
             onCancelled: { _ in }, onCommandCancelled: { _ in },
-            onProcessingCountChange: { _ in }, stallTimeout: 2, injectionInterval: 0
+            onProcessingCountChange: { _ in }, stallTimeout: 2
         )
         let original = delivery.begin(.init(context: context))
         if preview {
