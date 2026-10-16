@@ -1027,6 +1027,82 @@ its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
   The maintainer owns assembled-stack and live verification. Dependency cache
   files were copied into this worktree; no package installation was performed.
 
+### Snippet entry and keyboard editing, October 16, 2026
+
+Owner: Flo maintainers. The local acceptance report identified unclear snippet
+fields and a failed paste shortcut. The native grouped form keeps its existing
+system typography, semantic colors, and spacing. `NewSnippetForm` now gives the
+spoken phrase a labeled, bordered field and the expansion a labeled, scrolling
+multiline editor. The Add action still persists through `SettingsModel.addSnippet`
+and clears the draft. Empty fields leave Add disabled. Existing saved snippets
+can be removed and recreated to correct a trigger.
+
+The accessory app has no application Edit menu. `SettingsPanelController` now
+uses `SettingsWindow`, which first offers key equivalents to normal AppKit
+handling, then routes plain Command-X/C/V/A to the focused responder. Other
+modifier combinations and unhandled commands fall through. No keyboard events
+are posted and no clipboard data is read by this routing code.
+
+`SettingsWindowEditingTests` reproduced missing paste, copy, cut, and select-all
+dispatch before the override. The regression uses an unshown native text view
+whose paste handler inserts a fixture, without touching the system clipboard.
+It checks multiline replacement, the focused responder, unsupported modifiers,
+and unhandled commands. Its optional `FLO_SNIPPET_RENDER_DIR` case renders the
+actual form in light/dark appearances at 420 and 540 points, with empty,
+multiline, and overflowing text. These component renders do not establish live
+SwiftUI paste interaction or dictation insertion.
+
+The reported saved trigger and recognized phrase differed in spelling. Matching
+still requires the saved phrase, ignoring case and flexible whitespace. The new
+numbered-list example converted correctly; its wrong word was already present
+in speech recognition. Neither finding warrants a formatter or matching change.
+The follow-up long recording retained both markers. Evidence is recorded in the
+local acceptance report outside the repository, without copying personal speech
+into this flow record.
+
+Verification uses base `27f9e7a2` plus the uncommitted repair on
+`fix/snippet-entry-paste`. The final diff and fingerprints are retained in
+`/tmp/flo-snippet-paste-final.diff` and the local acceptance follow-up report.
+
+- FAIL, expected baseline: four native editing tests, with two failing tests
+  and nine assertions before shortcut routing. Log:
+  `/tmp/flo-settings-editing-baseline.log`.
+- PASS: `swift test --disable-automatic-resolution --filter
+  'SettingsWindowEditingTests|VerbatimSnippet|VoiceFormatterTests|SettingsModelCorrectionTests'`,
+  56 tests, zero failures. Log: `/tmp/flo-snippet-paste-focused.log`.
+- PASS: `FLO_SNIPPET_RENDER_DIR=/tmp/flo-snippet-form-renders swift test
+  --disable-automatic-resolution`, 521 tests, zero failures, one optional HUD
+  render skip. Log: `/tmp/flo-snippet-paste-full-tests.log`.
+- PASS: native component inspection of empty, multiline, and overflowing
+  content in light/dark appearances at both widths. The form remains within
+  its bounds; long text has a scrolling viewport. Mobile/tablet layouts and
+  loading states do not apply to this macOS form; it adds no animation.
+- PASS: fresh read-only review and a final predicate compatibility review.
+  Logs: `/tmp/flo-snippet-ui-review.txt` and
+  `/tmp/flo-snippet-ui-review-r2.txt`. The final predicate preserves the old
+  handling of newline-only expansions.
+- PASS: `./scripts/local-app.sh install`, exit 0. Flo Local 1.11.1 is running
+  from `/Applications/Flo Local.app`, built at `2026-10-16T16:38:01Z`, with
+  revision `27f9e7a2` marked modified. Built and installed executables have
+  matching SHA-256 hashes, strict signature verification passed, and model
+  readiness took 0.09 seconds. The 21 fingerprinted settings keys were
+  unchanged. Previous bundle: `/Applications/.flo-local.4ftAmO/Previous Flo Local.app`.
+  Log: `/tmp/flo-snippet-paste-install.log`.
+- NOT RUN by the agent: live SwiftUI paste, Tab traversal, Add/reset interaction, real
+  microphone dictation, or target-app insertion. Native responder tests use
+  synthetic events without posting them; component snapshots use fixed
+  bindings. These are explicit limits of the automated evidence.
+
+Subsequent installed-app acceptance on the `16:38:01Z` build passed snippet
+expansion with both Fast and Polished. The user supplied both inserted results.
+Polished trace `6EA38EA1-C33D-46F7-ACCC-F70A49C9F352` and Fast trace
+`DF8FF17E-32D4-4CFE-9312-87DE06F9226F` each retained the saved expansion byte for
+byte, including its final newline. Each recorded one successful paste dispatch,
+at release +56.60 ms and +83.04 ms respectively. User-reported insertion and
+diagnostic byte preservation are separate evidence; the dispatch event alone
+does not prove insertion. The specific paste gesture, Tab traversal, and draft
+clearing were not separately reported.
+
 ## R2: terminal capture cleanup and ongoing stream health
 
 Requirement source: authorized reliability report R2 on
