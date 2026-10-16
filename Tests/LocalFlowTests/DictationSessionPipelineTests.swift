@@ -681,6 +681,42 @@ final class DictationSessionPipelineTests: XCTestCase {
         XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 96, text: "all words")])
     }
 
+    func testBoundedPreviewPreservesDisplayedWordsWhenItsWindowAdvances() async {
+        for hasCommittedPrefix in [false, true] {
+            let generation = hasCommittedPrefix ? 102 : 101
+            let transcriber = ControlledTranscriber()
+            let outcomes = OutcomeRecorder()
+            var partials: [PartialTranscript] = []
+            let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                        outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
+            pipeline.begin(generation: generation, context: context())
+            if hasCommittedPrefix {
+                pipeline.processIncrementalChunk(generation: generation, samples: speech,
+                                                 pauseSecondsAfterChunk: 0, sourceEndIndex: speech.count)
+                expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: generation, in: transcriber))
+                expectTrue(await transcriber.succeed("committed", segment: .incrementalChunk(index: 0), generation: generation))
+                await settleAsyncWork()
+            }
+            let seconds = hasCommittedPrefix ? 16 : 15
+            let prefix = hasCommittedPrefix ? "committed " : ""
+            for (index, text) in ["earlier words", "new words", "new words again"].enumerated() {
+                let samples = [Float](repeating: 0.2, count: speech.count * (seconds + index))
+                pipeline.processIncrementalSnapshot(generation: generation, samples: samples)
+                expectTrue(await waitForCall(.preview, generation: generation, in: transcriber, minimumCount: index + 1))
+                expectTrue(await transcriber.succeed(text, segment: .preview, generation: generation))
+                await settleAsyncWork()
+            }
+            XCTAssertEqual(partials.suffix(3).map(\.text), [
+                prefix + "earlier words", prefix + "earlier words new words",
+                prefix + "earlier words new words again"
+            ])
+            expectEqual(await transcriber.sampleCounts(.preview, generation: generation),
+                        [15 * speech.count, speech.count, 2 * speech.count])
+            XCTAssertTrue(outcomes.values.isEmpty)
+            pipeline.cancel(generation: generation)
+        }
+    }
+
     func testChunkDoesNotReplacePreviewThatAlreadyCoversNewerWords() async {
         let transcriber = ControlledTranscriber()
         let outcomes = OutcomeRecorder()

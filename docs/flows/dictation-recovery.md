@@ -399,3 +399,24 @@ the 282-test release run. Installation evidence is
 `localflow-architecture-install-20260910.log` in the OS temporary directory.
 No live microphone dictation or target-app insertion was performed during
 installation. This installation supersedes the earlier not-installed status.
+
+### Preview window continuity repair
+
+Independent source review found that a rolling 15-second preview replaced words
+already displayed during continuous speech. The bounded preview now freezes its
+HUD prefix before opening another window. Later hypotheses update that window
+while retaining the prefix. Committed chunks can replace a preview once they
+cover its latest words. The displayed prefix never enters final recognition,
+cleanup, diagnostics, or delivery.
+
+The new `DisplayedPreview` value keeps the sample range, prefix, and current
+text together inside the pipeline. The regression covers continuous speech
+with and without an already committed prefix, repeated updates after advancing
+the window, and bounded input sizes. It failed four assertions before repair.
+Evidence: `/tmp/flo-preview-continuity-red.log` (exit 1) and
+`/tmp/flo-preview-continuity-focused.log` (46 tests, exit 0). The full debug
+suite passed 387 tests, zero failures and one optional HUD render skip:
+`/tmp/flo-preview-continuity-debug.log` (exit 0). Live model/device timing was
+not rerun for this repair.
+The full release suite also passed 387 tests, zero failures and the same optional
+HUD render skip: `/tmp/flo-preview-continuity-release.log` (exit 0).

@@ -134,6 +134,12 @@ final class DictationSessionPipeline {
         let tail: DictationAudioPreparation
     }
 
+    private struct DisplayedPreview {
+        let range: Range<Int>
+        let prefix: String
+        let text: String
+    }
+
     private final class Session {
         let generation: Int
         let context: DictationSessionContext
@@ -147,7 +153,7 @@ final class DictationSessionPipeline {
         /// interruption or a stall deadline cancels it and quarantines the engine.
         var previewTask: Task<Void, Never>?
         var lastPreviewRange: Range<Int>?
-        var displayedPreviewEnd = 0
+        var displayedPreview: DisplayedPreview?
         var nextChunkSnapshotSamples = 0
         /// Text cleanup never touches the speech engine, so it is always
         /// safe to cancel.
@@ -293,7 +299,17 @@ final class DictationSessionPipeline {
         let committedEnd = session.completedSampleEnd
         // A long hold without a pause must not re-decode minutes of audio
         // every second or leave release waiting behind that preview.
-        let start = max(committedEnd, samples.count - Int(15 * AudioRecorder.sampleRate))
+        let displayed = session.displayedPreview
+        var start = max(committedEnd, displayed?.range.lowerBound ?? committedEnd)
+        var prefix = start == committedEnd ? session.committedText : displayed?.prefix ?? ""
+        if samples.count - start > Int(15 * AudioRecorder.sampleRate) {
+            // Freeze the displayed hypothesis before starting another bounded
+            // window. This prefix is for the HUD only, never final delivery.
+            start = max(committedEnd, displayed?.range.upperBound ?? 0,
+                        samples.count - Int(15 * AudioRecorder.sampleRate))
+            prefix = (displayed?.range.upperBound ?? 0) > committedEnd
+                ? displayed?.text ?? session.committedText : session.committedText
+        }
         let range = start..<samples.count
         guard range != session.lastPreviewRange else { return }
         let audio = DictationAudioPreparation(samples: Array(samples[range]))
@@ -313,12 +329,10 @@ final class DictationSessionPipeline {
             guard let text, !text.isEmpty, isCurrent(session),
                   session.releaseAudio == nil,
                   session.completedSampleEnd == committedEnd else { return }
-            session.displayedPreviewEnd = range.upperBound
-            // Once the preview window slides past uncommitted words, show
-            // recent speech without joining text across the omitted audio.
-            let preview = start == committedEnd ? Transcriber.joinTranscriptParts(
-                session.committedText, text, pauseSeconds: session.nextPauseSeconds
-            ) : text
+            let preview = Transcriber.joinTranscriptParts(
+                prefix, text, pauseSeconds: start == committedEnd ? session.nextPauseSeconds : 0
+            )
+            session.displayedPreview = DisplayedPreview(range: range, prefix: prefix, text: preview)
             onPartialTranscript?(session.generation, preview)
         }
     }
@@ -492,7 +506,7 @@ final class DictationSessionPipeline {
                 session.completedSampleEnd = chunk.sourceEndIndex ?? session.completedSampleEnd
                 // Keep a preview that covers newer words. A successful chunk
                 // must still appear if no preview has supplied those words.
-                if session.displayedPreviewEnd <= session.completedSampleEnd {
+                if (session.displayedPreview?.range.upperBound ?? 0) <= session.completedSampleEnd {
                     onPartialTranscript?(session.generation, session.committedText)
                 }
                 session.chunkCount += 1
