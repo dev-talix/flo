@@ -1025,3 +1025,135 @@ its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
   clipboard, target-app insertion, release packaging, installation, or deployment.
   The maintainer owns assembled-stack and live verification. Dependency cache
   files were copied into this worktree; no package installation was performed.
+
+## R2: terminal capture cleanup and ongoing stream health
+
+Requirement source: authorized reliability report R2 on
+`47f1bb906e8f3b2291a617f13dd9bb0b11300e74`. Owner: Flo maintainers.
+Prerequisite E4 is cherry-picked unchanged from
+`aa579364df074dbfd4a7cbd00b77b4b9df521c42` as `3d60fe9`.
+R2 extends the existing recorder lifecycle. E5 idle work and RMS changes,
+decoder defaults, feature ideas, installation, and live-device checks are
+outside this change.
+
+### Capture and failure path
+
+Each `AudioRecorder.start` installs a recording UUID and its own runtime failure
+callback on the control queue. `RuntimeFailure` identifies that recording and
+capture generation. The watchdog validates both identities; runtime callbacks
+validate the capture generation and the recording present when the error
+arrived. An old timer, stopped input, or delayed app callback cannot clear a
+new hold.
+
+`AudioRecorder.failRecording` owns terminal cleanup, including failed setup.
+Under the sample lock it clears recording/live state, invalidates capture
+callbacks, and releases recognition samples, parked first-syllable samples,
+optional native audio, trace, and per-recording callbacks. It cancels warm
+teardown and releases the capture session. Native teardown removes the error
+observer and output delegate, stops capture, then releases the forwarder and its
+converter/buffer storage. Sample callbacks cannot refill audio while hardware
+shutdown blocks. Setup reports through start completion only; later terminal
+failure reports through the runtime callback once. Both leave a failure in the
+existing `Recording.startError` field for an already queued stop.
+
+`AppDelegate.hotkeyPressed` captures the UUID and UI/dictation generations in
+its per-start failure callback. `handleCaptureFailure` consumes the matching UI
+generation once, clears command/recording/trace/HUD ownership, cancels that
+held or released dictation and its incremental timer, and reports failure.
+Recorder cleanup needs no extra app-side stop. Incremental ticks carry the
+recording UUID, and queued live cues and snapshot callbacks consult
+`AudioRecorder.isCaptureActive` before recognition or UI work, including while
+hardware teardown blocks and the UI failure is still queued. E4 detached
+snapshot contents remain intact. Hotkey release after failure is safe. A stop
+already queued returns empty audio and an error, so its existing guard cancels
+delivery before `process` or final recognition. Release after a
+runtime error before the live cue also discards its parked/native prefix and
+reports failure. A stale failure cannot stop, cancel, or hide the next recording.
+
+### Health policy and recovery
+
+The recorder checks every 1.2 seconds throughout a hold, using monotonic time.
+`HealthPolicy`, clock, and check scheduler are injectable for bounded fake tests.
+Startup retains two rebuild attempts, the existing per-open retry and built-in
+fallback, and eight further checks for flowing digital-zero Bluetooth wakeup
+audio. Runtime errors before live capture share that finite startup budget.
+A rebuild invalidates the old route while holding the same lock that proves
+capture live, so newly live audio wins before a replacement decision.
+
+After live capture, 3.6 seconds without raw delivery or converted output, five
+consecutive failed/empty conversions, a stopped session, or a runtime error
+fails the hold. `SampleForwarder` reports missing output through the existing
+PCM callback as nil and resets a failed converter for its next bounded attempt.
+Deadline gaps and conversion-limit failures remain latched even if a late buffer
+arrives before the next timer. Release checks the same health rules after
+queued conversion drains. A failed live stream is discarded rather than joined
+to a replacement route across missing speech; the next press starts fresh.
+
+Ordinary silence after live capture advances both progress clocks and stays
+healthy. Startup audible gating, digital-zero wakeup allowance, parked first
+syllables, and RMS/spectrum calculations retain their existing behavior. E4
+ranged snapshots still carry absolute offsets and detach independent storage;
+healthy release returns all original recognition and optional native samples.
+
+### R2 verification
+
+Verified source: the E4 prerequisite above plus the R2 diff saved at
+`/tmp/flo-r2.diff`, committed with this section. Environment: macOS 27.0.1,
+arm64, Apple Swift 6.4. Dependencies were copied from the existing local cache
+into this isolated worktree; commands disable automatic resolution.
+
+- PASS, exit 0: baseline `swift test --disable-automatic-resolution --filter
+  AudioCaptureLifecycleTests`, 7 tests. Log: `/tmp/flo-r2-baseline.log`.
+- PASS, exit 0: initial focused recorder suite, 19 tests, zero failures. Log:
+  `/tmp/flo-r2-focused.log`. Cases cover failed setup/rebuild, terminal cleanup,
+  one notification, stale timers/callbacks, missing buffers, failed or stalled
+  conversion, late buffer recovery attempts, healthy silence, first syllables,
+  release racing health checks, and complete E4 snapshots/release tails.
+  Final integration runs below include 21 recorder lifecycle tests, adding
+  queued snapshot suppression and release after a runtime error before live.
+- PASS, exit 0: `swift test --disable-automatic-resolution --filter
+  '^LocalFlowTests\.(AudioCaptureLifecycleTests|AudioRecorderTests|VoicedAudioTests|IncrementalCutPointTests|Dictation[A-Za-z]*Tests|RetainedAudioFileTests|PersonalVoice[A-Za-z]*Tests|NativeAudioRecordingTests|AppTerminationTests)/'`,
+  166 tests, zero failures. Log: `/tmp/flo-r2-integration-final.log`.
+  Exit status: `/tmp/flo-r2-integration-final.exit`.
+- PASS, exit 0: `python3 -B Tests/CaptureFailureBoundaryTests.py`, five tests.
+  Log: `/tmp/flo-r2-boundary.log`. The harness compiles the actual AppDelegate
+  failure, release, command-release, incremental-tick, and HUD-dismiss methods
+  with inert UI, capture, and delivery dependencies. It checks one UI transition, no final
+  recognition after failed release or a delayed snapshot, and protection of a
+  newer hold. CI runs it. Exit status: `/tmp/flo-r2-boundary.exit`.
+- PASS: a regression added before its release-check fix failed four assertions
+  for a runtime error before the live cue. It exposed retained native prefix,
+  missing capture error, and missing failure notification. The same test passes
+  in the final debug suite. Red run exit 1 and log:
+  `/tmp/flo-r2-release-before-live-red.exit` and
+  `/tmp/flo-r2-release-before-live-red.log`.
+
+- PASS, exit 0: `swift test -c release --disable-automatic-resolution --filter
+  '^LocalFlowTests\.(AudioCaptureLifecycleTests|AudioRecorderTests|VoicedAudioTests|IncrementalCutPointTests|Dictation[A-Za-z]*Tests|RetainedAudioFileTests|PersonalVoice[A-Za-z]*Tests|NativeAudioRecordingTests|AppTerminationTests)/'`,
+  166 tests, zero failures, including compilation of the changed application.
+  Log: `/tmp/flo-r2-release.log`. Exit status: `/tmp/flo-r2-release.exit`.
+  No tests in either final selected suite were skipped.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+  Evidence: `/tmp/flo-r2-diff-check.log` and `/tmp/flo-r2-diff-check.exit`.
+
+Existing compiler warnings in diagnostic retention and text injection remain.
+No warning was reported in the changed recorder, AppDelegate, or capture tests.
+
+An intermediate run failed nine assertions in the previous test that expected
+live runtime recovery to join partial speech across sessions. R2 replaces that
+contract with terminal discard and tests bounded recovery before live capture.
+Log: `/tmp/flo-r2-first.log`. The first broader integration filter also matched
+one private named-pasteboard fixture with stubbed paste. It did not use the
+system clipboard. Final selections above exclude TextInjector tests.
+
+NOT RUN: live microphone, physical hotplug/Bluetooth wakeup, real-model inference,
+installed UI, target-app insertion, packaging, installation, or performance
+measurement. Synthetic progress tests establish lifecycle contracts, not
+hardware-specific threshold tuning. Boundary tests substitute UI effects and
+recognition dispatch. Earlier incremental inference can have run before a later
+capture failure; cancellation rejects its eventual output. Full-suite execution
+is omitted to keep validation within the task's device and clipboard boundary.
+
+R2 stack integration also clears the captured command target on the matching
+terminal failure, while stale failures leave a newer target intact. The compiled
+AppDelegate boundary harness includes R3 command-target parameters.

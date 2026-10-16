@@ -346,24 +346,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The capture-live cue is passed to recorder.start per press, so it
         // carries that recording's generation and is installed on the
         // recorder's own queues — recording A's audio can't fire B's cue.
-        // Capture died mid-recording and recovery failed — stop pretending
-        // the mic is live.
-        recorder.onRuntimeFailure = { [weak self] error in
-            DispatchQueue.main.async {
-                guard let self, self.isRecording else { return }
-                self.isRecording = false
-                self.recordingGeneration += 1
-                self.cancelActiveDictationSession()
-                self.overlay.hide()
-                self.cancelKey.deactivate()
-                self.playCue("Basso")
-                self.state = .failed(UserFacingIssue(
-                    summary: "Microphone stopped",
-                    details: error.localizedDescription
-                ))
-                self.scheduleFailureRecovery()
-            }
-        }
         recorder.deviceUID = Settings.inputDeviceUID
         recorder.keepWarm = Settings.keepMicWarm
         // Hot-plug: when the default input or the device list changes, an
@@ -772,45 +754,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isRecording = true
         recordingGeneration += 1
         let generation = recordingGeneration
+        let recordingID = UUID()
         if recordingIsCommand {
             cancelActiveDictationSession()
         } else {
-            beginDictationSession()
+            beginDictationSession(recordingID: recordingID)
         }
         // Enqueue hardware startup before doing menu/HUD work on the main
         // thread. A warm microphone can now begin delivering immediately
         // while the visual state is updated in parallel. The "speak now"
         // cue fires on the first sustained audio, not on engine start, and
         // only for THIS recording's generation.
-        recorder.start(trace: trace, retainNativeAudio: AppIdentity.current.isLocal && Settings.savePersonalVoice && !recordingIsCommand, onCaptureLive: { [weak self] in
+        let dictationGeneration = activeDictationGeneration
+        recorder.start(recordingID: recordingID, trace: trace, retainNativeAudio: AppIdentity.current.isLocal && Settings.savePersonalVoice && !recordingIsCommand, onCaptureLive: { [weak self] in
             DispatchQueue.main.async {
-                guard let self, self.isRecording, generation == self.recordingGeneration else { return }
+                guard let self, self.isRecording, generation == self.recordingGeneration,
+                      self.recorder.isCaptureActive(recordingID: recordingID) else { return }
                 self.overlay.captureLive()
                 self.playCue("Pop")
+            }
+        }, onRuntimeFailure: { [weak self] failure in
+            guard failure.recordingID == recordingID else { return }
+            DispatchQueue.main.async {
+                self?.handleCaptureFailure(failure.error, generation: generation,
+                                           dictationGeneration: dictationGeneration,
+                                           summary: "Microphone stopped")
             }
         }) { [weak self] error in
             guard let self else { return }
             if let error {
-                // A newer recording owns the UI. The recorder carries the
-                // older start error in its own stop result.
-                guard generation == self.recordingGeneration else { return }
-                if self.isRecording {
-                    self.isRecording = false
-                    self.recordingIsCommand = false
-                    self.recordingCommandTarget = nil
-                    self.cancelActiveDictationSession()
-                    // Release may never call stop now that the active flag is
-                    // clear, so finish recorder-side cleanup here.
-                    self.recorder.stop { _ in }
-                }
-                self.overlay.hide()
-                self.cancelKey.deactivate()
-                self.playCue("Basso")
-                self.state = .failed(UserFacingIssue(
-                    summary: "Couldn't start the microphone",
-                    details: error.localizedDescription
-                ))
-                self.scheduleFailureRecovery()
+                self.handleCaptureFailure(error, generation: generation,
+                                          dictationGeneration: dictationGeneration,
+                                          summary: "Couldn't start the microphone")
                 return
             }
             guard generation == self.recordingGeneration else { return }
@@ -828,6 +803,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DiagLog.log("recording reached the %.0fs cap — stopping", Self.maxRecordingSeconds)
             self.hotkeyReleased()
         }
+    }
+
+    /// Both startup and terminal stream failures consume the press's UI
+    /// generation once, including failure racing a queued release handoff.
+    /// Recorder cleanup is complete; no unscoped stop may reach a newer hold.
+    private func handleCaptureFailure(
+        _ error: Error, generation: Int, dictationGeneration: Int?, summary: String
+    ) {
+        guard generation == recordingGeneration else { return }
+        recordingGeneration += 1
+        isRecording = false
+        recordingIsCommand = false
+        recordingCommandTarget = nil
+        activeDictationTrace = nil
+        if activeDictationGeneration == dictationGeneration {
+            cancelActiveDictationSession()
+        } else if let dictationGeneration {
+            dictationDelivery.cancel(generation: dictationGeneration)
+        }
+        hudDictationGeneration = nil
+        releasedDictation = nil
+        overlay.hide()
+        cancelKey.deactivate()
+        playCue("Basso")
+        state = .failed(UserFacingIssue(summary: summary, details: error.localizedDescription))
+        scheduleFailureRecovery()
     }
 
     private static let maxRecordingSeconds: TimeInterval = 300
@@ -864,7 +865,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
     }
 
-    private func beginDictationSession() {
+    private func beginDictationSession(recordingID: UUID) {
         cancelActiveDictationSession()
         let context = captureDictationContext()
         let generation = dictationDelivery.begin(.init(
@@ -876,20 +877,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activeDictationGeneration = generation
         hudDictationGeneration = (dictation: generation, hud: recordingGeneration)
         let cadence = context.incrementalCadence
-        scheduleIncrementalTick(generation: generation, cadence: cadence, after: cadence.firstSnapshotSeconds)
+        scheduleIncrementalTick(generation: generation, recordingID: recordingID, cadence: cadence, after: cadence.firstSnapshotSeconds)
     }
 
-    private func scheduleIncrementalTick(generation: Int, cadence: IncrementalCadence, after delay: TimeInterval) {
+    private func scheduleIncrementalTick(generation: Int, recordingID: UUID, cadence: IncrementalCadence, after delay: TimeInterval) {
         let work = DispatchWorkItem { [weak self] in
-            self?.runIncrementalTick(generation: generation, cadence: cadence)
+            self?.runIncrementalTick(generation: generation, recordingID: recordingID, cadence: cadence)
         }
         incrementalTimer = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    private func runIncrementalTick(generation: Int, cadence: IncrementalCadence) {
+    private func runIncrementalTick(generation: Int, recordingID: UUID, cadence: IncrementalCadence) {
         guard activeDictationGeneration == generation, isRecording else { return }
-        scheduleIncrementalTick(generation: generation, cadence: cadence, after: cadence.snapshotSeconds)
+        scheduleIncrementalTick(generation: generation, recordingID: recordingID, cadence: cadence, after: cadence.snapshotSeconds)
         guard let range = dictationDelivery.incrementalSnapshotRange(generation: generation) else {
             activeDictationTrace?.record(.incrementalSkipped, status: .busy)
             return
@@ -898,7 +899,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.snapshot(range: range) { [weak self] snapshot in
             guard let self,
                   self.activeDictationGeneration == generation,
-                  self.isRecording else { return }
+                  self.isRecording,
+                  self.recorder.isCaptureActive(recordingID: recordingID) else { return }
             self.dictationDelivery.processIncrementalSnapshot(
                 generation: generation, samples: snapshot.samples, sampleOffset: snapshot.sampleOffset
             )
