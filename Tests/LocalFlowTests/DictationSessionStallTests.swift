@@ -251,13 +251,13 @@ final class DictationSessionStallTests: XCTestCase {
         let delivery = DictationDelivery(
             transcribe: { try await transcriber.transcribe($0) },
             cleanup: { .init(text: $0.text, succeeded: true) },
-            inject: { text, complete in pasted.append(text); complete() },
+            inject: { text, _, ready, complete in pasted.append(text); complete(); ready() },
             recordTranscript: { history.append($0) },
             onOutcome: { outcome, _ in outcomes.append(outcome) },
             onCancelled: { _ in XCTFail("A deadline must retain the failed recording") },
             onCommandCancelled: { _ in },
             onProcessingCountChange: { _ in },
-            stallTimeout: 0.08, injectionInterval: 0
+            stallTimeout: 0.08
         )
         for _ in 0..<dictations {
             let generation = delivery.begin(.init(context: context))
