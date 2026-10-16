@@ -352,6 +352,18 @@ enum TextInjector {
         let range: CFRange
     }
 
+    private static func selectedRange(
+        in element: AXUIElement, readAttribute: SelectionAttributeReader
+    ) -> CFRange? {
+        let (error, value) = readAttribute(element, kAXSelectedTextRangeAttribute as CFString)
+        var range = CFRange()
+        guard error == .success, let value,
+              CFGetTypeID(value) == AXValueGetTypeID(),
+              AXValueGetValue(value as! AXValue, .cfRange, &range),
+              range.location >= 0, range.length >= 0 else { return nil }
+        return range
+    }
+
     static func captureCommandTarget(
         isSecureInputEnabled: () -> Bool = { IsSecureEventInputEnabled() },
         focusedApplication: @MainActor () -> AXUIElement? = frontmostAccessibilityApplication,
@@ -363,12 +375,7 @@ enum TextInjector {
         guard focusError == .success, let focus,
               CFGetTypeID(focus) == AXUIElementGetTypeID() else { return .failure(.unavailable) }
         let element = focus as! AXUIElement
-        let (rangeError, rangeValue) = readAttribute(element, kAXSelectedTextRangeAttribute as CFString)
-        var range = CFRange()
-        guard rangeError == .success, let rangeValue,
-              CFGetTypeID(rangeValue) == AXValueGetTypeID(),
-              AXValueGetValue(rangeValue as! AXValue, .cfRange, &range),
-              range.location >= 0, range.length >= 0 else { return .failure(.unavailable) }
+        guard let range = selectedRange(in: element, readAttribute: readAttribute) else { return .failure(.unavailable) }
         let selection: String?
         switch selectedText(in: element, readAttribute: readAttribute) {
         case .success(let text): selection = text
@@ -385,6 +392,28 @@ enum TextInjector {
         } else {
             return .failure(.unavailable)
         }
+
+        // AX reads can block while another process changes focus or selection.
+        // Check the selection again, then close with live window/field/app identity
+        // so retained attributes from an unfocused element cannot approve a paste.
+        guard let finalRange = selectedRange(in: element, readAttribute: readAttribute),
+              range.location == finalRange.location, range.length == finalRange.length,
+              case .success(let finalSelection) = selectedText(in: element, readAttribute: readAttribute),
+              selection == finalSelection else { return .failure(.unavailable) }
+        let (finalWindowError, finalWindow) = readAttribute(app, kAXFocusedWindowAttribute as CFString)
+        if let window {
+            guard finalWindowError == .success, let finalWindow, CFEqual(window, finalWindow) else {
+                return .failure(.unavailable)
+            }
+        } else {
+            guard finalWindowError == .attributeUnsupported || finalWindowError == .noValue else {
+                return .failure(.unavailable)
+            }
+        }
+        let (finalFocusError, finalFocus) = readAttribute(app, kAXFocusedUIElementAttribute as CFString)
+        guard finalFocusError == .success, let finalFocus, CFEqual(element, finalFocus),
+              let finalApp = focusedApplication(), CFEqual(app, finalApp),
+              !isSecureInputEnabled() else { return .failure(.unavailable) }
         return .success(CommandTarget(application: app, element: element, window: window,
                                       selection: selection, range: range))
     }

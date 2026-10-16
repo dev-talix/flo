@@ -147,6 +147,48 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         wait(for: [stopped], timeout: 2)
     }
 
+    func testStopSerializesDetachmentWithCallbackArrivingDuringSessionValidation() {
+        let input = SyntheticCaptureInput()
+        let recorder = AudioRecorder(makeCaptureSession: input.open)
+        startRecorder(recorder)
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [0.2])
+        source.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+
+        let rawArrived = DispatchSemaphore(value: 0)
+        let allowConversion = DispatchSemaphore(value: 0)
+        let paused = expectation(description: "callback paused between raw and converted tail")
+        // On the broken implementation this getter runs after the empty drain
+        // barrier. Start a new callback there, before controlQueue detaches.
+        input.onIsRunning = {
+            source.send(converted: [0.5], native: [0.6], betweenFormats: {
+                rawArrived.signal()
+                paused.fulfill()
+                XCTAssertEqual(allowConversion.wait(timeout: .now() + 3), .success)
+            })
+            XCTAssertEqual(rawArrived.wait(timeout: .now() + 2), .success)
+        }
+        let stopped = expectation(description: "paired handoff")
+        let premature = expectation(description: "stop waits for conversion counterpart")
+        premature.isInverted = true
+        var conversionReleased = false
+        recorder.stop { recording in
+            if !conversionReleased { premature.fulfill() }
+            XCTAssertNil(recording.startError)
+            XCTAssertEqual(recording.samples, [0.1, 0.3, 0.5])
+            XCTAssertEqual(recording.nativeAudio?.samples, [0.2, 0.4, 0.6])
+            XCTAssertEqual(recording.nativeAudio?.isComplete, true)
+            stopped.fulfill()
+        }
+        wait(for: [paused, premature], timeout: 0.1)
+        input.onIsRunning = nil
+        conversionReleased = true
+        allowConversion.signal()
+        wait(for: [stopped], timeout: 3)
+        XCTAssertTrue(drain(recorder).samples.isEmpty)
+    }
+
     func testStopHandsOffBeforeHardwareTeardownFinishesAndNextStartWaits() {
         let input = SyntheticCaptureInput()
         let teardownEntered = expectation(description: "teardown entered")
@@ -491,6 +533,10 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         input.latestSource!.send(converted: [0.3], native: [0.4])
         drain(recorder)
         clock.advance(by: 3)
+        // Terminal teardown must run outside sampleQueue, even when stop
+        // discovers the failure during its serialized validation.
+        let source = input.latestSource!
+        input.onStop = { source.queue.sync {} }
         let recording = stopRecorder(recorder)
         XCTAssertTrue(recording.samples.isEmpty)
         XCTAssertNil(recording.nativeAudio)
@@ -623,6 +669,149 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         clock.tick()
         drain(recorder)
         XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
+    func testCaptureFailureDuringPreviewKeepsEngineWarmAndNextRecordingUsable() async throws {
+        try await verifyCaptureFailureDuringInference(preview: true)
+    }
+
+    @MainActor
+    func testCaptureFailureDuringChunkKeepsEngineWarmAndNextRecordingUsable() async throws {
+        try await verifyCaptureFailureDuringInference(preview: false)
+    }
+
+    @MainActor
+    private func verifyCaptureFailureDuringInference(preview: Bool) async throws {
+        let engine = CaptureRecoveryEngine()
+        var loads = 0
+        let transcriber = Transcriber(modelLoader: { _, _ in loads += 1; return engine },
+                                      abandonedInferenceGrace: 30)
+        try await transcriber.load(model: "test")
+        var injected: [String] = []
+        var history: [String] = []
+        var partials: [String] = []
+        var outcomes: [DictationSessionOutcome] = []
+        var requests: [DictationTranscriptionSegment] = []
+        var finished: [Int] = []
+        let delivery = DictationDelivery(
+            transcribe: { request in
+                requests.append(request.segment)
+                defer { finished.append(request.generation) }
+                return try await transcriber.transcribe(request)
+            },
+            cleanup: { .init(text: $0.text, succeeded: true) },
+            inject: { text, _, ready, complete in injected.append(text); ready(); complete() },
+            recordTranscript: { history.append($0) },
+            onOutcome: { outcome, _ in outcomes.append(outcome) },
+            onPartialTranscript: { _, text in partials.append(text) },
+            onCancelled: { _ in }, onCommandCancelled: { _ in },
+            onProcessingCountChange: { _ in }
+        )
+        let context = DictationSessionContext(
+            cleanupEnabled: false, styleProfile: .general, corrections: [], snippets: [],
+            incrementalCadence: preview ? .whisper : .init(startSeconds: 4, tickSeconds: 2)
+        )
+        let failedGeneration = delivery.begin(.init(context: context))
+        let input = SyntheticCaptureInput()
+        let recorder = AudioRecorder(makeCaptureSession: input.open)
+        var failures = 0
+        await startRecoveryRecorder(recorder) { _ in
+            failures += 1
+            // The Python boundary checks this policy on the actual AppDelegate
+            // handler, helper, and failed-release path. Here it reaches real ASR.
+            delivery.cancel(generation: failedGeneration, interruptInference: false)
+        }
+        let source = input.latestSource!
+        let rate = Int(AudioRecorder.sampleRate)
+        let speech = [Float](repeating: 0.2, count: rate)
+        let initial = preview ? speech + speech
+            : Array(repeating: Float(0.2), count: rate * 3)
+                + Array(repeating: Float(0), count: rate)
+                + Array(repeating: Float(0.2), count: rate * 4)
+        source.send(converted: Array(initial.prefix(rate)), native: Array(repeating: 0.2, count: rate * 3))
+        source.send(converted: Array(initial.dropFirst(rate)), native: Array(repeating: 0.2, count: (initial.count - rate) * 3))
+        let initialSnapshot = try await recoverySnapshot(recorder)
+        delivery.processIncrementalSnapshot(generation: failedGeneration, samples: initialSnapshot.samples)
+        await captureEventually { await engine.calls == 1 }
+        XCTAssertEqual(requests, [preview ? .preview : .incrementalChunk(index: 0)])
+
+        source.fail()
+        await captureEventually { failures == 1 }
+        let loadedDuringGrace = await transcriber.isLoaded
+        XCTAssertTrue(loadedDuringGrace, "Capture failure must not quarantine healthy ASR")
+        let failedRecording = try await releaseRecoveryRecorder(recorder)
+        XCTAssertNotNil(failedRecording.startError)
+        XCTAssertTrue(failedRecording.samples.isEmpty)
+        XCTAssertNil(failedRecording.nativeAudio)
+        // Even a late release of the failed hold cannot revive its pipeline.
+        delivery.release(generation: failedGeneration, samples: initial)
+        XCTAssertTrue(injected.isEmpty)
+        XCTAssertEqual(delivery.retryCount, 0, "Incomplete capture must not become retry audio")
+
+        let next = delivery.begin(.init(context: context))
+        await startRecoveryRecorder(recorder)
+        input.latestSource!.send(converted: speech, native: [0.3])
+        input.latestSource!.send(converted: speech, native: [0.4])
+        let healthy = try await releaseRecoveryRecorder(recorder)
+        XCTAssertNil(healthy.startError)
+        XCTAssertEqual(healthy.samples, speech + speech)
+        XCTAssertEqual(healthy.nativeAudio?.samples, [0.3, 0.4])
+        XCTAssertEqual(healthy.nativeAudio?.isComplete, true)
+        delivery.release(generation: next, samples: healthy.samples, nativeAudio: healthy.nativeAudio)
+        await captureEventually { await transcriber.waitingInferenceCount == 1 }
+        await engine.finishAbandoned()
+        await captureEventually { finished.contains(failedGeneration) && outcomes.count == 1 }
+        XCTAssertEqual(outcomes, [.finalTranscript(generation: next, text: "next healthy words")])
+        XCTAssertEqual(injected, ["next healthy words"])
+        XCTAssertEqual(history, injected)
+        XCTAssertTrue(partials.isEmpty, "Abandoned preview/chunk must not update the HUD")
+        XCTAssertFalse(delivery.isBusy)
+        XCTAssertEqual(delivery.retryCount, 0)
+        let loadedAfterCompletion = await transcriber.isLoaded
+        XCTAssertTrue(loadedAfterCompletion)
+        XCTAssertEqual(loads, 1, "The next recording must succeed without reloading")
+    }
+
+    @MainActor
+    private func startRecoveryRecorder(_ recorder: AudioRecorder,
+                                       onFailure: @escaping (AudioRecorder.RuntimeFailure) -> Void = { _ in XCTFail("Unexpected capture failure") }) async {
+        let started = expectation(description: "recovery capture started")
+        recorder.start(retainNativeAudio: true, onRuntimeFailure: { failure in
+            DispatchQueue.main.async { onFailure(failure) }
+        }) { error in
+            XCTAssertNil(error)
+            started.fulfill()
+        }
+        await fulfillment(of: [started], timeout: 3)
+    }
+
+    @MainActor
+    private func recoverySnapshot(_ recorder: AudioRecorder) async throws -> AudioRecorder.Snapshot {
+        let drained = expectation(description: "recovery samples drained")
+        var result: AudioRecorder.Snapshot?
+        recorder.snapshot { result = $0; drained.fulfill() }
+        await fulfillment(of: [drained], timeout: 3)
+        return try XCTUnwrap(result)
+    }
+
+    @MainActor
+    private func releaseRecoveryRecorder(_ recorder: AudioRecorder) async throws -> AudioRecorder.Recording {
+        let stopped = expectation(description: "recovery capture released")
+        var result: AudioRecorder.Recording?
+        recorder.stop { result = $0; stopped.fulfill() }
+        await fulfillment(of: [stopped], timeout: 3)
+        return try XCTUnwrap(result)
+    }
+
+    @MainActor
+    private func captureEventually(_ condition: () async -> Bool,
+                                  file: StaticString = #filePath, line: UInt = #line) async {
+        for _ in 0..<400 {
+            if await condition() { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Capture recovery condition did not become true", file: file, line: line)
     }
 
     private func healthRecorder(
@@ -825,9 +1014,10 @@ private final class SyntheticCaptureInput {
             queue.async { self.onRaw(Self.buffer([0.1], rate: 48_000)) }
         }
 
-        func send(converted: [Float], native: [Float]) {
+        func send(converted: [Float], native: [Float], betweenFormats: @escaping () -> Void = {}) {
             queue.async {
                 self.onRaw(Self.buffer(native, rate: 48_000))
+                betweenFormats()
                 self.onPCM(Self.buffer(converted, rate: 16_000))
             }
         }
@@ -852,6 +1042,7 @@ private final class SyntheticCaptureInput {
     private var shouldFail = false
     private var stopCallback: (() -> Void)?
     var onOpen: ((Source) throws -> Void)?
+    var onIsRunning: (() -> Void)?
 
     var latestSource: Source? {
         lock.lock(); defer { lock.unlock() }
@@ -891,7 +1082,7 @@ private final class SyntheticCaptureInput {
         try onOpen?(source)
         return AudioCaptureSession(deviceUID: deviceUID ?? AudioDevices.defaultInputDeviceUID() ?? AVCaptureDevice.default(for: .audio)?.uniqueID,
                                    microphoneName: "Synthetic input",
-                                   isRunning: { true }, stop: {
+                                   isRunning: { self.onIsRunning?(); return true }, stop: {
             self.lock.lock()
             self.stops += 1
             let callback = self.stopCallback
@@ -927,4 +1118,31 @@ private final class CaptureHealthClock {
     }
 
     func tick() { takeCheck()() }
+}
+
+/// Ignores cancellation while the first inference is suspended, like a native
+/// model call. Later calls complete immediately without loading another engine.
+private actor CaptureRecoveryEngine: SpeechEngine {
+    private(set) var calls = 0
+    private var pending: CheckedContinuation<EngineTranscription, Never>?
+
+    func transcribe(samples: [Float], lowEnergy: Bool) async throws -> EngineTranscription {
+        calls += 1
+        if calls == 1 {
+            return await withCheckedContinuation { pending = $0 }
+        }
+        return result("next healthy words")
+    }
+
+    func setVocabulary(_ terms: String) async {}
+
+    func finishAbandoned() {
+        pending?.resume(returning: result("stale failed capture words"))
+        pending = nil
+    }
+
+    private func result(_ text: String) -> EngineTranscription {
+        .init(segments: [.init(text: text, start: 0, end: 1)], rawText: text,
+              decodingFallbacks: 0, resultCount: 1)
+    }
 }
