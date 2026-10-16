@@ -496,3 +496,34 @@ git diff --check
   timing, clipboard/typing, packaging, installation, or model inference.
   Maintainers own live acceptance and assembled-item integration. No runtime
   speedup was measured or claimed.
+
+## E3: bounded optional cleanup
+
+Owner: Flo maintainers. The October 15, 2026 efficiency request includes a
+separate cleanup budget and an explicit fast path. Recognition and deterministic
+corrections, voice formatting, and snippets still run before optional cleanup.
+The existing cleanup switch is the fast-path preference; its Settings help now
+explains that turning it off skips text-model processing.
+
+`DictationSessionPipeline.finalize` retains the composed transcript and gives
+cleanup three seconds. The cleanup deadline returns that transcript without
+waiting for a backend that ignores cancellation. If the original release
+deadline expires after recognition finished, it also delivers the retained
+transcript instead of failing the dictation. Normal recognition timeouts keep
+their existing failure and retry behavior. The completion helper is shared by
+normal cleanup, its own deadline, and release-deadline fallback. It emits one
+cleanup result and preserves spoken-order delivery. Cancellation removes the
+deadline, and late backend results cannot produce another outcome.
+
+`DictationCleanupDeadlineTests` covers an uncooperative backend, late output,
+the shorter release deadline, successful cleanup, cleanup disabled, cancellation,
+and a completed follower waiting behind a stalled cleanup. The initial six-test
+run reproduced six assertions failing before the deadline implementation.
+
+PASS: `swift test --disable-automatic-resolution`, 392 tests with zero failures
+and one optional render skip, on macOS 27.0.1, arm64, Swift 6.4. Focused pipeline,
+delivery, diagnostics, and stall checks passed 53 tests. Evidence is
+`/tmp/flo-e3-cleanup-red.log`, `focused.log`, and `tests.log` under the same
+`/tmp/flo-e3-cleanup-` prefix. Base is preview commit `47f1bb9` plus this change.
+Live model cleanup, rendered Settings help, microphone input, and target-app
+insertion were NOT RUN. No new settings key or public model policy was added.

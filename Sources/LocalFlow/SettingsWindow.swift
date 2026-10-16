@@ -643,7 +643,7 @@ struct SettingsView: View {
 
     private var cleanupPane: some View {
         Form {
-            Section("Transcript cleanup") {
+            Section {
                 Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
                 if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
                     Label {
@@ -654,6 +654,12 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                 }
+            } header: {
+                Text("Transcript cleanup")
+            } footer: {
+                Text("Turn off for fast dictation. Corrections, snippets, and voice formatting still apply. With cleanup on, slow responses fall back to the recognized text.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {
