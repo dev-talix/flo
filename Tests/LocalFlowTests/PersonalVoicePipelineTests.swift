@@ -23,7 +23,7 @@ final class PersonalVoicePipelineTests: XCTestCase {
             requests += 1
             if requests == 1 { throw CocoaError(.fileReadUnknown) }
             return "retried words"
-        }, cleanup: { .init(text: $0.text, succeeded: true) }, inject: { _, completion in completion() },
+        }, cleanup: { .init(text: $0.text, succeeded: true) }, inject: { _, _, ready, completion in completion(); ready() },
         recordTranscript: { _ in }, onOutcome: { outcome, _ in
             switch outcome {
             case .failed: failed.fulfill()
@@ -31,7 +31,7 @@ final class PersonalVoicePipelineTests: XCTestCase {
             default: XCTFail("Unexpected outcome")
             }
         }, onCancelled: { _ in XCTFail("Unexpected cancellation") }, onCommandCancelled: { _ in },
-        onProcessingCountChange: { _ in }, injectionInterval: 0)
+        onProcessingCountChange: { _ in })
         let generation = delivery.begin(.init(context: context, personalVoice: recording))
         delivery.release(generation: generation, samples: original)
         await fulfillment(of: [failed], timeout: 2)

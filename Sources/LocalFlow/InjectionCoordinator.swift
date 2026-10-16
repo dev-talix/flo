@@ -11,7 +11,7 @@ final class InjectionCoordinator {
     }
 
     enum Outcome {
-        case inject(String)
+        case inject(String, target: TextInjector.CommandTarget? = nil)
         case skip
     }
 
@@ -23,31 +23,29 @@ final class InjectionCoordinator {
     }
 
     private let stallTimeout: TimeInterval
-    private let injectionInterval: TimeInterval
     private let scheduleStall: (TimeInterval, DispatchWorkItem) -> Void
-    private let onInject: (String) -> Void
+    private let onInject: (String, TextInjector.CommandTarget?, @escaping () -> Void) -> Void
     private let onCancel: (Int, OperationKind) -> Void
     private let onProcessingCountChange: (Int) -> Void
 
     private var operations: [Int: Operation] = [:]
     private var nextSequenceToDrain = 0
     private var sequenceNumberCounter = 0
-    private var drainPending = false
+    private var activeDelivery: UUID?
+    private var isDraining = false
     private var headStallTimeout: DispatchWorkItem?
     private var stalledHeadSequence: Int?
 
     init(
         stallTimeout: TimeInterval,
-        injectionInterval: TimeInterval = 0.4,
         scheduleStall: @escaping (TimeInterval, DispatchWorkItem) -> Void = { delay, work in
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         },
-        onInject: @escaping (String) -> Void,
+        onInject: @escaping (String, TextInjector.CommandTarget?, @escaping () -> Void) -> Void,
         onCancel: @escaping (Int, OperationKind) -> Void,
         onProcessingCountChange: @escaping (Int) -> Void
     ) {
         self.stallTimeout = stallTimeout
-        self.injectionInterval = injectionInterval
         self.scheduleStall = scheduleStall
         self.onInject = onInject
         self.onCancel = onCancel
@@ -95,7 +93,9 @@ final class InjectionCoordinator {
     }
 
     private func drain() {
-        guard !drainPending else { return }
+        guard activeDelivery == nil, !isDraining else { return }
+        isDraining = true
+        defer { isDraining = false }
 
         while let operation = operations[nextSequenceToDrain], let outcome = operation.outcome {
             if stalledHeadSequence == nextSequenceToDrain {
@@ -105,17 +105,20 @@ final class InjectionCoordinator {
             nextSequenceToDrain += 1
 
             switch outcome {
-            case .inject(let text):
+            case .inject(let text, let target):
                 operation.trace?.record(.injectionStarted, fields: [.sequence: Double(nextSequenceToDrain - 1)])
-                DictationTrace.$current.withValue(operation.trace) { onInject(text) }
+                let delivery = UUID()
+                activeDelivery = delivery
                 onProcessingCountChange(operations.count)
-                drainPending = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + injectionInterval) { [weak self] in
-                    guard let self else { return }
-                    self.drainPending = false
-                    self.drain()
+                DictationTrace.$current.withValue(operation.trace) {
+                    onInject(text, target) { [weak self] in
+                        guard let self, self.activeDelivery == delivery else { return }
+                        self.activeDelivery = nil
+                        self.drain()
+                    }
                 }
-                return
+                // Synchronous failures and typing fakes may already be ready.
+                if activeDelivery != nil { return }
             case .skip:
                 operation.trace?.record(.injectionSkipped)
                 onProcessingCountChange(operations.count)

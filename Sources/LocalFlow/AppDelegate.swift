@@ -165,6 +165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Safety nets: a paste can fail (secure input quirks, slow app) and a
     // transcription can error — neither should ever lose the user's words.
     private var recentTranscripts: [RecentDictation] = []
+    private var recordingCommandTarget: TextInjector.CommandTarget?
     private var commandTasks: [Int: Task<Void, Never>] = [:]
     /// Speech requests still owned by a pending command, including gate waiters.
     private var commandSpeechLifetimes: [Int: TranscriptionLifetime] = [:]
@@ -217,9 +218,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return TranscriptCleanupResult(text: request.text, succeeded: false)
             }
         },
-        inject: { [weak self] text, completion in
-            guard let self else { completion(); return }
-            self.injectCompletedText(text, completion: completion)
+        inject: { [weak self] text, target, ready, completion in
+            guard let self else { completion(); ready(); return }
+            self.injectCompletedText(text, target: target, ready: ready, completion: completion)
         },
         recordTranscript: { [weak self] text in self?.rememberTranscript(text) },
         onOutcome: { [weak self] outcome, release in
@@ -466,6 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey.cancelHold()
         commandHotkey.cancelHold()
         recordingIsCommand = false
+        recordingCommandTarget = nil
         cancelKey.deactivate()
         if isRecording {
             DiagLog.log("%@ while recording — discarding the recording", reason)
@@ -794,6 +796,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard generation == self.recordingGeneration else { return }
                 if self.isRecording {
                     self.isRecording = false
+                    self.recordingIsCommand = false
+                    self.recordingCommandTarget = nil
                     self.cancelActiveDictationSession()
                     // Release may never call stop now that the active flag is
                     // clear, so finish recorder-side cleanup here.
@@ -910,15 +914,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func commandKeyPressed() {
         guard modelLoaded, !isRecording else { return }
-        // A paste still waiting on our promised string blocks the target
-        // app, and an AX call into it would block us until the AX timeout.
-        if !TextInjector.isAwaitingPasteboardRead {
-            TextInjector.prepareSelectionAccess()
+        // Never make synchronous AX calls while an app awaits our promised paste.
+        guard !TextInjector.isAwaitingPasteboardRead else {
+            reportCommandTargetFailure()
+            return
         }
+        TextInjector.prepareSelectionAccess()
+        guard case .success(let target) = TextInjector.captureCommandTarget() else {
+            reportCommandTargetFailure()
+            return
+        }
+        recordingCommandTarget = target
         let model = Settings.ollamaCommandModel
         Task { await textModelPolicy.prewarm(model: model) }
         recordingIsCommand = true
         hotkeyPressed()
+        if !isRecording {
+            recordingIsCommand = false
+            recordingCommandTarget = nil
+        }
+    }
+
+    private func reportCommandTargetFailure() {
+        playCue("Basso")
+        state = .failed(UserFacingIssue(
+            summary: "Couldn't capture the voice edit target",
+            details: "Focus an editable text field with a readable selection and cursor range, wait for any pending paste, then try again."
+        ))
+        scheduleFailureRecovery()
     }
 
     private func commandKeyReleased() {
@@ -926,56 +949,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyReleased()
     }
 
-    /// The spoken instruction is in; grab whatever is selected in the
-    /// frontmost app and run the edit. Ordered through the same injection
-    /// queue as dictations so results never overtake each other.
-    private func runCommand(instruction: String, seq: Int, hudGeneration: Int?) {
+    /// Use the keypress snapshot throughout recognition and rewrite. The queue
+    /// carries it to TextInjector, which validates it immediately before dispatch.
+    private func runCommand(instruction: String, seq: Int, hudGeneration: Int?, target: TextInjector.CommandTarget) {
         guard dictationDelivery.isCommandPending(seq) else { return }
-        TextInjector.copySelection { [weak self] selectionResult in
-            guard let self, self.dictationDelivery.isCommandPending(seq) else { return }
-            let selection: String?
-            switch selectionResult {
-            case .success(let text):
-                selection = text
-            case .failure(let error):
+        let task = Task {
+            defer { self.mirrorOllamaReachability() }
+            do {
+                let result = try await CommandMode.run(instruction: instruction, selection: target.selection)
+                guard self.dictationDelivery.isCommandPending(seq) else { return }
+                guard !result.isEmpty else {
+                    self.completeCommand(seq, with: .skip)
+                    self.dismissHud(hudGeneration)
+                    return
+                }
+                self.completeCommand(seq, with: .inject(result, target: target))
+                self.dismissHud(hudGeneration)
+                DiagLog.log("command result queued (selection=%d chars, result=%d chars)",
+                            target.selection?.count ?? 0, result.count)
+            } catch {
+                guard self.dictationDelivery.isCommandPending(seq) else { return }
                 self.completeCommand(seq, with: .skip)
                 self.dismissHud(hudGeneration)
                 self.playCue("Basso")
                 self.state = .failed(UserFacingIssue(
-                    summary: "Couldn't read selected text",
+                    summary: "Couldn't apply the voice edit",
                     details: error.localizedDescription
                 ))
                 self.scheduleFailureRecovery()
-                return
             }
-            let task = Task {
-                defer { self.mirrorOllamaReachability() }
-                do {
-                    let result = try await CommandMode.run(instruction: instruction, selection: selection)
-                    guard self.dictationDelivery.isCommandPending(seq) else { return }
-                    guard !result.isEmpty else {
-                        self.completeCommand(seq, with: .skip)
-                        self.dismissHud(hudGeneration)
-                        return
-                    }
-                    self.completeCommand(seq, with: .inject(result))
-                    self.dismissHud(hudGeneration)
-                    DiagLog.log("command mode applied (selection=%d chars, result=%d chars)",
-                          selection?.count ?? 0, result.count)
-                } catch {
-                    guard self.dictationDelivery.isCommandPending(seq) else { return }
-                    self.completeCommand(seq, with: .skip)
-                    self.dismissHud(hudGeneration)
-                    self.playCue("Basso")
-                    self.state = .failed(UserFacingIssue(
-                        summary: "Couldn't apply the voice edit",
-                        details: error.localizedDescription
-                    ))
-                    self.scheduleFailureRecovery()
-                }
-            }
-            self.commandTasks[seq] = task
         }
+        commandTasks[seq] = task
     }
 
     private func hotkeyReleased() {
@@ -996,6 +1000,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Whether this hold was a command must be latched here, at release:
         // the next press can flip the flag before the stop completion runs.
         let asCommand = recordingIsCommand
+        let commandTarget = recordingCommandTarget
+        recordingCommandTarget = nil
         recordingIsCommand = false
         let dictationGeneration = asCommand ? nil : activeDictationGeneration
         activeDictationGeneration = nil
@@ -1016,7 +1022,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 DictationTrace.$current.withValue(trace) {
                     self.process(samples: recording.samples, releasedAt: releasedAt,
-                             hudGeneration: generation, asCommand: asCommand,
+                             hudGeneration: generation, asCommand: asCommand, commandTarget: commandTarget,
                              dictationGeneration: dictationGeneration, nativeAudio: recording.nativeAudio)
                 }
             }
@@ -1063,10 +1069,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         releasedAt: Date,
         hudGeneration: Int? = nil,
         asCommand: Bool = false,
+        commandTarget: TextInjector.CommandTarget? = nil,
         dictationGeneration: Int? = nil,
         nativeAudio: NativeAudioRecording? = nil
     ) {
         if asCommand {
+            guard let commandTarget else {
+                reportCommandTargetFailure()
+                dismissHud(hudGeneration)
+                return
+            }
             let audio = DictationAudioPreparation(samples: rawSamples)
             guard audio.isAdmitted else {
                 reportHeardNothing()
@@ -1104,7 +1116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         raw,
                         corrections: context.corrections
                     )
-                    self.runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
+                    self.runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration, target: commandTarget)
                 } catch Transcriber.TranscriberError.noSpeech {
                     guard self.dictationDelivery.isCommandPending(seq) else { return }
                     self.completeCommand(seq, with: .skip)
@@ -1217,11 +1229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleFailureRecovery()
     }
 
-    private func injectCompletedText(_ text: String, completion: @escaping () -> Void) {
+    private func injectCompletedText(_ text: String, target: TextInjector.CommandTarget?, ready: @escaping () -> Void, completion: @escaping () -> Void) {
         let trace = DictationTrace.current
         // The cue acknowledges dispatch. Clipboard restoration happens later
         // and cannot establish whether the target app inserted the text.
-        TextInjector.inject(text, onDispatch: { [weak self] in
+        TextInjector.inject(text, target: target, onReadyForNext: ready, onDispatch: { [weak self] in
             if let ms = trace?.millisecondsSinceRelease {
                 self?.lastLatencyMs = Int(ms)
             }

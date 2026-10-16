@@ -60,7 +60,7 @@ final class WeakLifetime {
     }
     func fail(_ error: Error) { pending.removeValue(forKey: 0)!.resume(throwing: error) }
 }
-enum InjectionCoordinator { enum Outcome { case skip, inject(String) } }
+enum InjectionCoordinator { enum Outcome { case skip, inject(String, target: TextInjector.CommandTarget? = nil) } }
 @MainActor final class Delivery {
     var next = 0
     var pending: Set<Int> = []
@@ -72,21 +72,16 @@ enum InjectionCoordinator { enum Outcome { case skip, inject(String) } }
         guard pending.remove(seq) != nil else { return }
         switch outcome {
         case .skip: skipped.append(seq)
-        case .inject(let text): delivered.append(text)
+        case .inject(let text, _): delivered.append(text)
         }
     }
     func cancel(generation: Int, interruptInference: Bool) {}
     func release(generation: Int, samples: [Float], nativeAudio: NativeAudioRecording?,
                  releasedAt: Date, hudGeneration: Int?) {}
 }
-@MainActor enum TextInjector {
-    static var copies = 0
-    static var delayed = false
-    static var callback: ((Result<String?, Error>) -> Void)?
-    static func copySelection(_ completion: @escaping (Result<String?, Error>) -> Void) {
-        copies += 1
-        if delayed { callback = completion } else { completion(.success("selected text")) }
-    }
+enum TextInjector {
+    struct CommandTarget { let selection: String? }
+    enum SelectionError: Error { case unavailable }
 }
 @MainActor enum CommandMode {
     static var calls = 0
@@ -124,6 +119,7 @@ final class Recorder { var stops = 0; func stop(_ callback: (Int) -> Void) { sto
     var restingState = State.idle
     var isRecording = false
     var recordingIsCommand = false
+    var recordingCommandTarget: TextInjector.CommandTarget?
     var recordingGeneration = 1
     var releasedDictation: (generation: Int, hudGeneration: Int)?
     var activeDictationTrace: DictationTrace?
@@ -147,9 +143,18 @@ final class Recorder { var stops = 0; func stop(_ callback: (Int) -> Void) { sto
 '''
 
 CASES = r'''
-    func start() { process(samples: [0.1], releasedAt: Date(), hudGeneration: 1, asCommand: true) }
+    func start() {
+        process(samples: [0.1], releasedAt: Date(), hudGeneration: 1, asCommand: true,
+                commandTarget: .init(selection: "selected text"))
+    }
     func verify(_ scenario: String) async {
         defer { precondition(speechOwnerCount == 0, "command must release its speech ownership") }
+        if scenario == "missing-target" {
+            process(samples: [0.1], releasedAt: Date(), hudGeneration: 1, asCommand: true)
+            precondition(transcriber.received.isEmpty && commandTasks.isEmpty)
+            precondition(dictationDelivery.pending.isEmpty && recoveries == 1)
+            return
+        }
         if scenario == "discard-held" {
             isRecording = true
             recordingIsCommand = true
@@ -167,7 +172,7 @@ CASES = r'''
             await task.value
             precondition(!task.isCancelled && transcriber.started == 0)
             precondition(dictationDelivery.pending.isEmpty && commandTasks.isEmpty)
-            precondition(TextInjector.copies == 0 && CommandMode.calls == 0)
+            precondition(CommandMode.calls == 0)
             return
         }
         await until { !self.transcriber.received.isEmpty }
@@ -183,7 +188,7 @@ CASES = r'''
             precondition(!task.isCancelled && transcriber.started == 0)
             precondition(transcriber.abandonments == 0 && transcriber.interruptions == 0)
             precondition(dictationDelivery.pending.isEmpty && commandTasks.isEmpty)
-            precondition(TextInjector.copies == 0 && CommandMode.calls == 0)
+            precondition(CommandMode.calls == 0)
             await transcriber.gate.release()
             return
         }
@@ -204,7 +209,7 @@ CASES = r'''
             precondition(transcriber.interruptions == 0 && transcriber.pending.count == 1)
             transcriber.finish()
             await task.value
-            precondition(TextInjector.copies == 0 && CommandMode.calls == 0)
+            precondition(CommandMode.calls == 0)
             precondition(dictationDelivery.delivered.isEmpty && recoveries == 0)
         case "timeout-speech":
             // DictationDelivery removes pending identity before its timeout callback.
@@ -215,42 +220,35 @@ CASES = r'''
             transcriber.finish()
             await task.value
             precondition(commandTasks.isEmpty && commandHudGenerations.isEmpty && recoveries == 1)
-            precondition(TextInjector.copies == 0 && CommandMode.calls == 0)
-        case "normal-warm", "escape-llm", "timeout-llm", "escape-selection":
+            precondition(CommandMode.calls == 0)
+        case "normal-warm", "escape-llm", "timeout-llm":
             let lifetime = weakLifetime.value!
-            TextInjector.delayed = scenario == "escape-selection"
             transcriber.finish()
             await task.value
             precondition(lifetime.isInvalidated && transcriber.abandonments == 0)
-            precondition(transcriber.interruptions == 0 && TextInjector.copies == 1)
-            if scenario == "escape-selection" {
-                cancelFromKeyboard()
-                TextInjector.callback!(.success("late selection"))
-                precondition(CommandMode.calls == 0 && dictationDelivery.delivered.isEmpty)
+            precondition(transcriber.interruptions == 0)
+            await until { CommandMode.calls == 1 }
+            let llmTask = commandTasks[0]!
+            if scenario == "normal-warm" {
+                CommandMode.finish()
+                await llmTask.value
+                precondition(dictationDelivery.delivered == ["edited text"])
+                precondition(!llmTask.isCancelled && commandTasks.isEmpty)
+                // Another command reaches the same gate without any speech interruption.
+                start()
+                await until { self.transcriber.started == 2 }
+                let next = commandTasks[1]!
+                transcriber.finish(1, text: "")
+                await next.value
+                precondition(transcriber.abandonments == 0 && transcriber.interruptions == 0)
             } else {
-                await until { CommandMode.calls == 1 }
-                let llmTask = commandTasks[0]!
-                if scenario == "normal-warm" {
-                    CommandMode.finish()
-                    await llmTask.value
-                    precondition(dictationDelivery.delivered == ["edited text"])
-                    precondition(!llmTask.isCancelled && commandTasks.isEmpty)
-                    // Another command reaches the same gate without any speech interruption.
-                    start()
-                    await until { self.transcriber.started == 2 }
-                    let next = commandTasks[1]!
-                    transcriber.finish(1, text: "")
-                    await next.value
-                    precondition(transcriber.abandonments == 0 && transcriber.interruptions == 0)
-                } else {
-                    if scenario == "escape-llm" { cancelFromKeyboard() }
-                    else { dictationDelivery.pending.remove(0); cancelCommand(0) }
-                    await until { CommandMode.cancellations == 1 }
-                    precondition(llmTask.isCancelled && transcriber.abandonments == 0)
-                    CommandMode.finish()
-                    await llmTask.value
-                    precondition(dictationDelivery.delivered.isEmpty && transcriber.interruptions == 0)
-                }
+                if scenario == "escape-llm" { cancelFromKeyboard() }
+                else { dictationDelivery.pending.remove(0); cancelCommand(0) }
+                await until { CommandMode.cancellations == 1 }
+                precondition(llmTask.isCancelled && transcriber.abandonments == 0)
+                CommandMode.finish()
+                await llmTask.value
+                precondition(dictationDelivery.delivered.isEmpty && transcriber.interruptions == 0)
             }
         case "empty", "no-speech", "speech-error":
             let lifetime = weakLifetime.value!
@@ -260,7 +258,7 @@ CASES = r'''
             await task.value
             precondition(lifetime.isInvalidated && transcriber.abandonments == 0)
             precondition(commandTasks.isEmpty && commandHudGenerations.isEmpty)
-            precondition(dictationDelivery.pending.isEmpty && TextInjector.copies == 0)
+            precondition(dictationDelivery.pending.isEmpty)
             precondition(heardNothing == (scenario == "speech-error" ? 0 : 1))
             precondition(recoveries == (scenario == "speech-error" ? 1 : 0))
         default: fatalError("unknown scenario")
@@ -302,7 +300,7 @@ class CommandAbandonmentBoundaryTests(unittest.TestCase):
         source = (root / "Sources/LocalFlow/AppDelegate.swift").read_text()
         methods = "\n".join(method(source, name) for name in (
             "process", "runCommand", "cancelFromKeyboard", "completeCommand",
-            "cancelCommand", "discardActiveRecording", "dismissHud"))
+            "cancelCommand", "discardActiveRecording", "dismissHud", "reportCommandTargetFailure"))
         # Use actual stored declarations as well as methods, including on the
         # unfixed parent for a behavioral red run with its speech-phase set.
         properties = "\n".join(line for line in source.splitlines() if any(
@@ -353,8 +351,8 @@ class CommandAbandonmentBoundaryTests(unittest.TestCase):
     def test_timeout_cancels_only_text_model_and_rejects_late_edit(self):
         self.run_case("timeout-llm")
 
-    def test_escape_rejects_late_selection_without_running_text_model(self):
-        self.run_case("escape-selection")
+    def test_missing_captured_target_skips_speech_without_ownership(self):
+        self.run_case("missing-target")
 
     def test_empty_completion_clears_lifetime_without_abandonment(self):
         self.run_case("empty")

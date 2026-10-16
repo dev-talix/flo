@@ -17,6 +17,7 @@ enum TextInjector {
         case clipboardChanged
         /// Some or all keyboard events could not be created.
         case dispatchFailed
+        case targetChanged
 
         var userFacingIssue: UserFacingIssue? {
             switch self {
@@ -26,6 +27,11 @@ enum TextInjector {
                 return UserFacingIssue(
                     summary: "Clipboard changed after paste",
                     details: "The paste shortcut was sent, but the clipboard changed before restoration. Check whether the text appeared before copying it from Recent Dictations."
+                )
+            case .targetChanged:
+                return UserFacingIssue(
+                    summary: "Voice edit target changed",
+                    details: "The original app, text field, or selection changed. Nothing was sent. Copy the result from Recent Dictations to use it."
                 )
             case .dispatchFailed:
                 return UserFacingIssue(
@@ -42,6 +48,7 @@ enum TextInjector {
     private static var savedItems: [NSPasteboardItem]?
     private static var restoreWork: DispatchWorkItem?
     private static var pendingCompletion: ((_ undisturbed: Bool, _ readObserved: Bool) -> Void)?
+    private static var pendingReady: (() -> Void)?
     private static var ourChangeCount = -1
     private static var restoreGeneration = 0
     private static var dispatchedAt: TimeInterval?
@@ -67,26 +74,48 @@ enum TextInjector {
 
     /// `completion` runs on the main queue and reports event dispatch and
     /// clipboard disturbance. Neither confirms insertion into the target app.
+    /// `onReadyForNext` releases queue ownership after a read or resolution,
+    /// independently of later restoration, or after typing/failure completes.
     static func inject(
         _ text: String,
-        pasteboard: NSPasteboard = .general,
+        pasteboard: any InjectionClipboard = NSPasteboard.general,
+        target: CommandTarget? = nil,
+        validateTarget: @MainActor (CommandTarget) -> Bool = { validateCommandTarget($0) },
         timing: RestoreTiming = .standard,
         isSecureInputEnabled: () -> Bool = { IsSecureEventInputEnabled() },
         postPaste: @MainActor () -> Bool = { postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_V), flags: .maskCommand) },
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         schedule: @escaping Scheduler = { delay, work in DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work) },
+        typeText: (@MainActor (String, @escaping (Bool) -> Void) -> Void)? = nil,
+        onReadyForNext: (() -> Void)? = nil,
         onDispatch: (() -> Void)? = nil,
         completion: ((InjectionResult) -> Void)? = nil
     ) {
         let trace = DictationTrace.current
         guard !text.isEmpty else {
             completion?(.dispatchFailed)
+            onReadyForNext?()
             return
         }
-
         if isSecureInputEnabled() {
+            guard target == nil else {
+                completion?(.targetChanged)
+                onReadyForNext?()
+                return
+            }
             // Password field or similar: avoid the clipboard entirely.
-            typeString(text, trace: trace, onDispatch: onDispatch, completion: completion)
+            let finished: (InjectionResult) -> Void = { result in
+                completion?(result)
+                onReadyForNext?()
+            }
+            if let typeText {
+                typeText(text) { posted in
+                    if posted { onDispatch?() }
+                    finished(posted ? .dispatched : .dispatchFailed)
+                }
+            } else {
+                typeString(text, trace: trace, onDispatch: onDispatch, completion: finished)
+            }
             return
         }
 
@@ -94,15 +123,22 @@ enum TextInjector {
         // the previous one transcribes is allowed). Keep the snapshot from
         // the FIRST of the sequence — snapshotting now would capture the
         // previous dictation as "the user's clipboard" and lose the real one.
+        // Reading a previous clipboard provider may block. Validate the command
+        // after that read, before changing clipboard or restoration ownership.
+        let newSnapshot = savedItems == nil || pasteboard.changeCount != ourChangeCount
+            ? pasteboard.snapshotItems() : nil
+        if let target, !validateTarget(target) {
+            completion?(.targetChanged)
+            onReadyForNext?()
+            return
+        }
         restoreWork?.cancel()
         restoreWork = nil
         restoreGeneration &+= 1
         // A superseded injection never reaches its restore work — resolve it
         // now with the same signal the work item would have used.
         resolvePending(undisturbed: pasteboard.changeCount == ourChangeCount)
-        if savedItems == nil || pasteboard.changeCount != ourChangeCount {
-            savedItems = snapshot(of: pasteboard)
-        }
+        if let newSnapshot { savedItems = newSnapshot }
 
         let generation = restoreGeneration
         let scheduleRestore: (TimeInterval) -> Void = { delay in
@@ -112,7 +148,7 @@ enum TextInjector {
         }
         // Promise the text instead of writing it, so the first reader tells
         // us the paste is being serviced.
-        let receipt = PasteReceipt(text: text) {
+        let receipt = PasteReceipt(text: text, onRead: {
             let read = { noteRead(generation, at: now(), timing: timing, trace: trace, scheduleRestore: scheduleRestore) }
             // In-process reads call the provider synchronously and
             // out-of-process reads are serviced on the main run loop, so
@@ -122,15 +158,21 @@ enum TextInjector {
             } else {
                 DispatchQueue.main.async(execute: read)
             }
-        }
+        }, onFinish: {
+            // Provider teardown may run inside our own clipboard writes.
+            // Resolve external replacement on the next turn, after changeCount moves.
+            DispatchQueue.main.async {
+                guard generation == restoreGeneration,
+                      pasteboard.changeCount != ourChangeCount else { return }
+                restoreWork?.cancel()
+                restoreWork = nil
+                pasteReceipt = nil
+                savedItems = nil
+                resolvePending(undisturbed: false)
+            }
+        })
         pasteReceipt = receipt
-        let item = NSPasteboardItem()
-        if !item.setDataProvider(receipt, forTypes: [.string]) {
-            item.setString(text, forType: .string)
-        }
-        item.setData(Data(), forType: transientType)
-        pasteboard.clearContents()
-        pasteboard.writeObjects([item])
+        pasteboard.promise(receipt)
         ourChangeCount = pasteboard.changeCount
         guard postPaste() else {
             trace?.record(.pasteDispatched, status: .failed)
@@ -138,15 +180,16 @@ enum TextInjector {
             pasteReceipt = nil
             if let saved = savedItems {
                 savedItems = nil
-                pasteboard.clearContents()
-                pasteboard.writeObjects(saved)
+                pasteboard.replaceItems(saved)
             }
             completion?(.dispatchFailed)
+            onReadyForNext?()
             return
         }
         trace?.record(.pasteDispatched, status: .success)
         let dispatched = now()
         dispatchedAt = dispatched
+        pendingReady = onReadyForNext
         onDispatch?()
         pendingCompletion = { undisturbed, readObserved in
             trace?.record(.clipboardWindowResolved, status: undisturbed ? .unchangedClipboard : .changedClipboard, fields: [
@@ -194,9 +237,13 @@ enum TextInjector {
         trace?.record(.pasteboardRead, fields: [.readLatencyMs: elapsed * 1000])
         restoreWork?.cancel()
         scheduleRestore(restoreDelay(sinceDispatch: elapsed, timing: timing))
+        // Let the provider return its bytes before another paste replaces them.
+        let ready = pendingReady
+        pendingReady = nil
+        DispatchQueue.main.async { ready?() }
     }
 
-    private static func restore(_ generation: Int, on pasteboard: NSPasteboard) {
+    private static func restore(_ generation: Int, on pasteboard: any InjectionClipboard) {
         guard generation == restoreGeneration else { return }
         restoreWork = nil
         pasteReceipt = nil
@@ -207,8 +254,7 @@ enum TextInjector {
         // paste landed first is unknowable.
         let undisturbed = pasteboard.changeCount == ourChangeCount
         if undisturbed, let saved {
-            pasteboard.clearContents()
-            pasteboard.writeObjects(saved)
+            pasteboard.replaceItems(saved)
         }
         resolvePending(undisturbed: undisturbed)
     }
@@ -219,9 +265,12 @@ enum TextInjector {
         guard let done = pendingCompletion else { return }
         let readObserved = readObservedAt != nil
         pendingCompletion = nil
+        let ready = pendingReady
+        pendingReady = nil
         dispatchedAt = nil
         readObservedAt = nil
         done(undisturbed, readObserved)
+        ready?()
     }
 
     enum SelectionError: Error, LocalizedError, Equatable {
@@ -281,28 +330,114 @@ enum TextInjector {
             return
         }
         let focusedElement = focus as! AXUIElement
-        let (selectionError, selection) = readAttribute(focusedElement, kAXSelectedTextAttribute as CFString)
-        if selectionError == .noValue {
-            completion(.success(nil))
-        } else if selectionError == .success, let text = selection as? String {
-            completion(.success(text.isEmpty ? nil : text))
-        } else {
-            completion(.failure(.unavailable))
-        }
+        completion(selectedText(in: focusedElement, readAttribute: readAttribute))
     }
 
-    // MARK: - Clipboard save/restore
+    private static func selectedText(
+        in element: AXUIElement, readAttribute: SelectionAttributeReader
+    ) -> Result<String?, SelectionError> {
+        let (error, value) = readAttribute(element, kAXSelectedTextAttribute as CFString)
+        if error == .noValue { return .success(nil) }
+        guard error == .success, let text = value as? String else { return .failure(.unavailable) }
+        return .success(text.isEmpty ? nil : text)
+    }
 
-    private static func snapshot(of pasteboard: NSPasteboard) -> [NSPasteboardItem] {
-        (pasteboard.pasteboardItems ?? []).map { item in
-            let copy = NSPasteboardItem()
-            for type in item.types {
-                if let data = item.data(forType: type) {
-                    copy.setData(data, forType: type)
-                }
-            }
-            return copy
+    /// AX application identity includes the process. Element and window identity
+    /// distinguish fields and windows within that process; the range also guards a cursor.
+    struct CommandTarget {
+        let application: AXUIElement
+        let element: AXUIElement
+        let window: AXUIElement?
+        let selection: String?
+        let range: CFRange
+    }
+
+    private static func selectedRange(
+        in element: AXUIElement, readAttribute: SelectionAttributeReader
+    ) -> CFRange? {
+        let (error, value) = readAttribute(element, kAXSelectedTextRangeAttribute as CFString)
+        var range = CFRange()
+        guard error == .success, let value,
+              CFGetTypeID(value) == AXValueGetTypeID(),
+              AXValueGetValue(value as! AXValue, .cfRange, &range),
+              range.location >= 0, range.length >= 0 else { return nil }
+        return range
+    }
+
+    static func captureCommandTarget(
+        isSecureInputEnabled: () -> Bool = { IsSecureEventInputEnabled() },
+        focusedApplication: @MainActor () -> AXUIElement? = frontmostAccessibilityApplication,
+        readAttribute: SelectionAttributeReader = selectionAttribute
+    ) -> Result<CommandTarget, SelectionError> {
+        guard !isAwaitingPasteboardRead, !isSecureInputEnabled(),
+              let app = focusedApplication() else { return .failure(.unavailable) }
+        let (focusError, focus) = readAttribute(app, kAXFocusedUIElementAttribute as CFString)
+        guard focusError == .success, let focus,
+              CFGetTypeID(focus) == AXUIElementGetTypeID() else { return .failure(.unavailable) }
+        let element = focus as! AXUIElement
+        guard let range = selectedRange(in: element, readAttribute: readAttribute) else { return .failure(.unavailable) }
+        let selection: String?
+        switch selectedText(in: element, readAttribute: readAttribute) {
+        case .success(let text): selection = text
+        case .failure(let error): return .failure(error)
         }
+        // A nonempty range without readable text is not an insertion point.
+        guard (range.length == 0) == (selection == nil) else { return .failure(.unavailable) }
+        let (windowError, windowValue) = readAttribute(app, kAXFocusedWindowAttribute as CFString)
+        let window: AXUIElement?
+        if windowError == .success, let windowValue, CFGetTypeID(windowValue) == AXUIElementGetTypeID() {
+            window = (windowValue as! AXUIElement)
+        } else if windowError == .attributeUnsupported || windowError == .noValue {
+            window = nil
+        } else {
+            return .failure(.unavailable)
+        }
+
+        // AX reads can block while another process changes focus or selection.
+        // Check the selection again, then close with live window/field/app identity
+        // so retained attributes from an unfocused element cannot approve a paste.
+        guard let finalRange = selectedRange(in: element, readAttribute: readAttribute),
+              range.location == finalRange.location, range.length == finalRange.length,
+              case .success(let finalSelection) = selectedText(in: element, readAttribute: readAttribute),
+              selection == finalSelection else { return .failure(.unavailable) }
+        let (finalWindowError, finalWindow) = readAttribute(app, kAXFocusedWindowAttribute as CFString)
+        if let window {
+            guard finalWindowError == .success, let finalWindow, CFEqual(window, finalWindow) else {
+                return .failure(.unavailable)
+            }
+        } else {
+            guard finalWindowError == .attributeUnsupported || finalWindowError == .noValue else {
+                return .failure(.unavailable)
+            }
+        }
+        let (finalFocusError, finalFocus) = readAttribute(app, kAXFocusedUIElementAttribute as CFString)
+        guard finalFocusError == .success, let finalFocus, CFEqual(element, finalFocus),
+              let finalApp = focusedApplication(), CFEqual(app, finalApp),
+              !isSecureInputEnabled() else { return .failure(.unavailable) }
+        return .success(CommandTarget(application: app, element: element, window: window,
+                                      selection: selection, range: range))
+    }
+
+    static func validateCommandTarget(
+        _ target: CommandTarget,
+        isSecureInputEnabled: () -> Bool = { IsSecureEventInputEnabled() },
+        focusedApplication: @MainActor () -> AXUIElement? = frontmostAccessibilityApplication,
+        readAttribute: SelectionAttributeReader = selectionAttribute
+    ) -> Bool {
+        guard case .success(let current) = captureCommandTarget(
+            isSecureInputEnabled: isSecureInputEnabled,
+            focusedApplication: focusedApplication, readAttribute: readAttribute
+        ) else { return false }
+        let sameWindow: Bool
+        switch (target.window, current.window) {
+        case (nil, nil): sameWindow = true
+        case (.some(let original), .some(let focused)): sameWindow = CFEqual(original, focused)
+        default: sameWindow = false
+        }
+        return CFEqual(target.application, current.application)
+            && CFEqual(target.element, current.element) && sameWindow
+            && target.range.location == current.range.location && target.range.length == current.range.length
+            && target.selection == current.selection
     }
 
     // MARK: - Synthesized events
@@ -378,13 +513,15 @@ enum TextInjector {
 /// Supplies the dictation text on first read and reports that read. AppKit
 /// calls the provider at most once per type, then serves cached bytes, so
 /// the receipt is one-shot and can't tell the target app from anyone else.
-private final class PasteReceipt: NSObject, NSPasteboardItemDataProvider {
+final class PasteReceipt: NSObject, NSPasteboardItemDataProvider {
     private var text: String?
     private let onRead: () -> Void
+    private let onFinish: () -> Void
 
-    init(text: String, onRead: @escaping () -> Void) {
+    init(text: String, onRead: @escaping () -> Void, onFinish: @escaping () -> Void) {
         self.text = text
         self.onRead = onRead
+        self.onFinish = onFinish
     }
 
     func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
@@ -396,8 +533,48 @@ private final class PasteReceipt: NSObject, NSPasteboardItemDataProvider {
     }
 
     /// Fires when the item leaves the pasteboard, including during our own
-    /// clearContents(). Only drops the text, never drives state.
+    /// clearContents(). The owner distinguishes external replacement by generation.
     func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
+        finish()
+    }
+
+    func finish() {
         text = nil
+        onFinish()
+    }
+}
+
+/// The clipboard boundary used by injection. Tests keep receipts and snapshots in memory.
+@MainActor
+protocol InjectionClipboard: AnyObject {
+    var changeCount: Int { get }
+    func snapshotItems() -> [NSPasteboardItem]
+    func replaceItems(_ items: [NSPasteboardItem])
+    func promise(_ receipt: PasteReceipt)
+}
+
+extension NSPasteboard: InjectionClipboard {
+    func snapshotItems() -> [NSPasteboardItem] {
+        (pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+            }
+            return copy
+        }
+    }
+
+    func replaceItems(_ items: [NSPasteboardItem]) {
+        clearContents()
+        writeObjects(items)
+    }
+
+    func promise(_ receipt: PasteReceipt) {
+        let item = NSPasteboardItem()
+        if !item.setDataProvider(receipt, forTypes: [.string]) {
+            receipt.pasteboard(nil, item: item, provideDataForType: .string)
+        }
+        item.setData(Data(), forType: TextInjector.transientType)
+        replaceItems([item])
     }
 }

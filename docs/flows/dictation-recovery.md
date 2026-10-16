@@ -730,6 +730,131 @@ untouched diagnostic, injection, and startup-test code remain. The parent
 integration owner must assemble the stack and perform any authorized runtime
 validation. This task creates local commits only.
 
+## R3: Pace delivery by clipboard reads and retain command identity
+
+Owner: Flo maintainers. The October 15, 2026 reliability report R3 authorizes
+clipboard-aware queue pacing and command target/selection identity. The isolated
+base is `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`; E1
+`dc5df59821180d6ca224b282eb65ae6f0eefc656` was cherry-picked unchanged as
+`b0873cd980a8211a29a9ba758dbb4263501f00d8`. Other efficiency and reliability
+items, model policy, installed apps, and live input are outside this change.
+
+Intended and implemented path:
+
+- `InjectionCoordinator.drain` retains FIFO ownership until the injector calls
+  its readiness callback. It no longer advances after a fixed 400 ms. Delivery
+  UUIDs ignore duplicate callbacks; synchronous failures continue draining
+  without recursive delivery. Existing command and stalled-head deadlines stay.
+- `TextInjector.inject` uses the existing `PasteReceipt` first-read signal to
+  release the next delivery on the next main-queue turn, after the provider
+  returns its bytes. Restoration still follows the existing floor/grace/ceiling
+  timing. Receipt timeout, external provider finish, empty input, event failure,
+  and completed typing also release queue ownership. Provider finish uses the
+  generation and change count to distinguish external copies from Flo's writes.
+- `DictationDelivery` passes readiness separately from final completion. Its
+  existing active-injection tracking keeps Quit blocked through restoration.
+  A following paste still preserves the first clipboard snapshot unless the
+  user copied something in between. History records output before delivery.
+- `AppDelegate.commandKeyPressed` prepares AX access and captures a
+  `TextInjector.CommandTarget` before recording. Release latches that immutable
+  value across audio handoff, STT, rewrite, and the delivery queue. The rewrite
+  uses its captured selection. `TextInjector.validateCommandTarget` compares
+  AX application/process identity, focused element, focused window when exposed,
+  selected text, and range after reading the clipboard snapshot and before any
+  clipboard write or dispatch. Reading another clipboard provider can block,
+  so validation must follow that read. Cursor-only commands
+  require the same field and zero-length range. Unreadable identity, secure
+  input, or an outstanding promised paste safely refuses capture. Cancellation
+  and recording startup failure clear the held snapshot.
+- A changed or unreadable target produces `InjectionResult.targetChanged` with
+  an explicit warning and no paste, typing, or clipboard write. The generated
+  result remains in Recent Dictations and history. Ordinary dictation retains
+  its focused-app policy. A command target that changes and returns to the same
+  observable identity passes validation; this is a current-state guard.
+
+This checkout had AX selection readers but no existing target identity/range
+helpers. `selectedText` is shared by the old selection reader and target capture.
+`CommandTarget` is the new immutable value carried by command flow and the
+existing queue. `InjectionClipboard` is a narrow boundary implemented by
+`NSPasteboard` and the in-memory test fake. Tests reuse the actual `PasteReceipt`;
+there is no additional receipt type or scheduler.
+
+Acceptance checks are in `Tests/LocalFlowTests/TargetedDeliveryTests.swift`.
+They use in-memory clipboard receipts, local AX identity objects and attribute
+readers, a fake clock/scheduler, fake typing, and stubbed paste events. No test
+requires a system pasteboard, AX server requests, model inference, or microphone.
+The delayed-reader case waits 550 ms, checks the first receipt is still present,
+then verifies FIFO delivery after reads and restoration as a separate completion.
+Other cases cover timeout, changed clipboard, cancellation, duplicate signals,
+empty input, paste failure, typing success/failure, target changes during
+recognition/rewrite/queue wait, unchanged replacement, cursor-only commands,
+unavailable identity, a target change while reading the previous clipboard,
+and ordinary dictation focus policy. Existing
+`TextInjectorTests` now use the same in-memory clipboard boundary.
+
+Verification limits: the receipt observes the first reader, which need not be
+the target app. The existing transient marker asks compliant clipboard managers
+to skip these items. The target guard compares current AX state before event
+dispatch; it cannot make focus and event delivery atomic or prove insertion.
+Command phase tests simulate recognition/rewrite completion at the delivery
+boundary. Real AppDelegate hotkey/STT/model wiring is compiled but not exercised
+end to end. Flo maintainers own live AX, clipboard-manager, target-app,
+installation, and assembled-stack acceptance.
+
+Verified on macOS 27.0.1, arm64, Swift 6.4, in this worktree. The local `.build`
+was copied from the completed E1 worktree, then SwiftPM rebuilt for this path
+with automatic resolution disabled. Evidence prefix: `/tmp/flo-r3-`. The patch
+artifact `final.diff` is relative to the unchanged E1 cherry-pick above; the R3
+commit SHA is returned in the implementation handoff.
+
+Exact final commands:
+
+```sh
+swift test --disable-automatic-resolution --filter 'InjectionCoordinatorTests|TextInjectorTests|TargetedDeliveryTests|DictationDeliveryTests|DictationTraceTests|DictationSessionPipelineTests|DictationSessionStallTests|DictationAudioPreparationTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|AppTerminationTests|AudioCaptureLifecycleTests|UserFacingIssueTests'
+swift test -c release --disable-automatic-resolution --filter 'InjectionCoordinatorTests|TextInjectorTests|TargetedDeliveryTests|DictationDeliveryTests|DictationTraceTests|DictationSessionPipelineTests|DictationSessionStallTests|DictationAudioPreparationTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|AppTerminationTests|AudioCaptureLifecycleTests|UserFacingIssueTests'
+git diff --check
+git diff --exit-code dc5df59821180d6ca224b282eb65ae6f0eefc656 b0873cd980a8211a29a9ba758dbb4263501f00d8
+```
+
+- PASS, exit 0: final debug selection, 123 tests, zero failures or skips,
+  `final-debug.log`. This includes 16 new `TargetedDeliveryTests` and one new
+  coordinator callback/FIFO test.
+- PASS, exit 0: the same final selection in release, 123 tests, zero failures
+  or skips, `final-release.log`.
+- PASS, exit 0: the earlier focused selection, 54 tests, `focused-final.log`.
+  Earlier expanded debug/release selections each passed 122 tests in
+  `expanded-debug.log` and `expanded-release.log` before the snapshot-read case.
+- EXPECTED FAIL, exit 1: temporarily replacing readiness pacing with the former
+  400 ms timer, one delayed-reader test and four failed assertions,
+  `pacing-mutation.log`. It caught the second dictation replacing the unread first.
+- EXPECTED FAIL, exit 1: temporarily bypassing target validation, four tests and
+  13 failed assertions, zero unexpected failures, `target-mutation-final.log`.
+  Recognition, rewrite, queued delivery, and clipboard-snapshot changes all
+  caught forbidden events. Both mutations were restored before final checks.
+- PASS, exit 0: whitespace/diff check, `diff-check.log`; identical E1 tree check,
+  `prerequisite-check.log`.
+- NOT RUN: full Swift suite, shell/Python checks for unrelated packaging/startup,
+  live app, system clipboard, AX requests, microphone, installed-app replay,
+  model inference, packaging, installation, push, PR, merge, or delegation.
+
+Initial diagnostics are retained rather than counted as passed checks.
+`baseline-tests.log` was interrupted during compilation before tests ran to avoid
+its old private-pasteboard harness. `focused-tests.log` and `focused-rerun.log`
+failed to compile new actor-isolated default closures. `focused-pass.log`
+reached tests and exposed an unowned fake-harness lifetime during teardown.
+Actor annotations/default construction and harness teardown retention were fixed
+before `focused-final.log`. `target-mutation.log` is an earlier validation-bypass
+run with a secondary unread-paste failure; `target-mutation-final.log` supersedes
+it. Existing compiler concurrency/capture warnings remain visible in build logs.
+
+R3 integration with R1 updates the abandonment-retry fixture to the new delivery
+callback's separate queue-ready and restoration-complete signals. The initial
+combined build exposed its old two-argument signature and removed interval
+argument; production code compiled. The corrected fixture passed 39 focused
+stall, target, and queue tests, exit 0. Evidence:
+`/tmp/flo-session-stack-through-r4-debug.log` (initial compile failure) and
+`/tmp/flo-r3-r1-fixture-integration.log` (pass). Full assembled validation follows.
+
 ## R1 command follow-up: caller-owned speech abandonment, October 16, 2026
 
 Owner: Flo maintainers and the parent R1 integration agent. Requirement source:
@@ -816,3 +941,74 @@ The focused tests use fake engines and inert delivery callbacks. No new
 production abstraction, dependency, timer, or scheduler was introduced;
 command speech reuses R1's lifetime, gate, grace, and quarantine mechanisms.
 The parent agent owns integration into PR #50 and any later live acceptance.
+
+R1/R3 integration preserves command speech ownership while using the selection
+captured at keypress. The command boundary harness now supplies the captured
+target and uses R3's target-carrying injection outcome. Its former delayed
+selection-callback case is replaced by missing-target rejection because R3 no
+longer reads selection after recognition. All 13 caller cases pass, exit 0:
+`/tmp/flo-r1-r3-command-boundary-final.log`. The original ownership-only parent
+also passed 13 cases in `/tmp/flo-r1-command-stack-boundary.log`.
+
+## R3 repair: Reject focus changes during command target reads
+
+Owner: Flo maintainers; the parent task owns PR53 integration and R1 command
+lifetime. Requirement source: confirmed CS1 in
+`/Users/nikhlkapadia/Talix/flo-pr-work/review-r3-r4-result.json` and
+`verify-r3-focus-result.txt`. This repair starts at local
+`pr/r3-targeted-delivery`, `4110df96fbbc4042c341684d3a7d20d7b7332bba`, without
+changing its prerequisites.
+
+`TextInjector.captureCommandTarget` previously retained F1 while reading its
+range, selected text, and the app's focused window. Focus could move to F2
+during those reads while F1's attributes stayed valid. Validation then approved
+F1, allowing the untargeted paste to reach F2. Capture now rereads range and
+selected text, checks the focused window again, then checks the live focused
+element, frontmost app, and secure-input state before accepting. The existing
+`validateCommandTarget` capture and comparison path also gets these checks.
+The private `selectedRange` parser is shared by the two range reads. There is
+no retry loop, additional receipt, or new delivery boundary.
+
+Six new `TargetedDeliveryTests` use the existing injected reader. Its one-shot
+`CommandFocus.onRead` hook returns the sampled value while changing subsequent
+state. Cases move focus within one window or to another app during range,
+selected-text, and window reads. The app-switch case leaves the old app reporting
+F1. Delivery checks assert `.targetChanged`, zero clipboard writes, no paste or
+typing, retained output history, and released queue ownership. Further cases
+cover mixed selection/range capture, window and secure-input changes during
+reads, secure refusal without AX reads, and a stable target without an exposed
+window. Existing cases exercise unchanged selection/cursor delivery, failure,
+restoration, and receipt-based FIFO pacing.
+
+Checks ran on macOS 27.0.1, arm64, Apple Swift 6.4. The worktree's ignored
+`.build` was cloned from the existing delivery-stack cache. Automatic resolution
+and dependency updates were disabled. Evidence prefix:
+`/tmp/flo-r3-focus-snapshot-`; each test log has a matching `.exit` file.
+
+```sh
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests.testCaptureRejectsFocusChangeDuringAttributeReads|TargetedDeliveryTests.testDeliveryRejectsFocusChangeDuringAttributeReadsWithoutWritesOrEvents|TargetedDeliveryTests.testDeliveryRejectsWindowSelectionRangeOrSecureInputChangeDuringReads|TargetedDeliveryTests.testSecureCommandRefusesCaptureAndDeliveryWithoutAXOrClipboardWrites'
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+swift test -c release --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+git diff --check
+```
+
+- RED, exit 1 before the fix: four initial regression tests, 81 failed
+  assertions, no unexpected failures, `red.log`. The secure-refusal control
+  passed. The final fixture also adds mixed-capture and unexposed-window cases
+  and keeps the old app's F1 focused in the app-switch variant.
+- PASS, exit 0: final debug selection, 75 tests, zero failures or skips,
+  `final-debug.log`. An earlier selection passed 73 tests in `focused.log`.
+- PASS, exit 0: final release selection, 75 tests, zero failures or skips,
+  `final-release.log`.
+- PASS, exit 0: `git diff --check`, `diff-check.log`. The complete repair diff
+  against the pinned parent is `final.diff`; the local repair commit SHA is
+  returned in the implementation handoff. Existing concurrency/capture warnings
+  and the `--skip-update` deprecation warning remain in the build logs.
+
+The checks use the in-memory clipboard, local AX identity objects, fake readers,
+and stubbed event posting. Live app, microphone, system clipboard, real AX
+requests, network, full suite, installation, push, new PR, and merge were NOT
+RUN. Sampled AX reads cannot provide an atomic OS snapshot or atomic paste.
+Changes after the closing reads and changes that return to the same observable
+state can escape detection; dispatch still does not prove insertion. Live and
+assembled-stack acceptance remain with the parent and Flo maintainers.

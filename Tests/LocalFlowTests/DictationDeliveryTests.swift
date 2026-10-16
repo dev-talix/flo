@@ -225,13 +225,17 @@ final class DictationDeliveryTests: XCTestCase {
         DictationDelivery(
             transcribe: transcribe,
             cleanup: { .init(text: $0.text, succeeded: true) },
-            inject: { text, completion in effects.injected.append(text); effects.completions.append(completion) },
+            inject: { text, _, ready, completion in
+                effects.injected.append(text)
+                effects.completions.append(completion)
+                ready()
+            },
             recordTranscript: { effects.history.append($0) },
             onOutcome: { outcome, release in effects.outcomes.append(outcome); effects.releases.append(release) },
             onCancelled: { effects.cancelled.append($0) },
             onCommandCancelled: { effects.cancelledCommands.append($0) },
             onProcessingCountChange: { effects.processingCounts.append($0) },
-            stallTimeout: stallTimeout, injectionInterval: 0
+            stallTimeout: stallTimeout
         )
     }
 

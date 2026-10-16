@@ -114,7 +114,7 @@ final class TextInjectorTests: XCTestCase {
         var results: [TextInjector.InjectionResult] = []
         var dispatchCount = 0
 
-        TextInjector.inject("", onDispatch: { dispatchCount += 1 }) {
+        TextInjector.inject("", pasteboard: MemoryClipboard(), onDispatch: { dispatchCount += 1 }) {
             results.append($0)
         }
 
@@ -125,7 +125,7 @@ final class TextInjectorTests: XCTestCase {
     @MainActor
     func testDeliveryWarningsFitMenuWithoutTruncation() throws {
         XCTAssertNil(TextInjector.InjectionResult.dispatched.userFacingIssue)
-        for result in [TextInjector.InjectionResult.clipboardChanged, .dispatchFailed] {
+        for result in [TextInjector.InjectionResult.clipboardChanged, .dispatchFailed, .targetChanged] {
             let issue = try XCTUnwrap(result.userFacingIssue)
             XCTAssertEqual(issue.menuSummary, issue.summary)
             XCTAssertFalse(issue.details.isEmpty)
@@ -257,6 +257,7 @@ final class TextInjectorTests: XCTestCase {
         let types = try XCTUnwrap(harness.board.pasteboardItems?.first).types
         XCTAssertTrue(types.contains(TextInjector.transientType))
         XCTAssertTrue(types.contains(.string))
+        XCTAssertNotNil(harness.board.receipt)
     }
 
     @MainActor
@@ -308,11 +309,11 @@ final class TextInjectorTests: XCTestCase {
     }
 }
 
-/// Drives the paste path against a private pasteboard with a fake clock and
+/// Drives the paste path against an in-memory clipboard with a fake clock and
 /// scheduler. `postPaste` is stubbed so no real Cmd+V goes out.
 @MainActor
 private final class PasteHarness {
-    let board = NSPasteboard(name: NSPasteboard.Name("LocalFlowTests.\(UUID().uuidString)"))
+    let board = MemoryClipboard()
     let events = TraceEvents()
     var time: TimeInterval = 100
     var scheduled: [(delay: TimeInterval, work: DispatchWorkItem)] = []
@@ -324,10 +325,8 @@ private final class PasteHarness {
     init(test: XCTestCase) {
         board.clearContents()
         board.setString("user clipboard", forType: .string)
-        let board = board
         test.addTeardownBlock { @MainActor in
             TextInjector.restoreNow()
-            board.releaseGlobally()
         }
     }
 
@@ -339,5 +338,53 @@ private final class PasteHarness {
                 schedule: { delay, work in self.scheduled.append((delay, work)) }
             ) { self.results.append($0) }
         }
+    }
+}
+
+/// No pasteboard server, AX requests, or keyboard events are used by this fake.
+@MainActor
+final class MemoryClipboard: InjectionClipboard {
+    private(set) var changeCount = 0
+    private(set) var pasteboardItems: [NSPasteboardItem]? = []
+    private(set) var receipt: PasteReceipt?
+    var onSnapshot: (() -> Void)?
+
+    func snapshotItems() -> [NSPasteboardItem] {
+        onSnapshot?()
+        return pasteboardItems ?? []
+    }
+
+    func replaceItems(_ items: [NSPasteboardItem]) {
+        clearContents()
+        pasteboardItems = items
+    }
+
+    func promise(_ receipt: PasteReceipt) {
+        let item = NSPasteboardItem()
+        item.setData(Data(), forType: .string)
+        item.setData(Data(), forType: TextInjector.transientType)
+        replaceItems([item])
+        self.receipt = receipt
+    }
+
+    func clearContents() {
+        receipt?.finish()
+        receipt = nil
+        pasteboardItems = []
+        changeCount += 1
+    }
+
+    func setString(_ text: String, forType type: NSPasteboard.PasteboardType) {
+        let item = NSPasteboardItem()
+        item.setString(text, forType: type)
+        replaceItems([item])
+    }
+
+    func string(forType type: NSPasteboard.PasteboardType) -> String? {
+        guard let item = pasteboardItems?.first else { return nil }
+        if let receipt {
+            receipt.pasteboard(nil, item: item, provideDataForType: type)
+        }
+        return item.string(forType: type)
     }
 }
