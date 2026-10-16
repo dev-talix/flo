@@ -855,6 +855,85 @@ stall, target, and queue tests, exit 0. Evidence:
 `/tmp/flo-session-stack-through-r4-debug.log` (initial compile failure) and
 `/tmp/flo-r3-r1-fixture-integration.log` (pass). Full assembled validation follows.
 
+## R4: verbatim snippets and literal formatting
+
+Owner: Flo maintainers. The October 16, 2026 R4 request authorizes exact snippet
+insertion and a literal-formatting preference. Per-app preferences and other
+feature proposals are outside this change.
+
+`AppDelegate.captureDictationContext` and `DictationReplay.run` snapshot the new
+`literalFormatting` preference into `DictationSessionContext`. It defaults to
+false, preserving spoken command formatting. Settings > Dictation exposes the
+switch through `SettingsModel` and `SettingsApplication`. When enabled, the
+pipeline skips both spoken commands and automatic ordinal lists. Corrections
+and optional prose cleanup still apply. This is a formatting preference, not a
+promise of verbatim recognition or verbatim prose from a text model.
+
+`Snippets.parts` matches the original assembled transcript before corrections
+or voice formatting. Matching remains case-insensitive, uses word boundaries,
+accepts flexible spaces, and consumes at most one trailing punctuation mark.
+Earlier positions win. At one position the longest trimmed saved trigger wins,
+measured in UTF-16 units, then saved order breaks ties. Accepted matches consume
+that original range once. Overlapping occurrences are considered even within
+one trigger. Empty triggers and empty expansions are ignored. Repeated original
+matches expand independently; saved expansions and correction-created trigger
+phrases are never searched again.
+
+`Snippets.Part` distinguishes prose from verbatim text. The existing expansion
+API, pipeline, and VoiceFormatter reuse it. Only prose receives corrections,
+voice formatting, or cleanup. Explicit list state and line-break commands carry
+across snippets without trimming or capitalizing saved content. Automatic
+ordinal-list detection uses original source context across protected snippets.
+With no snippets, the existing formatter and whole-transcript cleanup behavior
+remain unchanged.
+Polished cleans prose spans sequentially, preserving their boundary whitespace,
+then joins them with untouched expansions in spoken order. No placeholders enter
+a model. One E3 deadline covers all spans. Its fallback retains the entire
+pre-cleanup composition, including after partial cleanup; the release deadline
+uses the same `completeCleanup` boundary. Late results cannot deliver twice or
+start cleanup of later spans after completion or cancellation. Diagnostics keep
+`cleanupInput` as the composed pre-cleanup transcript, rather than one event per
+model request.
+
+The Settings snippet editor no longer strips expansion whitespace. The public
+snippet API and legacy string-array preference remain unchanged. When tabs or
+backslashes require lossless storage, `verbatimSnippets` saves exact pairs plus
+the legacy array they encode. The reader uses those pairs only while that array
+still matches, so external or older-app edits cannot restore stale content.
+Simple entries retain the original encoding without a companion value. Older
+versions retain their previous interpretation of the public array, including its
+existing limitations with tabs and literal backslash-n. Already-lost content
+cannot be reconstructed. Tests verify UTF-8 bytes after persistence, including
+outer whitespace, multiline code, URLs, tabs, and literal backslash-n. They also
+verify legacy edits invalidate the companion value.
+
+Verification uses macOS 27.0.1, arm64, Swift 6.4. The base is `47f1bb9` plus
+unchanged prerequisite cherry-picks `2574a72` and `3d7f8e7`. Their patch IDs match
+originals `673876a` and `debf9fc`. R4 is the local commit containing this section;
+its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
+`/tmp/flo-r4-final.diff`.
+
+- FAIL, expected regression evidence: `swift test --disable-automatic-resolution --filter VerbatimSnippetPipelineTests`,
+  exit 1, three tests with three assertion failures before pipeline protection.
+  Log: `/tmp/flo-r4-pipeline-red.log`.
+- PASS: `swift test --disable-automatic-resolution --filter 'VerbatimSnippet|DictationCleanupDeadlineTests|VoiceFormatterTests|DictationDiffTests|SettingsModelCorrectionTests'`,
+  exit 0, 56 tests. Log: `/tmp/flo-r4-focused-final.log`. Cases cover overlaps,
+  recursive expansion, trigger/correction ordering, code preservation, rewriting
+  and failed cleaners, both deadlines, partial-cleanup fallback, late results,
+  literal spoken commands, default formatting, persistence, and session snapshots.
+- PASS: `env -u LOCALFLOW_RENDER_DIR swift test --disable-automatic-resolution --skip TextInjectorTests`,
+  exit 0, 387 tests, one optional HUD render skip, zero failures.
+  Log: `/tmp/flo-r4-broad-final.log`. The 21-test clipboard class is excluded
+  under this task's no-clipboard restriction.
+- PASS: `python3 Tests/TranscribeCLITests.py`, exit 0, two tests;
+  `python3 -B Tests/StartupReadinessTests.py`, exit 0, four tests.
+  Logs: `/tmp/flo-r4-cli.log` and `/tmp/flo-r4-startup.log`.
+- PASS: `git diff --check`, exit 0. Log: `/tmp/flo-r4-diff-check.log`.
+- NOT RUN: rendered Settings interaction, real models, audio replay, microphone,
+  clipboard, target-app insertion, release packaging, installation, or deployment.
+  The maintainer owns assembled-stack and live verification. Dependency cache
+  files were copied into this worktree; no package installation was performed.
+
 ## R1 command follow-up: caller-owned speech abandonment, October 16, 2026
 
 Owner: Flo maintainers and the parent R1 integration agent. Requirement source:
@@ -1012,3 +1091,106 @@ RUN. Sampled AX reads cannot provide an atomic OS snapshot or atomic paste.
 Changes after the closing reads and changes that return to the same observable
 state can escape detection; dispatch still does not prove insertion. Live and
 assembled-stack acceptance remain with the parent and Flo maintainers.
+
+## R4 repair: Automatic ordinal lists around verbatim snippets
+
+### Requirement source, owner, and non-goals
+
+Owner: Flo maintainers. The October 16, 2026 R4 repair request and confirmed CS2
+finding require default ordinal lists to retain their structure around snippets.
+Parent: `c280b530845912099e18166d455d81fed44ef30d`, including the failing pipeline
+regression. This record covers that repair only. R1, R2, R3, and R6 are separate.
+It replaces the initial prose-span-only ordinal behavior described in the R4
+implementation history.
+
+### Intended behavior and concrete acceptance examples
+
+With `insert code` expanding to `code`, default formatting of
+`First, insert code. Second, get eggs.` must produce `1. code\n2. Get eggs.`.
+Fast, Polished with identity cleanup, and whole-cleanup deadline fallback must
+agree. Matching must still use only original transcript occurrences and retain
+earliest, longest, then saved-order precedence. Saved bytes must never receive
+corrections, command formatting, ordinal formatting, or model cleanup.
+
+Ordinal cues and consumed punctuation in the transcript determine list structure.
+Expansion length and embedded ordinal or command phrases must not change it.
+Single or distant ordinal cues remain prose. Literal formatting remains off by
+default and, when enabled, still bypasses both commands and automatic lists.
+Explicit commands, list state, punctuation, and ordering must remain compatible.
+
+### Observed path and checks before implementation
+
+`DictationSessionPipeline.finalize` calls `Snippets.parts`, corrects only prose,
+then calls `VoiceFormatter.apply` unless literal formatting is enabled. The parent
+formats each prose span independently, losing both the consumed period and the
+two-cue run across the snippet. The pipeline stores the deterministic composition
+before sequential prose cleanup. One three-second cleanup deadline restores that
+whole composition, including after partial cleanup, and rejects late results.
+
+Use the existing `VerbatimSnippetPipelineTests` regression as the pre-fix red
+check. Extend `VerbatimSnippetTests` and pipeline tests for source punctuation,
+long multiline saved text, hidden cues and commands, single/distant cues,
+Polished prose-only input, and partial-cleanup fallback. Reuse
+`VoiceFormatterTests` and `DictationCleanupDeadlineTests` for compatibility.
+
+Commands use `swift test --disable-automatic-resolution --skip-update --filter`
+with each test name or class expression. Dependency checkouts, artifacts, and
+repository caches were cloned locally into this worktree. No package download,
+installation, live app, microphone, clipboard, AX, or model inference is allowed.
+
+### Implemented composition
+
+`Snippets.Part.verbatim` retains the consumed original source alongside the
+saved expansion. `Snippets.parts` still owns matching and precedence. Its
+`text` accessor still exposes only the expansion. The pipeline's only change
+uses that accessor while reassembling protected parts.
+
+`VoiceFormatter.apply` processes explicit commands with shared list state, then
+passes all parts to the existing ordinal parser. The parser uses prose plus
+matched source for punctuation and distance. It excludes cues inside protected
+source ranges, then rewrites only prose ranges. Rendering resets capitalization
+at each protected part and keeps its saved bytes intact. Both whole-string
+formatter entry points reuse this path. There is no second expander, copied
+ordinal parser, placeholder, or model-visible source marker.
+
+### Verified behavior and gaps
+
+Environment: macOS 27.0.1, arm64, Apple Swift 6.4. Repair branch:
+`fix/verbatim-ordinal-lists`. The verified patch is the local commit containing
+this record. Its SHA is recorded in `/tmp/flo-r4-ordinal-repair-commit.txt`;
+the complete staged patch is `/tmp/flo-r4-ordinal-repair-final.diff`.
+
+All Swift commands below use `swift test --disable-automatic-resolution
+--skip-update --filter` followed by the exact filter shown. Each command's
+actual process exit was captured. No dependency resolution or download ran.
+
+- EXPECTED FAIL, exit 1: pre-fix
+  `VerbatimSnippetPipelineTests.testAutomaticNumberedListKeepsItsStructureAcrossASnippet`,
+  one test and one assertion failure. Log:
+  `/tmp/flo-r4-ordinal-repair-red.log`. The observed result was
+  `First, code Second, get eggs.`, confirming the supplied parent red evidence.
+- PASS, exit 0: first implementation check, `VerbatimSnippet|VoiceFormatterTests`,
+  40 tests. Log: `/tmp/flo-r4-ordinal-repair-first.log`.
+- PASS, exit 0: `VerbatimSnippet|DictationCleanupDeadlineTests|VoiceFormatterTests|DictationDiffTests|SettingsModelCorrectionTests`,
+  66 tests. Log: `/tmp/flo-r4-ordinal-repair-focused.log`. The original Fast
+  regression and Polished identity case produce `1. code\n2. Get eggs.`.
+  The additional tests cover exact UTF-8 multiline code, repeated snippets,
+  source-based distance, consumed punctuation, hidden ordinals and commands,
+  single cues, literal mode, explicit list state, prose-only cleaner input,
+  default-off persistence, both deadlines, and late results. The new default
+  three-second deadline case restores the entire ordinal list after a previous
+  prose span was rewritten and prevents cleanup of later spans.
+- PASS, exit 0: `DictationSessionPipelineTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|SegmentJoinTests`,
+  37 adjacent tests. Log: `/tmp/flo-r4-ordinal-repair-pipeline.log`. These check
+  finalization, chunk ordering, diagnostics, archive transcript stages, and
+  paragraph joins through the shared formatter.
+- PASS, exit 0: `git diff --cached --check`. Log:
+  `/tmp/flo-r4-ordinal-repair-diff-check.log`.
+- NOT RUN: full suite, unrelated packaging checks, live app, real models,
+  microphone, clipboard, AX, installation, publication, and independent repair
+  review. Focused tests compile the app and test target. The maintainer owns
+  independent review and assembled-stack verification before publication.
+
+The offline build emits existing concurrency/capture and trailing-closure
+warnings. Swift also reports that `--skip-update` is deprecated. No check failed
+after the repair.

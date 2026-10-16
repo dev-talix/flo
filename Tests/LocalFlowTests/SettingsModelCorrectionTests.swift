@@ -20,6 +20,25 @@ final class SettingsModelCorrectionTests: XCTestCase {
         super.tearDown()
     }
 
+    func testLiteralFormattingDefaultsOffAndPersistsThroughModelAndApplication() {
+        let defaults = makeDefaults()
+        let application = makeApplication(defaults: defaults, system: FakeLiveSystem())
+        let model = SettingsModel(settingsApplication: application)
+        XCTAssertFalse(application.values.literalFormatting)
+        XCTAssertFalse(model.literalFormatting)
+        XCTAssertEqual(defaults.object(forKey: Settings.Key.literalFormatting) as? Bool, false)
+
+        model.literalFormatting = true
+        XCTAssertTrue(application.values.literalFormatting)
+        XCTAssertEqual(defaults.object(forKey: Settings.Key.literalFormatting) as? Bool, true)
+        let restored = makeApplication(defaults: defaults, system: FakeLiveSystem())
+        XCTAssertTrue(SettingsModel(settingsApplication: restored).literalFormatting)
+        XCTAssertFalse(makeApplication(defaults: makeDefaults(), system: FakeLiveSystem()).values.literalFormatting)
+
+        restored.apply(.literalFormatting(false))
+        XCTAssertFalse(makeApplication(defaults: defaults, system: FakeLiveSystem()).values.literalFormatting)
+    }
+
     func testReplacingCorrectionAppliesOnlyTheFinalCorrectionsValue() {
         let defaults = makeDefaults()
         defaults.set("LocalFlow", forKey: Settings.Key.customVocabulary)

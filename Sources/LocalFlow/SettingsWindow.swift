@@ -67,6 +67,13 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    @Published var literalFormatting: Bool = Settings.literalFormatting {
+        didSet {
+            guard oldValue != literalFormatting, !isSynchronizingApplicationValues else { return }
+            apply(.literalFormatting(literalFormatting))
+        }
+    }
+
     @Published var ollamaModel: String = Settings.ollamaModel {
         didSet {
             guard oldValue != ollamaModel, !isSynchronizingApplicationValues else { return }
@@ -148,7 +155,6 @@ final class SettingsModel: ObservableObject {
 
     func addSnippet(trigger: String, expansion: String) {
         let trigger = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
-        let expansion = expansion.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trigger.isEmpty, !expansion.isEmpty else { return }
         snippets.removeAll { $0.trigger.caseInsensitiveCompare(trigger) == .orderedSame }
         snippets.append(SnippetPair(trigger: trigger, expansion: expansion))
@@ -274,6 +280,7 @@ final class SettingsModel: ObservableObject {
         keepMicWarm = settingsApplication.values.keepMicWarm
         liveTranscript = settingsApplication.values.liveTranscript
         cleanupEnabled = settingsApplication.values.cleanupEnabled
+        literalFormatting = settingsApplication.values.literalFormatting
         commandModeEnabled = settingsApplication.values.commandModeEnabled
         theme = settingsApplication.values.theme
         soundCues = settingsApplication.values.soundCues
@@ -629,6 +636,14 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Literal formatting", isOn: $model.literalFormatting)
+            } footer: {
+                Text("Keep phrases like 'bullet point', 'new line', and 'thumbs up emoji' as words. Also disables automatic numbered lists. Corrections and optional model cleanup still apply to prose. Snippets always insert verbatim.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 ThemeGallery(selection: $model.theme)
             } header: {
                 Text("Listening theme")
@@ -663,7 +678,7 @@ struct SettingsView: View {
             } header: {
                 Text("Transcript cleanup")
             } footer: {
-                Text("Fast skips model cleanup. Polished cleans up the recognized text. Both apply corrections, snippets, and voice formatting. Slow cleanup falls back to the recognized text.")
+                Text("Fast skips model cleanup. Polished cleans up the recognized text. Both apply corrections and snippets. Voice formatting follows the Literal formatting setting. Slow cleanup falls back to the recognized text.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

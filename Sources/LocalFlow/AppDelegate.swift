@@ -838,6 +838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             styleProfile: AppStyleProfile.current(),
             corrections: Settings.corrections,
             snippets: Settings.snippets,
+            literalFormatting: Settings.literalFormatting,
             ollamaModel: Settings.ollamaModel,
             incrementalCadence: .forModel(Settings.whisperModel, liveTranscript: Settings.liveTranscript)
         )
