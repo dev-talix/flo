@@ -129,7 +129,7 @@ final class DictationDelivery {
         ))
         if let sequence { generationsBySequence[sequence] = generation }
         pipeline.recordCapturedAudio(generation: generation, samples: samples, nativeAudio: nativeAudio)
-        pipeline.release(generation: generation, fullSamples: samples)
+        pipeline.release(generation: generation, audio: audio)
     }
 
     /// See `DictationSessionPipeline.cancel(generation:interruptInference:)`.

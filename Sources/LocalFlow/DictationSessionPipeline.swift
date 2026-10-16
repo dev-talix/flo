@@ -71,12 +71,14 @@ enum DictationTranscriptionSegment: Equatable, Codable, Sendable {
 
 /// Shared admission and decoder preparation for live dictation, commands, and replay.
 struct DictationAudioPreparation {
+    let originalSamples: [Float]
     let samples: [Float]
     let voicedSeconds: Double
     let voicedDBFS: Float
     let rawVoicedSeconds: Double
 
     init(samples: [Float]) {
+        originalSamples = samples
         rawVoicedSeconds = AudioRecorder.voicedMetrics(of: samples).voicedSeconds
         self.samples = AudioRecorder.trimmingSilence(samples)
         let voice = AudioRecorder.voicedMetrics(of: self.samples)
@@ -395,9 +397,22 @@ final class DictationSessionPipeline {
         guard let session = sessions[generation],
               !session.cancelled,
               session.releaseAudio == nil else { return }
-
         recordCapturedAudio(generation: generation, samples: fullSamples)
-        let full = DictationAudioPreparation(samples: fullSamples)
+        release(generation: generation, audio: DictationAudioPreparation(samples: fullSamples),
+                tailSamples: tailSamples)
+    }
+
+    func release(
+        generation: Int,
+        audio full: DictationAudioPreparation,
+        tailSamples: [Float]? = nil
+    ) {
+        guard let session = sessions[generation],
+              !session.cancelled,
+              session.releaseAudio == nil else { return }
+
+        let fullSamples = full.originalSamples
+        recordCapturedAudio(generation: generation, samples: fullSamples)
         guard full.isAdmitted else {
             session.activeTask?.cancel()
             session.activeTask = nil
@@ -408,15 +423,20 @@ final class DictationSessionPipeline {
         let derivedTail: [Float]
         if let tailSamples {
             derivedTail = tailSamples
+        } else if session.incrementalSampleEnd == 0 {
+            derivedTail = fullSamples
         } else if session.incrementalSampleEnd <= fullSamples.count {
             derivedTail = Array(fullSamples[session.incrementalSampleEnd...])
         } else {
             derivedTail = []
             session.incrementalFailed = true
         }
+        // Submitted chunks include queued and in-flight work, even before the
+        // first chunk completes. Only those sessions can need a separate tail.
+        let reusesFull = session.nextChunkIndex == 0 || session.incrementalFailed
+            || (tailSamples == nil && session.incrementalSampleEnd == 0)
         session.releaseAudio = ReleaseAudio(
-            full: full,
-            tail: DictationAudioPreparation(samples: derivedTail)
+            full: full, tail: reusesFull ? full : DictationAudioPreparation(samples: derivedTail)
         )
         session.trace?.record(.audioReleased, fields: [
             .samples: Double(fullSamples.count), .tailSamples: Double(derivedTail.count),

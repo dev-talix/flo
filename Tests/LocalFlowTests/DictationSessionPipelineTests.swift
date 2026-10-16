@@ -88,6 +88,57 @@ final class DictationSessionPipelineTests: XCTestCase {
         ])
     }
 
+    func testPreparedReleaseDerivesQuietTailFromOriginalWhileFirstChunkIsInFlight() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes)
+        let silence = [Float](repeating: 0, count: speech.count)
+        let quietTail = [Float](repeating: 0.0025, count: speech.count / 2)
+        let original = silence + speech + quietTail
+        let prepared = DictationAudioPreparation(samples: original)
+        XCTAssertLessThan(prepared.samples.count, original.count)
+        pipeline.begin(generation: 2, context: context(cleanupEnabled: false))
+        pipeline.processIncrementalChunk(generation: 2, samples: silence + speech, pauseSecondsAfterChunk: 0,
+                                         sourceEndIndex: silence.count + speech.count)
+        expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: 2, in: transcriber))
+        pipeline.release(generation: 2, audio: prepared)
+        await settleAsyncWork()
+        expectFalse(await transcriber.hasCall(.releaseTail, generation: 2))
+        expectFalse(await transcriber.hasCall(.fullUtterance, generation: 2))
+        XCTAssertTrue(outcomes.values.isEmpty)
+
+        expectTrue(await transcriber.succeed("first words", segment: .incrementalChunk(index: 0), generation: 2))
+        expectTrue(await waitForCall(.releaseTail, generation: 2, in: transcriber))
+        expectEqual(await transcriber.sampleCounts(.releaseTail, generation: 2), [quietTail.count])
+        expectTrue(await transcriber.succeed("quiet ending", segment: .releaseTail, generation: 2))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 2, text: "first words quiet ending")])
+        expectFalse(await transcriber.hasCall(.fullUtterance, generation: 2))
+    }
+
+    func testPreparedReleaseFallsBackToFullAudioWhenFirstInFlightChunkFails() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes)
+        let silence = [Float](repeating: 0, count: speech.count)
+        let prepared = DictationAudioPreparation(samples: silence + speech + speech + silence)
+        pipeline.begin(generation: 3, context: context(cleanupEnabled: false))
+        pipeline.processIncrementalChunk(generation: 3, samples: silence + speech, pauseSecondsAfterChunk: 0,
+                                         sourceEndIndex: silence.count + speech.count)
+        expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: 3, in: transcriber))
+        pipeline.release(generation: 3, audio: prepared)
+        expectTrue(await transcriber.fail(TestError.decodeFailed, segment: .incrementalChunk(index: 0), generation: 3))
+        expectTrue(await waitForCall(.fullUtterance, generation: 3, in: transcriber))
+        expectEqual(await transcriber.sampleCounts(.fullUtterance, generation: 3), [prepared.samples.count])
+        expectFalse(await transcriber.hasCall(.releaseTail, generation: 3))
+        expectTrue(await transcriber.succeed("", segment: .fullUtterance, generation: 3))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        expectEqual(await transcriber.callCount(.fullUtterance, generation: 3), 1)
+        XCTAssertEqual(outcomes.values, [.emptyTranscript(generation: 3)])
+    }
+
     func testCancelledGenerationDropsLateCallbackAndDoesNotBlockNextOutcome() async {
         let transcriber = ControlledTranscriber()
         let cleaner = RecordingCleaner(mode: .unchanged)

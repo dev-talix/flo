@@ -420,3 +420,79 @@ suite passed 387 tests, zero failures and one optional HUD render skip:
 not rerun for this repair.
 The full release suite also passed 387 tests, zero failures and the same optional
 HUD render skip: `/tmp/flo-preview-continuity-release.log` (exit 0).
+
+## E1: Prepare each released recording once
+
+Owner: Flo maintainers. The October 15, 2026 efficiency report E1 authorizes
+reusing full-recording preparation across delivery and the session pipeline.
+Base commit: `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Preview scheduling, snapshot ranges, cleanup budgets, model defaults, and
+decoder rules are outside this item.
+
+`DictationAudioPreparation` in `Sources/LocalFlow/DictationSessionPipeline.swift`
+now keeps immutable `originalSamples` alongside trimmed samples and the existing
+separate raw-window retry and trimmed admission metrics. `DictationDelivery.release`
+passes that preparation to `DictationSessionPipeline.release(generation:audio:tailSamples:)`.
+The raw-sample release overload remains available and retains capture before
+preparing it. `DictationReplay.run` reuses its admission preparation for releases
+across replay runs. Delivery still retains the original for manual retry and
+passes native audio to the first-save-wins recording retention path.
+
+Release reuses the full preparation for an unused tail when no chunk was
+submitted, when incremental recognition already failed, or when the derived
+tail is the whole original. `nextChunkIndex` tracks submitted chunks, including
+queued work and the first in-flight chunk while `chunkCount` is still zero.
+Release waits for that work and derives a separate tail from original sample
+indices. Trace sample counts still describe the raw recording and tail.
+Successful chunks keep nonzero quiet endings eligible; failed chunks use the
+prepared full recording for the existing single recovery attempt.
+
+Acceptance coverage uses synthetic samples and temporary retention folders:
+
+- `DictationAudioPreparationTests.testPreparedReleaseKeepsOriginalSamplesAndHalfFrameRetryMetrics`
+  verifies exact originals and a 280 ms raw-window result that passes 300 ms
+  trimmed admission without earning an empty-result retry. The existing quiet
+  archive/retry test now exercises prepared release and exact WAV retention.
+- `DictationDeliveryTests.testPreparedReleaseAndManualRetryKeepOriginalWindowMetrics`
+  verifies delivery duration, inference samples, and retention of the raw
+  recording for manual retry rather than a trimmed request.
+- The two prepared-release tests in `DictationSessionPipelineTests` verify an
+  in-flight first chunk, the correct quiet tail after leading-silence trimming,
+  and full fallback without another retry when that chunk fails.
+- `PersonalVoicePipelineTests.testDeliveryRetainsOriginalFallbackOnceAcrossManualRetry`
+  reads every persisted Float32 sample and verifies one unchanged personal clip
+  across manual retry. Existing native-audio, silence, cancellation, output-order,
+  diagnostic-stage, capture, and stall checks remain in the selected suites.
+
+Verified on macOS 27.0.1, Apple M5 Pro, Swift 6.4, with worktree-local `.build`.
+Evidence prefix: `/tmp/flo-e1-`. The final patch is `final.diff` under that
+prefix, applied to the base commit above. No new abstraction was introduced;
+the existing prepared type is reused by delivery, pipeline, and replay.
+
+Exact test commands and results:
+
+```sh
+swift test --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests'
+swift test --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|DictationReplayTests|DictationSessionStallTests'
+swift test --disable-automatic-resolution --filter 'DictationSessionPipelineTests.testPreparedReleaseDerivesQuietTailFromOriginalWhileFirstChunkIsInFlight'
+swift test --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnostic|PersonalVoice|DictationReplayTests|DictationSessionStallTests|NativeAudioRecordingTests|AudioRecorderTests|AudioCaptureLifecycleTests|DictationTraceTests'
+swift test -c release --disable-automatic-resolution --filter 'DictationAudioPreparationTests|DictationSessionPipelineTests|DictationDeliveryTests|DictationDiagnostic|PersonalVoice|DictationReplayTests|DictationSessionStallTests|NativeAudioRecordingTests|AudioRecorderTests|AudioCaptureLifecycleTests|DictationTraceTests'
+git diff --check
+```
+
+- PASS, exit 0: baseline command, 46 tests, `baseline-tests.log`.
+- FAIL, exit 1: first expanded focused build used a nonexistent `Clip.status`
+  field in the new test, `focused-tests.log`. Corrected to the persisted failure
+  reason and transcript fields. PASS, exit 0: rerun, 66 tests,
+  `focused-tests-rerun.log`.
+- EXPECTED FAIL, exit 1: the single in-flight test with a temporary mutation
+  selecting full audio from `chunkCount == 0`, `inflight-mutation-tests.log`.
+  It caught a 28,000-sample full recording replacing the 8,000-sample quiet
+  tail. Submitted-chunk tracking was restored before final checks.
+- PASS, exit 0: expanded debug selection, 120 tests, `final-tests.log`.
+- PASS, exit 0: the same selection in release, 120 tests, `release-tests.log`.
+- PASS, exit 0: `git diff --check`, `diff-check.log`.
+- NOT RUN: full Swift suite, live microphone, installed-app replay, panel
+  timing, clipboard/typing, packaging, installation, or model inference.
+  Maintainers own live acceptance and assembled-item integration. No runtime
+  speedup was measured or claimed.
