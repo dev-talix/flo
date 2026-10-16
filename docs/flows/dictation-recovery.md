@@ -932,3 +932,161 @@ its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
   clipboard, target-app insertion, release packaging, installation, or deployment.
   The maintainer owns assembled-stack and live verification. Dependency cache
   files were copied into this worktree; no package installation was performed.
+
+## R1 command follow-up: caller-owned speech abandonment, October 16, 2026
+
+Owner: Flo maintainers and the parent R1 integration agent. Requirement source:
+the authorized PR #50 follow-up brief, extending R1 to command-mode speech.
+Base: `9094828c8efcecdf5c655575aaa43816ae89c574` on local
+`pr/r1-abandoned-inference-recovery`. This is one additional local R1 commit.
+R2's compiled boundary-test pattern was inspected at `f6d302f`; none of its
+implementation was copied or cherry-picked. R3/R4, target selection, live
+capture, clipboard access, installation, publishing, and model changes are
+outside this follow-up.
+
+Intended behavior and observed path:
+
+- `AppDelegate.process(asCommand: true)` creates a `TranscriptionLifetime`,
+  stores it by command sequence, captures it in the task, and passes it into
+  the existing `Transcriber.transcribe(samples:lowEnergy:lifetime:)` call.
+  This replaces the speech-phase set with the existing lifetime type.
+- Escape skips the pending command through `completeCommand`, invalidating
+  and removing its lifetime before dropping the task handle. Speech stays
+  uncancelled, and a suspended call retains its invalidated lifetime. The
+  existing Transcriber owns the 90-second grace and quarantine. No caller
+  timer or scheduler was added. A queued request instead leaves the real gate.
+- The speech-call defer removes ownership and invalidates the lifetime after
+  Transcriber has detached its observer. Normal completion, empty output,
+  no-speech, and errors therefore do not start abandonment after inference.
+- The delivery timeout removes pending identity before invoking
+  `AppDelegate.cancelCommand`. That method invalidates the lifetime and
+  explicitly cancels the task, retaining immediate quarantine for active
+  speech. After speech finishes, Escape and timeout still cancel text-model
+  work. Existing pending-sequence checks reject late speech, selection, and
+  text-model results before follow-on work or delivery.
+- Discarding a held command has no speech lifetime yet. The existing discard
+  path stops capture without starting command recognition.
+
+`Tests/CommandAbandonmentBoundaryTests.py` compiles the actual AppDelegate
+stored ownership declarations and seven methods, plus the actual
+`TranscriptionLifetime` and `TranscriptionGate`. UI, capture, selection access,
+speech, text models, and delivery side effects are inert dependencies. Its
+13 cases exercise suspended Escape and skip, queued removal, Escape before
+task execution, speech timeout, normal completion and gate reuse, text-model
+Escape and timeout, late selection, empty/no-speech/error completion, and held
+discard. The fake speech backend deliberately returns late text so caller
+identity guards must prevent further selection access, model work, or delivery.
+The suspended case checks the weakly observed lifetime remains invalidated
+after all caller task handles are removed. Every case checks speech ownership
+is released. CI's existing Test step runs the documented Python command.
+
+The boundary harness proves caller wiring and the real gate/lifetime contract;
+it does not itself implement or measure model quarantine. Existing real
+Transcriber cases in `DictationSessionStallTests` and
+`PreviewInferenceBudgetTests` verify injected grace expiry, replacement,
+queued removal, warm reuse, and explicit interruption. They passed alongside
+the new caller checks. The live default remains 90 seconds; tests use the
+existing injected backend and deadline seams.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1-command` and the unchanged lockfile. Evidence identifies the base
+above plus `/tmp/flo-r1-command-final.diff`; the handoff names the resulting
+local commit. Executed commands and results:
+
+```sh
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'
+python3 -B Tests/CommandAbandonmentBoundaryTests.py CommandAbandonmentBoundaryTests.test_escape_retains_invalidated_suspended_speech_without_task_cancellation
+python3 -B Tests/CommandAbandonmentBoundaryTests.py
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'
+git diff --check
+git diff --cached --check
+```
+
+- PASS, exit 0: baseline, 41 tests. `/tmp/flo-r1-command-baseline.log`.
+- RED, exit 1: one caller test against the unfixed AppDelegate. The compiled
+  case failed with `actual command caller must pass a speech lifetime`.
+  `/tmp/flo-r1-command-boundary-red.log`.
+- PASS, exit 0: final boundary suite, 13 tests, no skips.
+  `/tmp/flo-r1-command-boundary.log`.
+- PASS, exit 0: focused Swift suite, 124 tests, zero failures, no skips.
+  `/tmp/flo-r1-command-focused.log`. This also compiles the actual application.
+- PASS, exit 0: unstaged and staged diff checks.
+  `/tmp/flo-r1-command-diff-check.log`.
+
+NOT RUN: full Swift suite, real-model inference, live app, microphone,
+clipboard, system Accessibility, installation, packaging, or remote CI.
+The focused tests use fake engines and inert delivery callbacks. No new
+production abstraction, dependency, timer, or scheduler was introduced;
+command speech reuses R1's lifetime, gate, grace, and quarantine mechanisms.
+The parent agent owns integration into PR #50 and any later live acceptance.
+
+R1/R3 integration preserves command speech ownership while using the selection
+captured at keypress. The command boundary harness now supplies the captured
+target and uses R3's target-carrying injection outcome. Its former delayed
+selection-callback case is replaced by missing-target rejection because R3 no
+longer reads selection after recognition. All 13 caller cases pass, exit 0:
+`/tmp/flo-r1-r3-command-boundary-final.log`. The original ownership-only parent
+also passed 13 cases in `/tmp/flo-r1-command-stack-boundary.log`.
+
+## R3 repair: Reject focus changes during command target reads
+
+Owner: Flo maintainers; the parent task owns PR53 integration and R1 command
+lifetime. Requirement source: confirmed CS1 in
+`/Users/nikhlkapadia/Talix/flo-pr-work/review-r3-r4-result.json` and
+`verify-r3-focus-result.txt`. This repair starts at local
+`pr/r3-targeted-delivery`, `4110df96fbbc4042c341684d3a7d20d7b7332bba`, without
+changing its prerequisites.
+
+`TextInjector.captureCommandTarget` previously retained F1 while reading its
+range, selected text, and the app's focused window. Focus could move to F2
+during those reads while F1's attributes stayed valid. Validation then approved
+F1, allowing the untargeted paste to reach F2. Capture now rereads range and
+selected text, checks the focused window again, then checks the live focused
+element, frontmost app, and secure-input state before accepting. The existing
+`validateCommandTarget` capture and comparison path also gets these checks.
+The private `selectedRange` parser is shared by the two range reads. There is
+no retry loop, additional receipt, or new delivery boundary.
+
+Six new `TargetedDeliveryTests` use the existing injected reader. Its one-shot
+`CommandFocus.onRead` hook returns the sampled value while changing subsequent
+state. Cases move focus within one window or to another app during range,
+selected-text, and window reads. The app-switch case leaves the old app reporting
+F1. Delivery checks assert `.targetChanged`, zero clipboard writes, no paste or
+typing, retained output history, and released queue ownership. Further cases
+cover mixed selection/range capture, window and secure-input changes during
+reads, secure refusal without AX reads, and a stable target without an exposed
+window. Existing cases exercise unchanged selection/cursor delivery, failure,
+restoration, and receipt-based FIFO pacing.
+
+Checks ran on macOS 27.0.1, arm64, Apple Swift 6.4. The worktree's ignored
+`.build` was cloned from the existing delivery-stack cache. Automatic resolution
+and dependency updates were disabled. Evidence prefix:
+`/tmp/flo-r3-focus-snapshot-`; each test log has a matching `.exit` file.
+
+```sh
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests.testCaptureRejectsFocusChangeDuringAttributeReads|TargetedDeliveryTests.testDeliveryRejectsFocusChangeDuringAttributeReadsWithoutWritesOrEvents|TargetedDeliveryTests.testDeliveryRejectsWindowSelectionRangeOrSecureInputChangeDuringReads|TargetedDeliveryTests.testSecureCommandRefusesCaptureAndDeliveryWithoutAXOrClipboardWrites'
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+swift test -c release --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+git diff --check
+```
+
+- RED, exit 1 before the fix: four initial regression tests, 81 failed
+  assertions, no unexpected failures, `red.log`. The secure-refusal control
+  passed. The final fixture also adds mixed-capture and unexposed-window cases
+  and keeps the old app's F1 focused in the app-switch variant.
+- PASS, exit 0: final debug selection, 75 tests, zero failures or skips,
+  `final-debug.log`. An earlier selection passed 73 tests in `focused.log`.
+- PASS, exit 0: final release selection, 75 tests, zero failures or skips,
+  `final-release.log`.
+- PASS, exit 0: `git diff --check`, `diff-check.log`. The complete repair diff
+  against the pinned parent is `final.diff`; the local repair commit SHA is
+  returned in the implementation handoff. Existing concurrency/capture warnings
+  and the `--skip-update` deprecation warning remain in the build logs.
+
+The checks use the in-memory clipboard, local AX identity objects, fake readers,
+and stubbed event posting. Live app, microphone, system clipboard, real AX
+requests, network, full suite, installation, push, new PR, and merge were NOT
+RUN. Sampled AX reads cannot provide an atomic OS snapshot or atomic paste.
+Changes after the closing reads and changes that return to the same observable
+state can escape detection; dispatch still does not prove insertion. Live and
+assembled-stack acceptance remain with the parent and Flo maintainers.
