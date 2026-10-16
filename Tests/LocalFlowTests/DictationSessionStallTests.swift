@@ -179,7 +179,7 @@ final class DictationSessionStallTests: XCTestCase {
         var outcomes: [DictationSessionOutcome] = []
         var partials: [String] = []
         let pipeline = DictationSessionPipeline(
-            transcribe: { try await transcriber.transcribe(samples: $0.samples) },
+            transcribe: { try await transcriber.transcribe($0) },
             cleanup: { .init(text: $0.text, succeeded: true) },
             onOutcome: { outcomes.append($0) },
             onPartialTranscript: { _, text in partials.append(text) },
@@ -249,7 +249,7 @@ final class DictationSessionStallTests: XCTestCase {
         var pasted: [String] = []
         var history: [String] = []
         let delivery = DictationDelivery(
-            transcribe: { try await transcriber.transcribe(samples: $0.samples) },
+            transcribe: { try await transcriber.transcribe($0) },
             cleanup: { .init(text: $0.text, succeeded: true) },
             inject: { text, complete in pasted.append(text); complete() },
             recordTranscript: { history.append($0) },
@@ -304,7 +304,7 @@ final class DictationSessionStallTests: XCTestCase {
         try await transcriber.load(model: "test")
         var outcomes: [DictationSessionOutcome] = []
         let pipeline = DictationSessionPipeline(
-            transcribe: { try await transcriber.transcribe(samples: $0.samples) },
+            transcribe: { try await transcriber.transcribe($0) },
             cleanup: { .init(text: $0.text, succeeded: true) },
             onOutcome: { outcomes.append($0) }
         )

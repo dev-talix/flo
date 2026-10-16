@@ -534,3 +534,102 @@ The explicit Fast/Polished picker was compiled and checked with
 six cleanup tests passed, exit 0. There is no `SettingsPaneTests` class in this
 checkout, so that filter added no UI test coverage. Evidence:
 `/tmp/flo-e3-explicit-modes.log`. Rendered Settings interaction remains NOT RUN.
+
+## E2: Preview inference budget, October 15, 2026
+
+Owner: Flo maintainers. Requirement source: the authorized efficiency report E2,
+against preview foundation `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Give disposable previews their own inference budget without changing final
+recognition, release audio preparation, retry, quiet-tail, or delivery contracts.
+This section belongs to E2; other efficiency and reliability items have separate
+owners and PRs.
+
+`DictationSessionPipeline.startPreviewIfNeeded` attaches `TranscriptionPurpose`
+and a per-request `PreviewLifetime`. Both `AppDelegate` and `DictationReplay`
+forward the complete request through `Transcriber.transcribe(_:)`. Existing
+sample/file callers remain authoritative by default. `SpeechEngine` supplies
+adapters for engines that retain their existing preview decoder, including
+Parakeet.
+
+`WhisperEngine.decodingOptions(lowEnergy:purpose:)` keeps the temperature-zero
+pass and sets `temperatureFallbackCount` to zero for previews. The pinned
+WhisperKit 1.1.0 `TranscribeTask` builds attempts with
+`0...temperatureFallbackCount`, so zero means one attempt. Final options,
+vocabulary prompts, timestamps, VAD chunking, and the low-energy policy retain
+their existing values. No new model or dependency is required.
+
+`TranscriptionGate` gives waiting authoritative requests priority over disposable
+previews and keeps FIFO arrival order within each purpose. It cannot preempt
+active inference. Release and cancellation invalidate the preview lifetime,
+remove its waiter, and reject a stale permit handoff without cancelling active
+inference. The existing generation and audio-coverage checks still drop late
+text. Routine Escape leaves the model loaded. Explicit interruption and the
+release deadline still cancel active inference and quarantine its engine.
+
+`Transcriber` measures preview inference with a monotonic clock, excluding gate
+waits. After a preview taking duration D, that model's next preview becomes
+eligible D seconds after completion. Requests during this interval skip rather
+than queue or sleep. Budgets are keyed by the loaded model ID, so measurements
+from a slow model do not throttle another model. Finals never consult this
+budget. Cancelled or superseded engine generations do not update it. Capture
+still schedules one-second ticks, permits one active preview per session, and
+bounds preview audio to 15 seconds. The complete original release audio still
+determines final recognition. Preview text does not enter cleanup, history,
+delivery, personal voice labels, or diagnostic audio archives.
+
+Acceptance examples target the real gate with fake engines in
+`PreviewInferenceBudgetTests`: final precedence with FIFO finals; queued-preview
+removal during release and Escape before active inference returns; active-preview
+release and Escape without unloading; explicit interruption with quarantine;
+model-specific observed-duration backoff that leaves finals eligible; stale
+work rejection at an idle gate; and preview-only Whisper option changes.
+Existing `DictationSessionStallTests` now use the same request adapter as live
+and replay, including the stalled-preview deadline and engine recovery case.
+Existing pipeline, audio-preparation, diagnostic, delivery, model, and replay
+suites cover bounded audio, original final audio, quiet tails, retries, and
+preview side-effect isolation.
+
+Verified on macOS 27.0.1, arm64, Swift 6.4, from baseline
+`47f1bb906e8f3b2291a617f13dd9bb0b11300e74` plus the E2 diff on
+`perf/preview-inference-budget`. The reviewed source/test diff is saved at
+`/tmp/flo-e2-final.diff`; the handoff names the final local commit. All SwiftPM
+commands used this worktree's isolated `.build-e2` scratch directory and the
+existing lockfile. Generated build artifacts were moved to ignored `.build/e2`
+after validation, without touching another worktree's output.
+
+Executed checks, with final results:
+
+- PASS, exit 0: `swift test --scratch-path .build-e2 --disable-automatic-resolution --filter TranscriberTests`,
+  13 tests. Evidence: `/tmp/flo-e2-transcriber-tests.log`.
+- PASS, exit 0: `swift test --scratch-path .build-e2 --disable-automatic-resolution --filter 'PreviewInferenceBudgetTests|TranscriberTests|DictationSessionPipelineTests|DictationSessionStallTests|DictationAudioPreparationTests|DictationReplayTests|DictationDiagnosticPipelineTests|TranscriptionModelTests|ParakeetEngineTests'`,
+  97 tests, including all nine E2 tests. Evidence: `/tmp/flo-e2-focused-tests.log`.
+- PASS, exit 0: `swift test --scratch-path .build-e2 --disable-automatic-resolution`,
+  395 tests, zero failures. Evidence: `/tmp/flo-e2-full-tests.log`.
+  SKIPPED: one optional `HudRenderSnapshots.testRenderOverlayStates`, which
+  requires `LOCALFLOW_RENDER_DIR`.
+- PASS, exit 0: `python3 -B Tests/TranscribeCLITests.py`, two tests.
+  Evidence: `/tmp/flo-e2-cli-tests.log`.
+- PASS, exit 0: `python3 -B Tests/StartupReadinessTests.py`, four tests.
+  Evidence: `/tmp/flo-e2-startup-tests.log`.
+- PASS, exit 0: `git diff --check` and `git diff --cached --check`.
+
+Earlier test iterations were corrected before the passing checks above.
+`swift test --scratch-path .build-e2 --disable-automatic-resolution --filter PreviewInferenceBudgetTests`
+initially exited 1 with eight passing tests and one failure caused by comparing
+JSON objects with unsorted keys. Evidence: `/tmp/flo-e2-budget-tests.log`.
+The comparison now sorts keys. The first focused build also exited 1 because
+an async assertion used an autoclosure that cannot await; the assertion now
+uses an explicit guard. Neither was an engine behavior failure. The initial
+build also emitted existing warnings in untouched diagnostic, injection, and
+startup-test code; those warnings remain outside E2.
+
+NOT RUN: real-model replay, preview-quality comparison, latency/power benchmarks,
+release packaging, installation, microphone capture, clipboard access, or typing.
+No model downloads or dependency upgrades were performed. Speedup and real-model
+preview quality remain unmeasured. Maintainers own those checks after integrating
+E1 and the other authorized items. Active previews remain nonpreemptible.
+
+Stack integration keeps queued-preview invalidation in the prepared-audio release
+overload shared by live delivery and raw-sample callers. The queued-preview
+regression now exercises prepared-audio release; other release tests retain the
+raw-sample path. Assembled-stack validation is recorded separately.
