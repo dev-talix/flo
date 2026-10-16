@@ -6,6 +6,110 @@ final class VerbatimSnippetPipelineTests: XCTestCase {
     private let code = "  ```swift\n\tlet url = \"https://example.com/a?b=1\"\n// beta new line $1 \\n\n```\n "
     private let speech = [Float](repeating: 0.2, count: 16_000)
 
+    func testAutomaticNumberedListKeepsItsStructureAcrossASnippet() async {
+        let delivered = expectation(description: "automatic list around snippet")
+        var outcomes: [DictationSessionOutcome] = []
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in "First, insert code. Second, get eggs." },
+            cleanup: { .init(text: $0.text, succeeded: true) },
+            onOutcome: { outcomes.append($0); delivered.fulfill() }
+        )
+        pipeline.begin(generation: 20, context: .init(
+            cleanupEnabled: false, styleProfile: .general, corrections: [],
+            snippets: [("insert code", "code")]
+        ))
+        pipeline.release(generation: 20, fullSamples: speech)
+        await fulfillment(of: [delivered], timeout: 1)
+        XCTAssertEqual(outcomes, [.finalTranscript(generation: 20, text: "1. code\n2. Get eggs.")])
+    }
+
+    func testOrdinalListsProtectSavedBytesInFastPolishedAndLiteralModes() async {
+        let saved = "  ```swift\n" + String(repeating: "\t// First, new line. Second, beta next item.\n", count: 20) + "```\n "
+        for polished in [false, true] {
+            for literal in [false, true] {
+                let delivered = expectation(description: "ordinal composition")
+                var inputs: [String] = []
+                var outcomes: [DictationSessionOutcome] = []
+                let pipeline = DictationSessionPipeline(
+                    transcribe: { _ in "First, insert code. Second, talex. Third, insert code!" },
+                    cleanup: { request in
+                        XCTAssertTrue(polished)
+                        inputs.append(request.text)
+                        return .init(text: request.text, succeeded: true)
+                    },
+                    onOutcome: { outcomes.append($0); delivered.fulfill() }
+                )
+                pipeline.begin(generation: 21, context: .init(
+                    cleanupEnabled: polished, styleProfile: .general,
+                    corrections: [("talex", "Talix"), ("beta", "wrong"), ("insert code", "wrong")],
+                    snippets: [("insert code", saved), ("beta", "wrong")], literalFormatting: literal
+                ))
+                pipeline.release(generation: 21, fullSamples: speech)
+                await fulfillment(of: [delivered], timeout: 1)
+                let expected = literal
+                    ? "First, " + saved + " Second, Talix. Third, " + saved
+                    : "1. " + saved + "\n2. Talix.\n3. " + saved
+                XCTAssertEqual(outcomes, [.finalTranscript(generation: 21, text: expected)])
+                XCTAssertEqual(inputs, !polished ? [] : literal ? ["First,", "Second, Talix. Third,"] : ["1.", "2. Talix.\n3."])
+            }
+        }
+    }
+
+    func testPolishedIdentityKeepsTheConfirmedOrdinalListAndOnlyCleansProse() async {
+        let delivered = expectation(description: "polished ordinal list")
+        var inputs: [String] = []
+        var outcomes: [DictationSessionOutcome] = []
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in "First, insert code. Second, get eggs." },
+            cleanup: { request in
+                inputs.append(request.text)
+                return .init(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcomes.append($0); delivered.fulfill() }
+        )
+        pipeline.begin(generation: 22, context: .init(
+            cleanupEnabled: true, styleProfile: .general, corrections: [], snippets: [("insert code", "code")]
+        ))
+        pipeline.release(generation: 22, fullSamples: speech)
+        await fulfillment(of: [delivered], timeout: 1)
+        XCTAssertEqual(inputs, ["1.", "2. Get eggs."])
+        XCTAssertEqual(outcomes, [.finalTranscript(generation: 22, text: "1. code\n2. Get eggs.")])
+    }
+
+    func testDefaultThreeSecondDeadlineRestoresEntireOrdinalListAfterPartialCleanup() async {
+        let started = expectation(description: "second prose span stalled")
+        let delivered = expectation(description: "default cleanup deadline")
+        var continuation: CheckedContinuation<TranscriptCleanupResult, Never>?
+        var inputs: [String] = []
+        var outcomes: [DictationSessionOutcome] = []
+        var cleanupStarted: Date?
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in "First, insert code. Second, get eggs. Third, insert code. Finally, done." },
+            cleanup: { request in
+                inputs.append(request.text)
+                if inputs.count == 1 {
+                    cleanupStarted = Date()
+                    return .init(text: "REWRITTEN", succeeded: true)
+                }
+                return await withCheckedContinuation { continuation = $0; started.fulfill() }
+            },
+            onOutcome: { outcomes.append($0); delivered.fulfill() }
+        )
+        pipeline.begin(generation: 23, context: .init(
+            cleanupEnabled: true, styleProfile: .general, corrections: [], snippets: [("insert code", code)]
+        ))
+        pipeline.release(generation: 23, fullSamples: speech)
+        await fulfillment(of: [started], timeout: 1)
+        await fulfillment(of: [delivered], timeout: 5)
+        if let cleanupStarted { XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(cleanupStarted), 2.8) }
+        let expected = "1. " + code + "\n2. Get eggs.\n3. " + code + "\n4. Done."
+        XCTAssertEqual(outcomes, [.finalTranscript(generation: 23, text: expected)])
+        continuation?.resume(returning: .init(text: "LATE REWRITE", succeeded: true))
+        for _ in 0..<50 { await Task.yield() }
+        XCTAssertEqual(inputs, ["1.", "2. Get eggs.\n3."])
+        XCTAssertEqual(outcomes.count, 1)
+    }
+
     func testPolishedOnlyCleansProseAndReassemblesRepeatedSnippetsInOrder() async {
         let delivered = expectation(description: "composed output")
         var inputs: [String] = []

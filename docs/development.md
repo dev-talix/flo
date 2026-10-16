@@ -142,6 +142,7 @@ bash Tests/ReleaseContractTests.sh
 python3 Tests/LocalAppIdleTests.py
 python3 Tests/TranscribeCLITests.py
 python3 -B Tests/StartupReadinessTests.py   # no mic or model download needed
+python3 -B Tests/CommandAbandonmentBoundaryTests.py   # inert command caller, no app or clipboard
 ```
 
 CI runs all of these except the startup readiness check.

@@ -976,8 +976,9 @@ phrases are never searched again.
 API, pipeline, and VoiceFormatter reuse it. Only prose receives corrections,
 voice formatting, or cleanup. Explicit list state and line-break commands carry
 across snippets without trimming or capitalizing saved content. Automatic
-ordinal-list detection stays within each prose span. With no snippets, the
-existing formatter and whole-transcript cleanup behavior remain unchanged.
+ordinal-list detection uses original source context across protected snippets.
+With no snippets, the existing formatter and whole-transcript cleanup behavior
+remain unchanged.
 Polished cleans prose spans sequentially, preserving their boundary whitespace,
 then joins them with untouched expansions in spoken order. No placeholders enter
 a model. One E3 deadline covers all spans. Its fallback retains the entire
@@ -1025,3 +1026,264 @@ its SHA is recorded in `/tmp/flo-r4-commit.txt`, and the reviewed patch is
   clipboard, target-app insertion, release packaging, installation, or deployment.
   The maintainer owns assembled-stack and live verification. Dependency cache
   files were copied into this worktree; no package installation was performed.
+
+## R1 command follow-up: caller-owned speech abandonment, October 16, 2026
+
+Owner: Flo maintainers and the parent R1 integration agent. Requirement source:
+the authorized PR #50 follow-up brief, extending R1 to command-mode speech.
+Base: `9094828c8efcecdf5c655575aaa43816ae89c574` on local
+`pr/r1-abandoned-inference-recovery`. This is one additional local R1 commit.
+R2's compiled boundary-test pattern was inspected at `f6d302f`; none of its
+implementation was copied or cherry-picked. R3/R4, target selection, live
+capture, clipboard access, installation, publishing, and model changes are
+outside this follow-up.
+
+Intended behavior and observed path:
+
+- `AppDelegate.process(asCommand: true)` creates a `TranscriptionLifetime`,
+  stores it by command sequence, captures it in the task, and passes it into
+  the existing `Transcriber.transcribe(samples:lowEnergy:lifetime:)` call.
+  This replaces the speech-phase set with the existing lifetime type.
+- Escape skips the pending command through `completeCommand`, invalidating
+  and removing its lifetime before dropping the task handle. Speech stays
+  uncancelled, and a suspended call retains its invalidated lifetime. The
+  existing Transcriber owns the 90-second grace and quarantine. No caller
+  timer or scheduler was added. A queued request instead leaves the real gate.
+- The speech-call defer removes ownership and invalidates the lifetime after
+  Transcriber has detached its observer. Normal completion, empty output,
+  no-speech, and errors therefore do not start abandonment after inference.
+- The delivery timeout removes pending identity before invoking
+  `AppDelegate.cancelCommand`. That method invalidates the lifetime and
+  explicitly cancels the task, retaining immediate quarantine for active
+  speech. After speech finishes, Escape and timeout still cancel text-model
+  work. Existing pending-sequence checks reject late speech, selection, and
+  text-model results before follow-on work or delivery.
+- Discarding a held command has no speech lifetime yet. The existing discard
+  path stops capture without starting command recognition.
+
+`Tests/CommandAbandonmentBoundaryTests.py` compiles the actual AppDelegate
+stored ownership declarations and seven methods, plus the actual
+`TranscriptionLifetime` and `TranscriptionGate`. UI, capture, selection access,
+speech, text models, and delivery side effects are inert dependencies. Its
+13 cases exercise suspended Escape and skip, queued removal, Escape before
+task execution, speech timeout, normal completion and gate reuse, text-model
+Escape and timeout, late selection, empty/no-speech/error completion, and held
+discard. The fake speech backend deliberately returns late text so caller
+identity guards must prevent further selection access, model work, or delivery.
+The suspended case checks the weakly observed lifetime remains invalidated
+after all caller task handles are removed. Every case checks speech ownership
+is released. CI's existing Test step runs the documented Python command.
+
+The boundary harness proves caller wiring and the real gate/lifetime contract;
+it does not itself implement or measure model quarantine. Existing real
+Transcriber cases in `DictationSessionStallTests` and
+`PreviewInferenceBudgetTests` verify injected grace expiry, replacement,
+queued removal, warm reuse, and explicit interruption. They passed alongside
+the new caller checks. The live default remains 90 seconds; tests use the
+existing injected backend and deadline seams.
+
+Verified on macOS 27.0.1, arm64, Apple Swift 6.4, using isolated scratch output
+`.build/r1-command` and the unchanged lockfile. Evidence identifies the base
+above plus `/tmp/flo-r1-command-final.diff`; the handoff names the resulting
+local commit. Executed commands and results:
+
+```sh
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests'
+python3 -B Tests/CommandAbandonmentBoundaryTests.py CommandAbandonmentBoundaryTests.test_escape_retains_invalidated_suspended_speech_without_task_cancellation
+python3 -B Tests/CommandAbandonmentBoundaryTests.py
+swift test --scratch-path .build/r1-command --disable-automatic-resolution --filter 'TranscriberTests|DictationSessionStallTests|PreviewInferenceBudgetTests|DictationSessionPipelineTests|DictationAudioPreparationTests|DictationDeliveryTests|DictationReplayTests|DictationDiagnosticPipelineTests|DictationTraceTests|TranscriptionModelTests|ParakeetEngineTests'
+git diff --check
+git diff --cached --check
+```
+
+- PASS, exit 0: baseline, 41 tests. `/tmp/flo-r1-command-baseline.log`.
+- RED, exit 1: one caller test against the unfixed AppDelegate. The compiled
+  case failed with `actual command caller must pass a speech lifetime`.
+  `/tmp/flo-r1-command-boundary-red.log`.
+- PASS, exit 0: final boundary suite, 13 tests, no skips.
+  `/tmp/flo-r1-command-boundary.log`.
+- PASS, exit 0: focused Swift suite, 124 tests, zero failures, no skips.
+  `/tmp/flo-r1-command-focused.log`. This also compiles the actual application.
+- PASS, exit 0: unstaged and staged diff checks.
+  `/tmp/flo-r1-command-diff-check.log`.
+
+NOT RUN: full Swift suite, real-model inference, live app, microphone,
+clipboard, system Accessibility, installation, packaging, or remote CI.
+The focused tests use fake engines and inert delivery callbacks. No new
+production abstraction, dependency, timer, or scheduler was introduced;
+command speech reuses R1's lifetime, gate, grace, and quarantine mechanisms.
+The parent agent owns integration into PR #50 and any later live acceptance.
+
+R1/R3 integration preserves command speech ownership while using the selection
+captured at keypress. The command boundary harness now supplies the captured
+target and uses R3's target-carrying injection outcome. Its former delayed
+selection-callback case is replaced by missing-target rejection because R3 no
+longer reads selection after recognition. All 13 caller cases pass, exit 0:
+`/tmp/flo-r1-r3-command-boundary-final.log`. The original ownership-only parent
+also passed 13 cases in `/tmp/flo-r1-command-stack-boundary.log`.
+
+## R3 repair: Reject focus changes during command target reads
+
+Owner: Flo maintainers; the parent task owns PR53 integration and R1 command
+lifetime. Requirement source: confirmed CS1 in
+`/Users/nikhlkapadia/Talix/flo-pr-work/review-r3-r4-result.json` and
+`verify-r3-focus-result.txt`. This repair starts at local
+`pr/r3-targeted-delivery`, `4110df96fbbc4042c341684d3a7d20d7b7332bba`, without
+changing its prerequisites.
+
+`TextInjector.captureCommandTarget` previously retained F1 while reading its
+range, selected text, and the app's focused window. Focus could move to F2
+during those reads while F1's attributes stayed valid. Validation then approved
+F1, allowing the untargeted paste to reach F2. Capture now rereads range and
+selected text, checks the focused window again, then checks the live focused
+element, frontmost app, and secure-input state before accepting. The existing
+`validateCommandTarget` capture and comparison path also gets these checks.
+The private `selectedRange` parser is shared by the two range reads. There is
+no retry loop, additional receipt, or new delivery boundary.
+
+Six new `TargetedDeliveryTests` use the existing injected reader. Its one-shot
+`CommandFocus.onRead` hook returns the sampled value while changing subsequent
+state. Cases move focus within one window or to another app during range,
+selected-text, and window reads. The app-switch case leaves the old app reporting
+F1. Delivery checks assert `.targetChanged`, zero clipboard writes, no paste or
+typing, retained output history, and released queue ownership. Further cases
+cover mixed selection/range capture, window and secure-input changes during
+reads, secure refusal without AX reads, and a stable target without an exposed
+window. Existing cases exercise unchanged selection/cursor delivery, failure,
+restoration, and receipt-based FIFO pacing.
+
+Checks ran on macOS 27.0.1, arm64, Apple Swift 6.4. The worktree's ignored
+`.build` was cloned from the existing delivery-stack cache. Automatic resolution
+and dependency updates were disabled. Evidence prefix:
+`/tmp/flo-r3-focus-snapshot-`; each test log has a matching `.exit` file.
+
+```sh
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests.testCaptureRejectsFocusChangeDuringAttributeReads|TargetedDeliveryTests.testDeliveryRejectsFocusChangeDuringAttributeReadsWithoutWritesOrEvents|TargetedDeliveryTests.testDeliveryRejectsWindowSelectionRangeOrSecureInputChangeDuringReads|TargetedDeliveryTests.testSecureCommandRefusesCaptureAndDeliveryWithoutAXOrClipboardWrites'
+swift test --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+swift test -c release --disable-automatic-resolution --skip-update --filter 'TargetedDeliveryTests|TextInjectorTests|InjectionCoordinatorTests|DictationDeliveryTests|DictationSessionStallTests'
+git diff --check
+```
+
+- RED, exit 1 before the fix: four initial regression tests, 81 failed
+  assertions, no unexpected failures, `red.log`. The secure-refusal control
+  passed. The final fixture also adds mixed-capture and unexposed-window cases
+  and keeps the old app's F1 focused in the app-switch variant.
+- PASS, exit 0: final debug selection, 75 tests, zero failures or skips,
+  `final-debug.log`. An earlier selection passed 73 tests in `focused.log`.
+- PASS, exit 0: final release selection, 75 tests, zero failures or skips,
+  `final-release.log`.
+- PASS, exit 0: `git diff --check`, `diff-check.log`. The complete repair diff
+  against the pinned parent is `final.diff`; the local repair commit SHA is
+  returned in the implementation handoff. Existing concurrency/capture warnings
+  and the `--skip-update` deprecation warning remain in the build logs.
+
+The checks use the in-memory clipboard, local AX identity objects, fake readers,
+and stubbed event posting. Live app, microphone, system clipboard, real AX
+requests, network, full suite, installation, push, new PR, and merge were NOT
+RUN. Sampled AX reads cannot provide an atomic OS snapshot or atomic paste.
+Changes after the closing reads and changes that return to the same observable
+state can escape detection; dispatch still does not prove insertion. Live and
+assembled-stack acceptance remain with the parent and Flo maintainers.
+
+## R4 repair: Automatic ordinal lists around verbatim snippets
+
+### Requirement source, owner, and non-goals
+
+Owner: Flo maintainers. The October 16, 2026 R4 repair request and confirmed CS2
+finding require default ordinal lists to retain their structure around snippets.
+Parent: `c280b530845912099e18166d455d81fed44ef30d`, including the failing pipeline
+regression. This record covers that repair only. R1, R2, R3, and R6 are separate.
+It replaces the initial prose-span-only ordinal behavior described in the R4
+implementation history.
+
+### Intended behavior and concrete acceptance examples
+
+With `insert code` expanding to `code`, default formatting of
+`First, insert code. Second, get eggs.` must produce `1. code\n2. Get eggs.`.
+Fast, Polished with identity cleanup, and whole-cleanup deadline fallback must
+agree. Matching must still use only original transcript occurrences and retain
+earliest, longest, then saved-order precedence. Saved bytes must never receive
+corrections, command formatting, ordinal formatting, or model cleanup.
+
+Ordinal cues and consumed punctuation in the transcript determine list structure.
+Expansion length and embedded ordinal or command phrases must not change it.
+Single or distant ordinal cues remain prose. Literal formatting remains off by
+default and, when enabled, still bypasses both commands and automatic lists.
+Explicit commands, list state, punctuation, and ordering must remain compatible.
+
+### Observed path and checks before implementation
+
+`DictationSessionPipeline.finalize` calls `Snippets.parts`, corrects only prose,
+then calls `VoiceFormatter.apply` unless literal formatting is enabled. The parent
+formats each prose span independently, losing both the consumed period and the
+two-cue run across the snippet. The pipeline stores the deterministic composition
+before sequential prose cleanup. One three-second cleanup deadline restores that
+whole composition, including after partial cleanup, and rejects late results.
+
+Use the existing `VerbatimSnippetPipelineTests` regression as the pre-fix red
+check. Extend `VerbatimSnippetTests` and pipeline tests for source punctuation,
+long multiline saved text, hidden cues and commands, single/distant cues,
+Polished prose-only input, and partial-cleanup fallback. Reuse
+`VoiceFormatterTests` and `DictationCleanupDeadlineTests` for compatibility.
+
+Commands use `swift test --disable-automatic-resolution --skip-update --filter`
+with each test name or class expression. Dependency checkouts, artifacts, and
+repository caches were cloned locally into this worktree. No package download,
+installation, live app, microphone, clipboard, AX, or model inference is allowed.
+
+### Implemented composition
+
+`Snippets.Part.verbatim` retains the consumed original source alongside the
+saved expansion. `Snippets.parts` still owns matching and precedence. Its
+`text` accessor still exposes only the expansion. The pipeline's only change
+uses that accessor while reassembling protected parts.
+
+`VoiceFormatter.apply` processes explicit commands with shared list state, then
+passes all parts to the existing ordinal parser. The parser uses prose plus
+matched source for punctuation and distance. It excludes cues inside protected
+source ranges, then rewrites only prose ranges. Rendering resets capitalization
+at each protected part and keeps its saved bytes intact. Both whole-string
+formatter entry points reuse this path. There is no second expander, copied
+ordinal parser, placeholder, or model-visible source marker.
+
+### Verified behavior and gaps
+
+Environment: macOS 27.0.1, arm64, Apple Swift 6.4. Repair branch:
+`fix/verbatim-ordinal-lists`. The verified patch is the local commit containing
+this record. Its SHA is recorded in `/tmp/flo-r4-ordinal-repair-commit.txt`;
+the complete staged patch is `/tmp/flo-r4-ordinal-repair-final.diff`.
+
+All Swift commands below use `swift test --disable-automatic-resolution
+--skip-update --filter` followed by the exact filter shown. Each command's
+actual process exit was captured. No dependency resolution or download ran.
+
+- EXPECTED FAIL, exit 1: pre-fix
+  `VerbatimSnippetPipelineTests.testAutomaticNumberedListKeepsItsStructureAcrossASnippet`,
+  one test and one assertion failure. Log:
+  `/tmp/flo-r4-ordinal-repair-red.log`. The observed result was
+  `First, code Second, get eggs.`, confirming the supplied parent red evidence.
+- PASS, exit 0: first implementation check, `VerbatimSnippet|VoiceFormatterTests`,
+  40 tests. Log: `/tmp/flo-r4-ordinal-repair-first.log`.
+- PASS, exit 0: `VerbatimSnippet|DictationCleanupDeadlineTests|VoiceFormatterTests|DictationDiffTests|SettingsModelCorrectionTests`,
+  66 tests. Log: `/tmp/flo-r4-ordinal-repair-focused.log`. The original Fast
+  regression and Polished identity case produce `1. code\n2. Get eggs.`.
+  The additional tests cover exact UTF-8 multiline code, repeated snippets,
+  source-based distance, consumed punctuation, hidden ordinals and commands,
+  single cues, literal mode, explicit list state, prose-only cleaner input,
+  default-off persistence, both deadlines, and late results. The new default
+  three-second deadline case restores the entire ordinal list after a previous
+  prose span was rewritten and prevents cleanup of later spans.
+- PASS, exit 0: `DictationSessionPipelineTests|DictationDiagnosticPipelineTests|PersonalVoicePipelineTests|SegmentJoinTests`,
+  37 adjacent tests. Log: `/tmp/flo-r4-ordinal-repair-pipeline.log`. These check
+  finalization, chunk ordering, diagnostics, archive transcript stages, and
+  paragraph joins through the shared formatter.
+- PASS, exit 0: `git diff --cached --check`. Log:
+  `/tmp/flo-r4-ordinal-repair-diff-check.log`.
+- NOT RUN: full suite, unrelated packaging checks, live app, real models,
+  microphone, clipboard, AX, installation, publication, and independent repair
+  review. Focused tests compile the app and test target. The maintainer owns
+  independent review and assembled-stack verification before publication.
+
+The offline build emits existing concurrency/capture and trailing-closure
+warnings. Swift also reports that `--skip-update` is deprecated. No check failed
+after the repair.
