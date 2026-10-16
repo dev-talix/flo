@@ -184,22 +184,9 @@ echo "Built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
     echo "Installing to /Applications..."
-    # Stop through launchd, not pkill: a SIGTERM'd agent counts as an
-    # unsuccessful exit, so KeepAlive would relaunch the OLD binary during
-    # the sleep below and the fresh copy would exit at its already-running
-    # guard. bootout both stops the process and stops supervision.
-    launchctl bootout "gui/$(id -u)/app.talix.localflow" 2>/dev/null || true
-    # Belt for instances launched outside the agent (Finder, `open`, dev runs).
-    PRODUCTION_PROCESS_PATTERN='^/Applications/(Flo|Walkie|LocalFlow)\.app/Contents/MacOS/LocalFlow$'
-    pkill -f "$PRODUCTION_PROCESS_PATTERN" 2>/dev/null || true
-    # Verify the old instance is actually gone before swapping the bundle:
-    # if bootout failed (label variants, transient launchctl errors),
-    # KeepAlive can respawn it and the copy would race a running process.
-    for _ in 1 2 3 4 5; do
-        pgrep -f "$PRODUCTION_PROCESS_PATTERN" >/dev/null || break
-        sleep 1
-    done
-    pkill -9 -f "$PRODUCTION_PROCESS_PATTERN" 2>/dev/null || true
+    # Share the local channel's idle check and normal Quit policy. Never
+    # replace a running bundle or bypass the app's active-dictation guard.
+    python3 scripts/app-lifecycle.py
     rm -rf /Applications/Flo.app
     cp -R "$APP" /Applications/
     open /Applications/Flo.app

@@ -41,61 +41,9 @@ if [[ "$ACTION" != "install" && ! -d "$TARGET_APP" ]]; then
     exit 1
 fi
 
-# Older installed builds lack the app's quit guard. Check their current
-# session after building, immediately before requesting termination.
-python3 - <<'PY_CHECK_IDLE'
-import json
-from pathlib import Path
-import subprocess
-
-for name, log_name in (("Flo", "LocalFlow-diag.log"), ("Walkie", "LocalFlow-diag.log"),
-                       ("LocalFlow", "LocalFlow-diag.log"), ("Flo Local", "LocalFlow-Local-diag.log"),
-                       ("Walkie Local", "LocalFlow-Local-diag.log"), ("LocalFlow Local", "LocalFlow-Local-diag.log")):
-    running = subprocess.run(["pgrep", "-f", rf"^/Applications/{name}\.app/Contents/MacOS/LocalFlow$"], capture_output=True, text=True)
-    if running.returncode != 0:
-        continue
-    pid = running.stdout.strip()
-    lines = (Path.home() / "Library/Logs" / log_name).read_text().splitlines()
-    starts = [i for i, line in enumerate(lines) if f"session start (pid {pid})" in line]
-    if not starts:
-        raise SystemExit(f"error: cannot verify {name} is idle; finish dictating and quit it before switching")
-    traces = {}
-    for line in lines[starts[-1]:]:
-        if " timing " not in line:
-            continue
-        event = json.loads(line.split(" timing ", 1)[1])
-        if event.get("source") == "dictation":
-            traces.setdefault(event["traceID"], []).append(event)
-    for events in traces.values():
-        names = {event["name"] for event in events}
-        resolved = bool(names & {"cancellationRequested", "injectionSkipped", "clipboardWindowResolved", "typingDispatched"})
-        resolved |= any(event["name"] == "resultReady" and event.get("status") in ("empty", "failed", "insufficientVoice", "cancelled") for event in events)
-        resolved |= any(event["name"] == "pasteDispatched" and event.get("status") == "failed" for event in events)
-        if "hotkeyPressed" in names and not resolved:
-            raise SystemExit(f"error: {name} has an active dictation; finish it and retry switching")
-PY_CHECK_IDLE
-
-# Clean termination keeps the production KeepAlive agent from restarting.
-# Never force-quit a recording or overwrite an app that is still running.
-for APP_NAME in Flo Walkie LocalFlow "Flo Local" "Walkie Local" "LocalFlow Local"; do
-    BUNDLE_ID="app.talix.localflow"
-    if [[ "$APP_NAME" == *" Local" ]]; then
-        BUNDLE_ID="app.talix.localflow.local"
-    fi
-    if pgrep -f "^/Applications/$APP_NAME\\.app/Contents/MacOS/LocalFlow$" >/dev/null; then
-        osascript -e "tell application id \"$BUNDLE_ID\" to quit"
-    fi
-done
-for _ in 1 2 3 4 5; do
-    if ! pgrep -f '^/Applications/(Flo|Walkie|LocalFlow)( Local)?\.app/Contents/MacOS/LocalFlow$' >/dev/null; then
-        break
-    fi
-    sleep 1
-done
-if pgrep -f '^/Applications/(Flo|Walkie|LocalFlow)( Local)?\.app/Contents/MacOS/LocalFlow$' >/dev/null; then
-    echo "error: Flo is still running; finish dictating and quit it before switching" >&2
-    exit 1
-fi
+# Older installed builds lack the app's Quit guard. Check every running
+# bundle, request normal Quit, and refuse replacement until both channels exit.
+python3 scripts/app-lifecycle.py
 
 if [[ "$ACTION" == "install" ]]; then
     # Seed preferences once. Later installs preserve local settings; history

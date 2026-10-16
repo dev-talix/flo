@@ -37,6 +37,9 @@ test without touching the release build:
   and `/Applications/LocalFlow.app` installs.
 - Run one app at a time. The switch commands quit both before opening the
   target, and refuse to switch while a dictation is active.
+- Both installers find running copies by bundle ID, including legacy names
+  and relative executable launches. They request normal Quit and refuse to
+  replace an app that remains running or whose idle state cannot be verified.
 - The local copy builds from the working tree, uncommitted changes included.
   It has no auto-update and no login item. The previous local bundle is kept in
   a hidden `/Applications/.flo-local.*` directory. Installing also archives
@@ -76,7 +79,7 @@ checks each running copy for active dictation before switching, and archives
 older local bundles during installation. Production switching prefers Flo,
 then Walkie, then LocalFlow. Local switching follows the same preference
 for Flo Local, Walkie Local, and LocalFlow Local. The production development
-installer also recognizes processes launched under the older bundle names.
+installer uses the same bundle-identity and normal Quit checks.
 
 Acceptance checks cover Flo display names with stable IDs and data paths,
 idle guards for current and legacy app names, and matching release asset
@@ -196,3 +199,38 @@ but runtime savings and extracted-file coverage need a GitHub CodeQL run.
 Compare a cold run and an unchanged warm run, including their dependency-build,
 app-build, and analysis timings. The workflow maintainer owns that check when
 these changes reach GitHub.
+
+## R5: installer process identity and Quit safety
+
+Requirement: the October 15, 2026 codebase review batch requests bundle-based
+process discovery and normal Quit across both development installers. Owner:
+Flo maintainers. Installing or relaunching an app was outside this change's
+validation scope.
+
+`scripts/app-lifecycle.py` is shared by `local-app.sh` and the production
+`make-app.sh --install` path. NSWorkspace supplies bundle IDs and PIDs rather
+than command-line paths. The helper checks both channels' current PID-anchored
+diagnostic sessions before requesting any Quit. It calls NSRunningApplication's
+normal `terminate`, rechecking PID and bundle ID, then waits up to five seconds
+for both channels to disappear. An unreadable or malformed session, active
+recording/processing/paste, refused Quit, or a respawn stops installation before
+bundle replacement. Legacy Flo, Walkie, and LocalFlow names retain their existing
+channel and installed-path selection. No force-quit fallback remains.
+
+Verification on macOS arm64, Python 3 and the installed AppKit SDK:
+
+- PASS: `python3 Tests/LocalAppIdleTests.py`, 16 tests, exit 0. Includes active
+  dictation, clipboard wait, stale session, missing/corrupt log, current/legacy
+  names, both channels, native JavaScript bundle filtering and PID matching,
+  Quit refusal/respawn, and both installer entry points. Native Quit tests use
+  fake application objects. Evidence: `/tmp/flo-r5-idle-tests.log`.
+- PASS: `bash -n scripts/local-app.sh scripts/make-app.sh` and `git diff --check`.
+- PASS: `bash Tests/ReleaseContractTests.sh`, 63 checks, exit 0. An initial
+  run failed two legacy-key cases because this new worktree lacked the pinned
+  Sparkle `sign_update` artifact. Reusing the existing checkout's pinned
+  artifact resolved both. Evidence: `/tmp/flo-r5-release-contract.log` and
+  `/tmp/flo-r5-release-contract-with-artifacts.log`.
+- PASS: read-only native `running_apps()` lookup found one matching app. No
+  termination was requested.
+- NOT RUN: actual installation, normal Quit against a running app, launch-agent
+  behavior, or a live dictation. Swift behavior did not change.
