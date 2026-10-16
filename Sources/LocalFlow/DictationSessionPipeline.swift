@@ -1,20 +1,19 @@
 import Foundation
 
-/// How often a held dictation is transcribed for live text. Whisper Turbo
-/// took 350 to 975 ms per chunk, so it waits 8 s and ticks every 4 s.
-/// Parakeet took 40 to 90 ms on the same clips, so it can start at 4 s and
-/// tick every 2 s.
+/// Safe chunks keep their engine-specific cadence and pause boundaries.
+/// HUD previews start after 1 s and refresh independently of those boundaries.
 ///
 /// Previews transcribe the uncommitted audio for the HUD only and are never
-/// committed. Parakeet takes about 50 ms for a short clip, so it previews
-/// every second from 1 s. Whisper is too slow for that and has none.
+/// committed. Busy previews skip ticks rather than queue more inference.
 struct IncrementalCadence: Equatable {
     let startSeconds: TimeInterval
     let tickSeconds: TimeInterval
     var previewTickSeconds: TimeInterval? = nil
     var previewStartSeconds: TimeInterval = 0
 
-    static let whisper = IncrementalCadence(startSeconds: 8, tickSeconds: 4)
+    static let whisper = IncrementalCadence(
+        startSeconds: 8, tickSeconds: 4, previewTickSeconds: 1, previewStartSeconds: 1
+    )
     static let parakeet = IncrementalCadence(
         startSeconds: 4, tickSeconds: 2, previewTickSeconds: 1, previewStartSeconds: 1
     )
@@ -28,11 +27,13 @@ struct IncrementalCadence: Equatable {
         previewTickSeconds.map { min($0, tickSeconds) } ?? tickSeconds
     }
 
-    static func forModel(_ id: String) -> IncrementalCadence {
-        switch TranscriptionModel.engine(forID: id) {
+    static func forModel(_ id: String, liveTranscript: Bool = true) -> IncrementalCadence {
+        var cadence: IncrementalCadence = switch TranscriptionModel.engine(forID: id) {
         case .whisper: .whisper
         case .parakeet: .parakeet
         }
+        if !liveTranscript { cadence.previewTickSeconds = nil }
+        return cadence
     }
 }
 
@@ -133,6 +134,12 @@ final class DictationSessionPipeline {
         let tail: DictationAudioPreparation
     }
 
+    private struct DisplayedPreview {
+        let range: Range<Int>
+        let prefix: String
+        let text: String
+    }
+
     private final class Session {
         let generation: Int
         let context: DictationSessionContext
@@ -142,11 +149,11 @@ final class DictationSessionPipeline {
         var capturedAudioSaved = false
         var pendingChunks: [IncrementalChunk] = []
         var activeTask: Task<Void, Never>?
-        /// Never cancelled: cancelling inference quarantines the engine.
-        /// Dropping the reference is enough, since `isCurrent` rejects
-        /// stale results.
+        /// Normal release and Escape leave inference running. Only explicit
+        /// interruption or a stall deadline cancels it and quarantines the engine.
         var previewTask: Task<Void, Never>?
         var lastPreviewRange: Range<Int>?
+        var displayedPreview: DisplayedPreview?
         var nextChunkSnapshotSamples = 0
         /// Text cleanup never touches the speech engine, so it is always
         /// safe to cancel.
@@ -289,7 +296,20 @@ final class DictationSessionPipeline {
         guard canStartPreview(session),
               samples.count >= Int(cadence.previewStartSeconds * AudioRecorder.sampleRate),
               session.completedSampleEnd < samples.count else { return }
-        let start = session.completedSampleEnd
+        let committedEnd = session.completedSampleEnd
+        // A long hold without a pause must not re-decode minutes of audio
+        // every second or leave release waiting behind that preview.
+        let displayed = session.displayedPreview
+        var start = max(committedEnd, displayed?.range.lowerBound ?? committedEnd)
+        var prefix = start == committedEnd ? session.committedText : displayed?.prefix ?? ""
+        if samples.count - start > Int(15 * AudioRecorder.sampleRate) {
+            // Freeze the displayed hypothesis before starting another bounded
+            // window. This prefix is for the HUD only, never final delivery.
+            start = max(committedEnd, displayed?.range.upperBound ?? 0,
+                        samples.count - Int(15 * AudioRecorder.sampleRate))
+            prefix = (displayed?.range.upperBound ?? 0) > committedEnd
+                ? displayed?.text ?? session.committedText : session.committedText
+        }
         let range = start..<samples.count
         guard range != session.lastPreviewRange else { return }
         let audio = DictationAudioPreparation(samples: Array(samples[range]))
@@ -308,10 +328,12 @@ final class DictationSessionPipeline {
             session.previewTask = nil
             guard let text, !text.isEmpty, isCurrent(session),
                   session.releaseAudio == nil,
-                  session.completedSampleEnd == start else { return }
-            onPartialTranscript?(session.generation, Transcriber.joinTranscriptParts(
-                session.committedText, text, pauseSeconds: session.nextPauseSeconds
-            ))
+                  session.completedSampleEnd == committedEnd else { return }
+            let preview = Transcriber.joinTranscriptParts(
+                prefix, text, pauseSeconds: start == committedEnd ? session.nextPauseSeconds : 0
+            )
+            session.displayedPreview = DisplayedPreview(range: range, prefix: prefix, text: preview)
+            onPartialTranscript?(session.generation, preview)
         }
     }
 
@@ -420,6 +442,7 @@ final class DictationSessionPipeline {
             session.personalVoice?.finish(status: "cancelled")
             session.cancelled = true
             session.pendingChunks.removeAll()
+            if interruptInference { session.previewTask?.cancel() }
             session.previewTask = nil
             if interruptInference || session.activeTaskIsCleanup {
                 session.activeTask?.cancel()
@@ -480,14 +503,13 @@ final class DictationSessionPipeline {
                     text,
                     pauseSeconds: chunk.pauseSecondsBefore
                 )
-                // With previews on, the HUD already shows these words plus
-                // the ones after the cut. Showing only the committed text
-                // would drop the newer words until the next preview.
-                if session.context.incrementalCadence.previewTickSeconds == nil {
+                session.completedSampleEnd = chunk.sourceEndIndex ?? session.completedSampleEnd
+                // Keep a preview that covers newer words. A successful chunk
+                // must still appear if no preview has supplied those words.
+                if (session.displayedPreview?.range.upperBound ?? 0) <= session.completedSampleEnd {
                     onPartialTranscript?(session.generation, session.committedText)
                 }
                 session.chunkCount += 1
-                session.completedSampleEnd = chunk.sourceEndIndex ?? session.completedSampleEnd
                 session.trace?.record(.chunkCompleted, fields: [
                     .chunkIndex: Double(chunk.index), .completedEnd: Double(session.completedSampleEnd)
                 ])
@@ -736,6 +758,8 @@ final class DictationSessionPipeline {
             guard let self, let session, self.isCurrent(session) else { return }
             session.releaseTimeout = nil
             session.trace?.record(.cancellationRequested)
+            session.previewTask?.cancel()
+            session.previewTask = nil
             session.activeTask?.cancel()
             session.activeTask = nil
             session.pendingChunks.removeAll()

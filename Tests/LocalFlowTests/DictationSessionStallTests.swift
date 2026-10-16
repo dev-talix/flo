@@ -164,6 +164,55 @@ final class DictationSessionStallTests: XCTestCase {
         try await verifyNoncooperativeInference(dictations: 2)
     }
 
+    func testStalledPreviewReleasesDictationAndAllowsModelRecoveryAfterDeadline() async throws {
+        let blocked = NoncooperativeInference()
+        let old = FakeEngine()
+        old.inference = { await blocked.run() }
+        let replacement = FakeEngine()
+        replacement.inference = { syntheticResult("recovered words") }
+        var loads = 0
+        let transcriber = Transcriber(modelLoader: { _, _ in
+            loads += 1
+            return loads == 1 ? old : replacement
+        })
+        try await transcriber.load(model: "test")
+        var outcomes: [DictationSessionOutcome] = []
+        var partials: [String] = []
+        let pipeline = DictationSessionPipeline(
+            transcribe: { try await transcriber.transcribe(samples: $0.samples) },
+            cleanup: { .init(text: $0.text, succeeded: true) },
+            onOutcome: { outcomes.append($0) },
+            onPartialTranscript: { _, text in partials.append(text) },
+            stalledGenerationTimeout: 0.04
+        )
+        pipeline.begin(generation: 102, context: context)
+        pipeline.processIncrementalSnapshot(generation: 102, samples: speech + speech)
+        for _ in 0..<1_000 {
+            if await blocked.calls == 1 { break }
+            await Task.yield()
+        }
+        let previewCalls = await blocked.calls
+        XCTAssertEqual(previewCalls, 1)
+        pipeline.release(generation: 102, fullSamples: speech + speech)
+        for _ in 0..<200 {
+            if !outcomes.isEmpty, !(await transcriber.isLoaded) { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(outcomes, [.failed(generation: 102, message: "Transcription timed out after recording ended.")])
+        let loadedAfterTimeout = await transcriber.isLoaded
+        XCTAssertFalse(loadedAfterTimeout, "The stalled preview must quarantine its engine")
+        try await transcriber.load(model: "test")
+        XCTAssertEqual(loads, 2)
+        pipeline.begin(generation: 103, context: context)
+        pipeline.release(generation: 103, fullSamples: speech)
+        for _ in 0..<200 where outcomes.count < 2 { try? await Task.sleep(nanoseconds: 5_000_000) }
+        XCTAssertEqual(outcomes.last, .finalTranscript(generation: 103, text: "recovered words"))
+        await blocked.finish()
+        await settleAsyncWork()
+        XCTAssertTrue(partials.isEmpty)
+        XCTAssertEqual(outcomes.count, 2)
+    }
+
     func testRecordingHasNoDeadlineUntilRelease() async {
         let inference = StallCaseTranscriber(hungGeneration: 101, completedText: "")
         var outcomes: [DictationSessionOutcome] = []

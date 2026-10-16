@@ -141,7 +141,7 @@ final class WaveformOverlay {
         content.setPhase(.processing)
     }
 
-    /// Raw text of the chunks finished so far. Ignored once the HUD is
+    /// Raw preview or completed transcript. Ignored once the HUD is
     /// hiding, so a late chunk can't write into the next press's panel.
     func showTranscript(_ text: String) {
         guard acceptsTranscript else { return }

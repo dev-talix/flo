@@ -533,7 +533,7 @@ final class DictationSessionPipelineTests: XCTestCase {
         expectEqual(await transcriber.sampleCounts(.preview, generation: 91), [speech.count * 2])
         expectTrue(await transcriber.succeed("second", segment: .preview, generation: 91))
         await settleAsyncWork()
-        XCTAssertEqual(partials, [PartialTranscript(generation: 91, text: "first second")])
+        XCTAssertEqual(partials.map(\.text), ["first", "first second"])
         pipeline.cancel(generation: 91)
     }
 
@@ -559,14 +559,14 @@ final class DictationSessionPipelineTests: XCTestCase {
         expectTrue(await transcriber.succeed("stale preview", segment: .preview, generation: 92))
         await settleAsyncWork()
         // The preview covered audio that is now committed, so it is dropped.
-        // With previews on, the commit itself leaves the HUD text alone.
-        XCTAssertEqual(partials, [])
+        // No preview has reached the HUD, so the committed words still appear.
+        XCTAssertEqual(partials.map(\.text), ["committed"])
 
         pipeline.processIncrementalSnapshot(generation: 92, samples: snapshot + speech)
         expectTrue(await waitForCall(.preview, generation: 92, in: transcriber, minimumCount: 2))
         expectTrue(await transcriber.succeed("fresh", segment: .preview, generation: 92))
         await settleAsyncWork()
-        XCTAssertEqual(partials, [PartialTranscript(generation: 92, text: "committed fresh")])
+        XCTAssertEqual(partials.map(\.text), ["committed", "committed fresh"])
         pipeline.cancel(generation: 92)
     }
 
@@ -593,11 +593,11 @@ final class DictationSessionPipelineTests: XCTestCase {
         expectTrue(await transcriber.succeed("second", segment: .releaseTail, generation: 93))
         expectTrue(await waitForOutcomes(1, in: outcomes))
         XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 93, text: "first second")])
-        XCTAssertEqual(partials, [PartialTranscript(generation: 93, text: "first second")])
+        XCTAssertEqual(partials.map(\.text), ["first", "first second"])
         expectFalse(await transcriber.hasCall(.fullUtterance, generation: 93))
     }
 
-    func testReleaseDoesNotWaitForPreviewAndDropsItsLateResult() async {
+    func testReleaseSubmitsFinalRecognitionAndDropsLatePreview() async {
         let transcriber = ControlledTranscriber()
         let outcomes = OutcomeRecorder()
         var partials: [PartialTranscript] = []
@@ -617,21 +617,142 @@ final class DictationSessionPipelineTests: XCTestCase {
         XCTAssertEqual(partials, [])
     }
 
-    func testWhisperNeverPreviews() async {
+    func testWhisperPreviewsContinuousSpeechEarlyAndRepeatedlyWithoutCommitting() async {
         let transcriber = ControlledTranscriber()
         let outcomes = OutcomeRecorder()
+        var partials: [PartialTranscript] = []
         let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
-                                    outcomes: outcomes)
+                                    outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
 
         pipeline.begin(generation: 95, context: context())
-        for seconds in 1...10 {
+        // Capture can be a little behind the first timer tick.
+        pipeline.processIncrementalSnapshot(generation: 95, samples: Array(speech.dropLast(400)))
+        await settleAsyncWork()
+        expectEqual(await transcriber.callCount(.preview, generation: 95), 0)
+        pipeline.processIncrementalSnapshot(generation: 95, samples: speech + speech)
+        expectTrue(await waitForCall(.preview, generation: 95, in: transcriber))
+        for seconds in 3...10 {
             pipeline.processIncrementalSnapshot(
                 generation: 95, samples: Array(repeating: 0.2, count: speech.count * seconds)
             )
         }
         await settleAsyncWork()
-        expectEqual(await transcriber.callCount(.preview, generation: 95), 0)
-        pipeline.cancel(generation: 95)
+        expectEqual(await transcriber.callCount(.preview, generation: 95), 1)
+        expectTrue(await transcriber.succeed("early words", segment: .preview, generation: 95))
+        await settleAsyncWork()
+        let latestAudio = [Float](repeating: 0.2, count: speech.count * 11)
+        pipeline.processIncrementalSnapshot(generation: 95, samples: latestAudio)
+        expectTrue(await waitForCall(.preview, generation: 95, in: transcriber, minimumCount: 2))
+        expectTrue(await transcriber.succeed("early words keep coming", segment: .preview, generation: 95))
+        await settleAsyncWork()
+        XCTAssertEqual(partials.map(\.text), ["early words", "early words keep coming"])
+        XCTAssertEqual(pipeline.incrementalSampleEnd(generation: 95), 0)
+
+        pipeline.release(generation: 95, fullSamples: latestAudio)
+        expectTrue(await waitForCall(.fullUtterance, generation: 95, in: transcriber))
+        expectEqual(await transcriber.sampleCounts(.fullUtterance, generation: 95), [latestAudio.count])
+        expectTrue(await transcriber.succeed("final recognition", segment: .fullUtterance, generation: 95))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 95, text: "final recognition")])
+    }
+
+    func testLongContinuousPreviewIsBoundedWhileFinalRecognitionKeepsAllAudio() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        var partials: [PartialTranscript] = []
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
+        let samples = [Float](repeating: 0.2, count: speech.count * 45)
+        pipeline.begin(generation: 96, context: context())
+        pipeline.processIncrementalSnapshot(generation: 96, samples: samples)
+        expectTrue(await waitForCall(.preview, generation: 96, in: transcriber))
+        let counts = await transcriber.sampleCounts(.preview, generation: 96)
+        XCTAssertEqual(counts.count, 1)
+        XCTAssertLessThanOrEqual(counts.first ?? Int.max, speech.count * 15)
+        expectTrue(await transcriber.succeed("recent words", segment: .preview, generation: 96))
+        await settleAsyncWork()
+        XCTAssertEqual(partials.map(\.text), ["recent words"])
+
+        pipeline.release(generation: 96, fullSamples: samples)
+        expectTrue(await waitForCall(.fullUtterance, generation: 96, in: transcriber))
+        expectEqual(await transcriber.sampleCounts(.fullUtterance, generation: 96), [samples.count])
+        expectTrue(await transcriber.succeed("all words", segment: .fullUtterance, generation: 96))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 96, text: "all words")])
+    }
+
+    func testBoundedPreviewPreservesDisplayedWordsWhenItsWindowAdvances() async {
+        for hasCommittedPrefix in [false, true] {
+            let generation = hasCommittedPrefix ? 102 : 101
+            let transcriber = ControlledTranscriber()
+            let outcomes = OutcomeRecorder()
+            var partials: [PartialTranscript] = []
+            let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                        outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
+            pipeline.begin(generation: generation, context: context())
+            if hasCommittedPrefix {
+                pipeline.processIncrementalChunk(generation: generation, samples: speech,
+                                                 pauseSecondsAfterChunk: 0, sourceEndIndex: speech.count)
+                expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: generation, in: transcriber))
+                expectTrue(await transcriber.succeed("committed", segment: .incrementalChunk(index: 0), generation: generation))
+                await settleAsyncWork()
+            }
+            let seconds = hasCommittedPrefix ? 16 : 15
+            let prefix = hasCommittedPrefix ? "committed " : ""
+            for (index, text) in ["earlier words", "new words", "new words again"].enumerated() {
+                let samples = [Float](repeating: 0.2, count: speech.count * (seconds + index))
+                pipeline.processIncrementalSnapshot(generation: generation, samples: samples)
+                expectTrue(await waitForCall(.preview, generation: generation, in: transcriber, minimumCount: index + 1))
+                expectTrue(await transcriber.succeed(text, segment: .preview, generation: generation))
+                await settleAsyncWork()
+            }
+            XCTAssertEqual(partials.suffix(3).map(\.text), [
+                prefix + "earlier words", prefix + "earlier words new words",
+                prefix + "earlier words new words again"
+            ])
+            expectEqual(await transcriber.sampleCounts(.preview, generation: generation),
+                        [15 * speech.count, speech.count, 2 * speech.count])
+            XCTAssertTrue(outcomes.values.isEmpty)
+            pipeline.cancel(generation: generation)
+        }
+    }
+
+    func testChunkDoesNotReplacePreviewThatAlreadyCoversNewerWords() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        var partials: [PartialTranscript] = []
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
+        pipeline.begin(generation: 99, context: context())
+        pipeline.processIncrementalSnapshot(generation: 99, samples: speech + speech + speech)
+        expectTrue(await waitForCall(.preview, generation: 99, in: transcriber))
+        expectTrue(await transcriber.succeed("first newer words", segment: .preview, generation: 99))
+        await settleAsyncWork()
+        pipeline.processIncrementalChunk(generation: 99, samples: speech, pauseSecondsAfterChunk: 0,
+                                         sourceEndIndex: speech.count)
+        expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: 99, in: transcriber))
+        expectTrue(await transcriber.succeed("first", segment: .incrementalChunk(index: 0), generation: 99))
+        await settleAsyncWork()
+        XCTAssertEqual(partials.map(\.text), ["first newer words"])
+        pipeline.cancel(generation: 99)
+    }
+
+    func testCancelledWhisperPreviewCannotUpdateTheNextDictation() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        var partials: [PartialTranscript] = []
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
+        pipeline.begin(generation: 97, context: context())
+        pipeline.processIncrementalSnapshot(generation: 97, samples: speech + speech)
+        expectTrue(await waitForCall(.preview, generation: 97, in: transcriber))
+        pipeline.cancel(generation: 97, interruptInference: false)
+        pipeline.begin(generation: 98, context: context())
+        expectTrue(await transcriber.succeed("stale", segment: .preview, generation: 97))
+        await settleAsyncWork()
+        XCTAssertTrue(partials.isEmpty)
+        XCTAssertTrue(outcomes.values.isEmpty)
+        pipeline.cancel(generation: 98)
     }
 
     private func parakeetContext() -> DictationSessionContext {

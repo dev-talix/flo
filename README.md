@@ -55,8 +55,9 @@ shasum -a 256 -c SHA256SUMS.txt   # attached to each release
 Hold **Right Option**, speak, release. **Escape** cancels before the text is ready.
 Change the hotkey, speech model, microphone, and HUD theme in Settings.
 
-- **Live transcript.** Finished chunks appear in a panel above the HUD while you talk.
-  This text is raw; Flo pastes the final text after release.
+- **Live transcript.** A panel above the HUD previews recent speech, starting after
+  about a second of captured audio and refreshing as recognition finishes. It keeps
+  updating without a pause. This text is raw; Flo pastes the final text after release.
 - **Formatting.** Long pauses start paragraphs; "first... second..." makes
   numbered lists. Say "new line", "new paragraph", "bullet point", "numbered
   list", or "thumbs up emoji". Commands always apply, even mid-sentence.

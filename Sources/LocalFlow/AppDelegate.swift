@@ -838,7 +838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             corrections: Settings.corrections,
             snippets: Settings.snippets,
             ollamaModel: Settings.ollamaModel,
-            incrementalCadence: .forModel(Settings.whisperModel)
+            incrementalCadence: .forModel(Settings.whisperModel, liveTranscript: Settings.liveTranscript)
         )
     }
 
