@@ -40,18 +40,31 @@ final class TranscriptionModelTests: XCTestCase {
         XCTAssertEqual(IncrementalCadence.forModel(TranscriptionModel.defaultID), .whisper)
         XCTAssertEqual(IncrementalCadence.forModel(TranscriptionModel.parakeetV3ID), .parakeet)
         XCTAssertEqual(IncrementalCadence.forModel("not-a-model"), .whisper)
-        XCTAssertEqual(IncrementalCadence.whisper, IncrementalCadence(startSeconds: 8, tickSeconds: 4))
+        XCTAssertEqual(IncrementalCadence.whisper.startSeconds, 8)
+        XCTAssertEqual(IncrementalCadence.whisper.tickSeconds, 4)
         XCTAssertEqual(IncrementalCadence.parakeet, IncrementalCadence(
             startSeconds: 4, tickSeconds: 2, previewTickSeconds: 1, previewStartSeconds: 1
         ))
     }
 
-    func testOnlyParakeetPreviewsAndSnapshotsFollowTheFasterCadence() {
-        XCTAssertNil(IncrementalCadence.whisper.previewTickSeconds)
-        XCTAssertEqual(IncrementalCadence.whisper.firstSnapshotSeconds, 8)
-        XCTAssertEqual(IncrementalCadence.whisper.snapshotSeconds, 4)
-        XCTAssertEqual(IncrementalCadence.parakeet.previewTickSeconds, 1)
-        XCTAssertEqual(IncrementalCadence.parakeet.firstSnapshotSeconds, 1)
-        XCTAssertEqual(IncrementalCadence.parakeet.snapshotSeconds, 1)
+    func testBothEnginesPreviewBeforeTheirFirstCommittedChunk() {
+        for cadence in [IncrementalCadence.whisper, .parakeet] {
+            XCTAssertNotNil(cadence.previewTickSeconds)
+            XCTAssertLessThanOrEqual(cadence.firstSnapshotSeconds, 1)
+            XCTAssertLessThanOrEqual(cadence.snapshotSeconds, 1)
+            XCTAssertLessThan(cadence.firstSnapshotSeconds, cadence.startSeconds)
+        }
+    }
+
+    func testDisablingLiveTranscriptKeepsChunkCadenceWithoutPreviewWork() {
+        for model in [TranscriptionModel.defaultID, TranscriptionModel.parakeetV3ID] {
+            let enabled = IncrementalCadence.forModel(model)
+            let disabled = IncrementalCadence.forModel(model, liveTranscript: false)
+            XCTAssertNil(disabled.previewTickSeconds)
+            XCTAssertEqual(disabled.startSeconds, enabled.startSeconds)
+            XCTAssertEqual(disabled.tickSeconds, enabled.tickSeconds)
+            XCTAssertEqual(disabled.firstSnapshotSeconds, enabled.startSeconds)
+            XCTAssertEqual(disabled.snapshotSeconds, enabled.tickSeconds)
+        }
     }
 }

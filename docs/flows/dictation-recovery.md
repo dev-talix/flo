@@ -38,6 +38,93 @@ manual retries never create personal voice clips. Quitting loses retry audio.
 Optional [diagnostic recordings](diagnostic-recordings.md) keep independent disk
 copies and do not restore the retry queue.
 
+## Live transcript latency, October 15, 2026
+
+Owner: Flo maintainers. The user reported a roughly ten-second wait for the
+transcript panel, followed by updates in similar bursts. The requirement is
+early, repeated previews during speech, including speech without pauses.
+Final recognition, cleanup, delivery, and safe chunk boundaries retain their
+existing contracts.
+
+Timing-only inspection of 31 recent Whisper Turbo dictations on the installed
+1.11.1 release found no preview requests. The first incremental result arrived
+after a median 8.507 seconds, ranging from 8.402 to 12.689 seconds. Inference
+took a median 446 ms across 88 calls. The eight-second timer sometimes fired
+before eight seconds of audio existed, deferring recognition another four
+seconds. Missing silence boundaries also deferred updates. These traces measure
+result availability, not the moment AppKit displays text.
+
+`AppDelegate.captureDictationContext` now selects previews for either speech
+engine when live transcript is enabled. `IncrementalCadence` schedules snapshots
+from one second and every second thereafter. A snapshot just below the initial
+audio threshold retries on the next tick. `startPreviewIfNeeded` runs one preview
+at a time and drops busy ticks. Preview text never advances committed audio or
+enters final recognition, cleanup, history, or delivery.
+
+Preview inputs cover at most the last 15 seconds after the committed boundary.
+Long continuous holds show recent speech without joining text across omitted
+audio. Release still recognizes every uncommitted sample. Chunk completion
+updates the panel if it catches up with the displayed preview, or if no preview
+succeeded. It preserves a preview covering newer words. Disabling live transcript
+removes preview inference and retains the previous chunk schedule.
+
+Release and Escape discard late preview output without interrupting running
+inference. Explicit interruption and the existing release deadline cancel a
+stalled preview, allowing Transcriber to quarantine its engine. Retrying can
+then load a replacement engine instead of waiting behind the abandoned preview.
+
+Acceptance checks are `TranscriptionModelTests` for cadence and disabled
+previews, `DictationSessionPipelineTests` for repeated continuous-speech previews,
+busy ticks, bounded input, full final audio, displayed coverage, and cancellation,
+and `DictationSessionStallTests.testStalledPreviewReleasesDictationAndAllowsModelRecoveryAfterDeadline`
+for recovery through the real Transcriber gate with a suspended fake engine.
+The first preview regression run failed before the cadence change. The stall
+regression separately reproduced the engine remaining loaded and retry failing.
+
+Verified on macOS 27.0.1, Apple M5 Pro, Swift 6.4, base
+`045683cec7d56fa2936ec0dfe742f46474e3b022` plus the uncommitted fix.
+Evidence files use the `/tmp/flo-live-transcript-` prefix.
+
+- PASS: `swift test --disable-automatic-resolution` and
+  `swift test -c release --disable-automatic-resolution`, each with 386 tests,
+  zero failures, and one optional HUD render test skipped. Logs are `tests.log`
+  and `release-tests.log` under the evidence prefix. Red evidence is `red.log`
+  and `stall-red.log`; the latter reproduced three recovery failures.
+- PASS: `python3 -B Tests/StartupReadinessTests.py`, four tests;
+  `git diff --check`; `LOCAL_BUILD=1 SKIP_PREWARM=1 ./scripts/make-app.sh`;
+  `codesign --verify --deep --strict 'build/Flo Local.app'`. The signed local
+  bundle is built, with installation and switching the running app NOT RUN.
+- PASS: generated Samantha speech, 12.46 seconds, replayed through installed
+  1.11.1 once and the new local bundle twice using `--replay
+  /tmp/flo-live-transcript-fixture.aiff --runs N --no-cleanup --whisper-model
+  openai_whisper-large-v3-v20240930_turbo`. The baseline had no live result
+  before release. New first preview results arrived at 1.481 and 1.467 seconds,
+  with median update intervals of 1.044 and 1.061 seconds. All 39 final words
+  matched the baseline after case normalization. Release-to-result time was
+  1.140 and 1.203 seconds versus 1.321 seconds before. Logs and outputs are
+  `baseline.log`, `baseline.out`, `candidate.log`, and `candidate.out` under the
+  evidence prefix. The new local identity needed 65.9 seconds of Core ML model
+  preparation before replay; session timings exclude model loading.
+- NOT RUN: live microphone capture, actual panel visibility timing, and insertion
+  into the focused app. Replay checks recognition availability without opening
+  the HUD, microphone, or injection path. Maintainers own this live check after
+  installing the local bundle. Full source evidence is
+  `/tmp/flo-live-transcript-final.diff`. No new abstraction was introduced.
+
+The user subsequently requested rebuilding the local app. PASS:
+`./scripts/local-app.sh install` rebuilt and installed Flo Local 1.11.1 from
+the modified working tree. The installed executable matches the packaged
+executable, and post-launch `codesign --verify --deep --strict` passed. The
+previous local bundle is preserved in `/Applications/.flo-local.7ErchD`.
+The running production app used a relative executable path, which the install
+script's process matcher missed. After checking that its session had no
+unresolved dictations, a normal Quit request through its bundle ID stopped it.
+Launching the installed local app then completed readiness with a 0.13-second
+Parakeet load, preserving the local channel's saved model selection. This
+supersedes the earlier installation NOT RUN status.
+Evidence is `/tmp/flo-live-transcript-install.log`. Live microphone dictation
+and visible panel timing still require a user check.
+
 ## Near-silent recording latency
 
 On September 13, 2026, the user reported slow results after release, especially
