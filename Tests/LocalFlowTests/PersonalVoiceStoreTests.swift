@@ -439,6 +439,221 @@ final class PersonalVoiceStoreTests: XCTestCase {
         XCTAssertEqual(Set(recovered.clips.map(\.id)).count, 2)
     }
 
+    func testDiagnosticReconciliationSkipsDestinationSymlinkWithoutChangingExternalClip() async throws {
+        let root = try temporaryDirectory()
+        let diagnosticFolder = root.appendingPathComponent("diagnostics")
+        let diagnostics = DictationDiagnosticStore(folder: diagnosticFolder)
+        let source = diagnostics.begin(metadata())
+        source.saveAudio([0.25, -0.25])
+        source.record(.init(stage: "capture", sampleCount: 2))
+        source.record(.init(stage: "assembledTranscript", text: "original automatic text"))
+        diagnostics.flush()
+        let voiceFolder = root.appendingPathComponent("voice")
+        let store = PersonalVoiceStore(folder: voiceFolder, diagnosticsFolder: diagnosticFolder)
+        _ = try await store.importDiagnostics()
+        try await store.updateReview(id: source.id, transcript: "Reviewed words.", approved: true)
+        let destination = voiceFolder.appendingPathComponent(source.id.uuidString)
+        let external = root.appendingPathComponent("outside-voice")
+        try FileManager.default.moveItem(at: destination, to: external)
+        try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: external)
+        let metadataURL = external.appendingPathComponent("clip.json")
+        let audioURL = external.appendingPathComponent("audio.wav")
+        let beforeMetadata = try Data(contentsOf: metadataURL)
+        let beforeAudio = try Data(contentsOf: audioURL)
+        source.record(.init(stage: "assembledTranscript", text: "late automatic text"))
+        source.record(.init(stage: "finalTranscript", text: "Late automatic text."))
+        diagnostics.flush()
+
+        for _ in 0..<2 {
+            let count = try await store.importDiagnostics()
+            XCTAssertEqual(count, 0)
+            XCTAssertEqual(try Data(contentsOf: metadataURL), beforeMetadata)
+            XCTAssertEqual(try Data(contentsOf: audioURL), beforeAudio)
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: destination.path), external.path)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: external.path).sorted(), ["audio.wav", "clip.json"])
+        }
+        let snapshot = try await store.snapshot()
+        XCTAssertTrue(snapshot.clips.isEmpty)
+        XCTAssertEqual(snapshot.usedBytes, 0)
+    }
+
+    func testDiagnosticImportSkipsPlainFileAndDanglingLinkDestinations() async throws {
+        for danglingLink in [false, true] {
+            let root = try temporaryDirectory()
+            let diagnosticFolder = root.appendingPathComponent("diagnostics")
+            let diagnostics = DictationDiagnosticStore(folder: diagnosticFolder)
+            let source = diagnostics.begin(metadata())
+            source.saveAudio([0.25])
+            source.record(.init(stage: "capture", sampleCount: 1))
+            diagnostics.flush()
+            let voiceFolder = root.appendingPathComponent("voice")
+            try FileManager.default.createDirectory(at: voiceFolder, withIntermediateDirectories: false)
+            let destination = voiceFolder.appendingPathComponent(source.id.uuidString)
+            let missing = root.appendingPathComponent("missing-target")
+            let sentinel = Data("unmanaged file".utf8)
+            if danglingLink {
+                try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: missing)
+            } else {
+                try sentinel.write(to: destination)
+            }
+            let store = PersonalVoiceStore(folder: voiceFolder, diagnosticsFolder: diagnosticFolder)
+
+            let count = try await store.importDiagnostics()
+            XCTAssertEqual(count, 0)
+            if danglingLink {
+                XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: destination.path), missing.path)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+            } else {
+                XCTAssertEqual(try Data(contentsOf: destination), sentinel)
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: voiceFolder.path).sorted(),
+                           [".archive.lock", source.id.uuidString].sorted())
+        }
+    }
+
+    func testDiagnosticReconciliationRejectsExistingClipIdentityMismatch() async throws {
+        for nestedIdentity in [false, true] {
+            let root = try temporaryDirectory()
+            let diagnosticFolder = root.appendingPathComponent("diagnostics")
+            let diagnostics = DictationDiagnosticStore(folder: diagnosticFolder)
+            let source = diagnostics.begin(metadata())
+            source.saveAudio([0.25])
+            source.record(.init(stage: "capture", sampleCount: 1))
+            diagnostics.flush()
+            let voiceFolder = root.appendingPathComponent("voice")
+            let store = PersonalVoiceStore(folder: voiceFolder, diagnosticsFolder: diagnosticFolder)
+            _ = try await store.importDiagnostics()
+            let clipURL = voiceFolder.appendingPathComponent("\(source.id.uuidString)/clip.json")
+            try rewriteJSONObject(at: clipURL) { object in
+                if nestedIdentity {
+                    var metadata = try XCTUnwrap(object["metadata"] as? [String: Any])
+                    metadata["traceID"] = UUID().uuidString
+                    object["metadata"] = metadata
+                } else {
+                    object["id"] = UUID().uuidString
+                }
+            }
+            let metadataBytes = try Data(contentsOf: clipURL)
+            let audio = try Data(contentsOf: store.audioURL(for: source.id))
+            source.record(.init(stage: "assembledTranscript", text: "late text"))
+            diagnostics.flush()
+
+            do {
+                _ = try await store.importDiagnostics()
+                XCTFail("Existing clip identity must match its managed directory and diagnostic source")
+            } catch PersonalVoiceStore.ArchiveError.missingClip {}
+            XCTAssertEqual(try Data(contentsOf: clipURL), metadataBytes)
+            XCTAssertEqual(try Data(contentsOf: store.audioURL(for: source.id)), audio)
+        }
+    }
+
+    func testDiagnosticReconciliationContinuesPastEarlierNewClipAtCapacity() async throws {
+        let newID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        let existingID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+        for approved in [false, true] {
+            let root = try temporaryDirectory()
+            let diagnosticFolder = root.appendingPathComponent("diagnostics")
+            let diagnostics = DictationDiagnosticStore(folder: diagnosticFolder)
+            let existing = diagnostics.begin(metadata(id: existingID))
+            existing.saveAudio([0.25, -0.25])
+            existing.record(.init(stage: "capture", sampleCount: 2))
+            diagnostics.flush()
+            let voiceFolder = root.appendingPathComponent("voice")
+            let store = PersonalVoiceStore(folder: voiceFolder, diagnosticsFolder: diagnosticFolder)
+            _ = try await store.importDiagnostics()
+            let reviewed = approved ? "Exactly what I said. " : ""
+            try await store.updateReview(id: existingID, transcript: reviewed, approved: approved)
+            let before = try await store.snapshot()
+            let original = try XCTUnwrap(before.clips.first)
+            let audio = try Data(contentsOf: store.audioURL(for: existingID))
+            let new = diagnostics.begin(metadata(id: newID))
+            new.saveAudio([0.9])
+            new.record(.init(stage: "capture", sampleCount: 1))
+            diagnostics.flush()
+            let constrained = PersonalVoiceStore(folder: voiceFolder, maxBytes: before.usedBytes,
+                                                  diagnosticsFolder: diagnosticFolder)
+            let clipURL = voiceFolder.appendingPathComponent("\(existingID.uuidString)/clip.json")
+            for text in ["late words", "corrected words"] {
+                existing.record(.init(stage: "assembledTranscript", text: text))
+                existing.record(.init(stage: "finalTranscript", text: text + "."))
+                diagnostics.flush()
+                for attempt in 0..<2 {
+                    let previousBytes = try Data(contentsOf: clipURL)
+                    let previousIdentity = try FileManager.default.attributesOfItem(atPath: clipURL.path)[.systemFileNumber] as? NSNumber
+                    do {
+                        _ = try await constrained.importDiagnostics()
+                        XCTFail("Capacity failure must remain visible after reconciliation")
+                    } catch PersonalVoiceStore.ArchiveError.full {}
+                    let after = try await constrained.snapshot()
+                    let clip = try XCTUnwrap(after.clips.first)
+                    XCTAssertEqual(after.clips.map(\.id), [existingID])
+                    XCTAssertEqual(after.issue, PersonalVoiceStore.ArchiveError.full.localizedDescription)
+                    XCTAssertEqual(clip.rawTranscript, text)
+                    XCTAssertEqual(clip.finalTranscript, text + ".")
+                    XCTAssertEqual(clip.reviewedTranscript, reviewed)
+                    XCTAssertEqual(clip.approved, approved)
+                    XCTAssertEqual(clip.id, original.id)
+                    XCTAssertEqual(clip.createdAt, original.createdAt)
+                    XCTAssertEqual(clip.duration, original.duration)
+                    XCTAssertEqual(clip.sampleRate, original.sampleRate)
+                    XCTAssertEqual(clip.audioSource, original.audioSource)
+                    XCTAssertEqual(clip.failureReason, original.failureReason)
+                    XCTAssertEqual(clip.metadata?.traceID, original.metadata?.traceID)
+                    XCTAssertEqual(try Data(contentsOf: constrained.audioURL(for: existingID)), audio)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: constrained.audioURL(for: newID).path))
+                    XCTAssertEqual(try permissions(clipURL), 0o600)
+                    XCTAssertEqual(try permissions(clipURL.deletingLastPathComponent()), 0o700)
+                    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: voiceFolder.path).sorted(),
+                                   [".archive.lock", existingID.uuidString].sorted())
+                    if attempt == 1 {
+                        XCTAssertEqual(try Data(contentsOf: clipURL), previousBytes)
+                        let identity = try FileManager.default.attributesOfItem(atPath: clipURL.path)[.systemFileNumber] as? NSNumber
+                        XCTAssertNotNil(previousIdentity)
+                        XCTAssertEqual(identity, previousIdentity, "Identical imports must not replace metadata")
+                    }
+                }
+            }
+        }
+    }
+
+    func testDiagnosticReconciliationReportsReadErrorAfterDeferredCapacityFailure() async throws {
+        let root = try temporaryDirectory()
+        let diagnosticFolder = root.appendingPathComponent("diagnostics")
+        let diagnostics = DictationDiagnosticStore(folder: diagnosticFolder)
+        let existingID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000002"))
+        let existing = diagnostics.begin(metadata(id: existingID))
+        existing.saveAudio([0.25])
+        existing.record(.init(stage: "capture", sampleCount: 1))
+        diagnostics.flush()
+        let voiceFolder = root.appendingPathComponent("voice")
+        let store = PersonalVoiceStore(folder: voiceFolder, diagnosticsFolder: diagnosticFolder)
+        _ = try await store.importDiagnostics()
+        let clipURL = voiceFolder.appendingPathComponent("\(existingID.uuidString)/clip.json")
+        let metadataBytes = try Data(contentsOf: clipURL)
+        let audio = try Data(contentsOf: store.audioURL(for: existingID))
+        // A directory in place of metadata produces a real disk read error.
+        try FileManager.default.removeItem(at: clipURL)
+        try FileManager.default.createDirectory(at: clipURL, withIntermediateDirectories: false)
+        let sentinel = clipURL.appendingPathComponent("keep")
+        try metadataBytes.write(to: sentinel)
+        let newID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        let new = diagnostics.begin(metadata(id: newID))
+        new.saveAudio([0.9])
+        new.record(.init(stage: "capture", sampleCount: 1))
+        diagnostics.flush()
+        let constrained = PersonalVoiceStore(folder: voiceFolder, maxBytes: 1, diagnosticsFolder: diagnosticFolder)
+
+        do {
+            _ = try await constrained.importDiagnostics()
+            XCTFail("A non-capacity disk error must propagate")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, NSCocoaErrorDomain, "Expected the metadata read error, got \(error)")
+        }
+        XCTAssertEqual(try Data(contentsOf: sentinel), metadataBytes)
+        XCTAssertEqual(try Data(contentsOf: store.audioURL(for: existingID)), audio)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.audioURL(for: newID).path))
+    }
+
     func testImportWaitsForCaptureCompletionAndCanImportOnNextAttempt() async throws {
         let root = try temporaryDirectory()
         let diagnosticFolder = root.appendingPathComponent("diagnostics")
@@ -623,8 +838,8 @@ final class PersonalVoiceStoreTests: XCTestCase {
         return directory
     }
 
-    private func metadata() -> DictationDiagnosticStore.Metadata {
-        .init(traceID: UUID(),
+    private func metadata(id: UUID = UUID()) -> DictationDiagnosticStore.Metadata {
+        .init(traceID: id,
               context: .init(cleanupEnabled: true, styleProfile: .general, corrections: [], snippets: [],
                              ollamaModel: "test-cleaner"),
               whisperModel: "test-whisper", microphone: "synthetic-input", vocabulary: "")

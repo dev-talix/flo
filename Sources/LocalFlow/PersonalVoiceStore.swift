@@ -154,6 +154,7 @@ final class PersonalVoiceStore: @unchecked Sendable {
             guard fm.fileExists(atPath: self.diagnosticsFolder.path) else { return 0 }
             let sources = try fm.contentsOfDirectory(at: self.diagnosticsFolder, includingPropertiesForKeys: [.isSymbolicLinkKey])
             var imported = 0
+            var capacityExceeded = false
             for source in sources.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 guard let id = UUID(uuidString: source.lastPathComponent),
                       try source.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { continue }
@@ -179,7 +180,16 @@ final class PersonalVoiceStore: @unchecked Sendable {
                 // Capture is recorded on the diagnostic queue after the WAV closes.
                 // Interrupted traces remain reviewable; later imports reconcile automatic stages.
                 guard captureComplete else { continue }
-                if fm.fileExists(atPath: self.directory(id).path) {
+                let destinationAttributes: [FileAttributeKey: Any]?
+                do {
+                    destinationAttributes = try fm.attributesOfItem(atPath: self.directory(id).path)
+                } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                    destinationAttributes = nil
+                }
+                if let destinationAttributes {
+                    // Match archive enumeration: only real managed directories can reconcile.
+                    // Attributes inspect the link itself, including dangling links.
+                    guard destinationAttributes[.type] as? FileAttributeType == .typeDirectory else { continue }
                     let existing = try self.readClip(self.directory(id))
                     if rawTranscript.map({ $0 != existing.rawTranscript }) == true ||
                         finalTranscript.map({ $0 != existing.finalTranscript }) == true {
@@ -191,6 +201,7 @@ final class PersonalVoiceStore: @unchecked Sendable {
                     // Preserve audio, reviewed text, approval, and all other existing fields.
                     continue
                 }
+                guard !capacityExceeded else { continue }
                 clip.rawTranscript = rawTranscript ?? ""
                 clip.finalTranscript = finalTranscript
                 let audio = try AVAudioFile(forReading: original)
@@ -199,7 +210,13 @@ final class PersonalVoiceStore: @unchecked Sendable {
                 clip.sampleRate = audio.fileFormat.sampleRate
                 let metadataData = try self.encoder().encode(clip)
                 let bytes = try original.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
-                try self.checkCapacity(additional: Int64(bytes + metadataData.count))
+                do {
+                    try self.checkCapacity(additional: Int64(bytes + metadataData.count))
+                } catch ArchiveError.full {
+                    // Stop admitting audio, but finish existing clips before reporting full.
+                    capacityExceeded = true
+                    continue
+                }
                 let staging = self.root.appendingPathComponent(".pending-\(UUID().uuidString)", isDirectory: true)
                 try self.createDirectory(staging)
                 defer { try? fm.removeItem(at: staging) }
@@ -210,6 +227,7 @@ final class PersonalVoiceStore: @unchecked Sendable {
                 try fm.moveItem(at: staging, to: self.directory(id))
                 imported += 1
             }
+            if capacityExceeded { throw ArchiveError.full }
             return imported
         }
     }

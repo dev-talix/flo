@@ -199,3 +199,80 @@ R6 acceptance is covered by these `PersonalVoiceStoreTests` cases:
 Exact R6 commands, counts, source revisions, environment, and evidence are in
 [the R6 diagnostic verification record](diagnostic-recordings.md#r6-recovery-independent-expiry-october-16-2026).
 Interactive review/export UI and real diagnostic data were not exercised.
+
+## R6 destination boundary and capacity repair, October 16, 2026
+
+Owner: Flo maintainers. This repair addresses confirmed CS1 and CS2 from
+`/Users/nikhlkapadia/Talix/flo-pr-work/review-e5-r6-result.json`, confirmed separately
+in `verify-r6-symlink-result.txt` and `verify-r6-capacity-result.txt` in that folder.
+The accepted requirement remains R6 in
+`/tmp/flo-codebase-overview-20261016T032011.json`. This section covers explicit
+diagnostic import only; expiry, capture, delivery, and approval policy are unchanged.
+
+`PersonalVoiceStore.importDiagnostics` inspects an existing destination's own file
+attributes before reading its clip. Only a real directory enters reconciliation,
+matching archive enumeration's managed-directory policy. A directory symlink,
+plain file, or dangling link is skipped without replacing it or reading/writing
+its clip metadata. Only a missing destination enters audio admission. Other
+attribute errors propagate. A real directory still requires matching clip and
+nested metadata identities through `readClip`.
+
+On the first new clip's capacity failure, import stops admitting new audio for
+that invocation and continues the same loop to reconcile existing clips. It
+throws `ArchiveError.full` after the loop, preserving the caller's visible error
+and snapshot issue. Successful earlier copies and metadata updates remain.
+Other errors still abort immediately with their original error, including an
+existing clip's disk read failure after capacity was deferred. Retry repeats
+the capacity error while keeping identical automatic metadata untouched.
+The file lock, private atomic writer, source preservation, audio bytes, reviewed
+text, approval, and empty draft decisions retain their existing behavior.
+No new production abstraction was added.
+
+Disk-backed acceptance checks in `Tests/LocalFlowTests/PersonalVoiceStoreTests.swift`:
+
+- `testDiagnosticReconciliationSkipsDestinationSymlinkWithoutChangingExternalClip`
+  moves a valid imported clip outside the synthetic voice root and leaves a
+  symlink. Two imports preserve external metadata bytes, audio, and the link.
+- `testDiagnosticImportSkipsPlainFileAndDanglingLinkDestinations` preserves both
+  entry types and leaves no staged copy or newly created link target.
+- `testDiagnosticReconciliationRejectsExistingClipIdentityMismatch` preserves
+  files and reports both clip-ID and nested trace-ID mismatches.
+- `testDiagnosticReconciliationContinuesPastEarlierNewClipAtCapacity` fixes
+  UUID A before B, fills the archive with B, and leaves new A unadmitted while
+  B receives late then corrected raw/final text. It covers approved review and
+  an empty draft, private permissions, unchanged audio, and unchanged metadata
+  bytes and file identity on repeat imports. Every attempt still reports full.
+- `testDiagnosticReconciliationReportsReadErrorAfterDeferredCapacityFailure`
+  verifies that a real metadata read error propagates after new A is refused.
+
+Verification uses parent `aced1cb0b8f28faf1b4c8210790215258436b4f2` plus the repair
+diff at `/tmp/flo-r6-repair-implementation.diff`, captured before the single local
+repair commit. Environment: macOS 27.0.1, arm64, Swift 6.4. Local dependency caches
+were copied into this worktree's ignored `.build` and their copied artifact paths
+were remapped. All archive fixtures use temporary directories. The persistence
+check used this command; the other checks use the same prefix with their filters:
+
+```sh
+env CFFIXED_USER_HOME=/tmp/flo-r6-repair-home \
+  sandbox-exec -f /tmp/flo-r6-repair-offline.sb \
+  swift test --disable-sandbox --disable-automatic-resolution --skip-update \
+  --filter 'PersonalVoiceStoreTests|PersonalVoicePipelineTests|DictationDiagnosticStoreTests|DictationDiagnosticPipelineTests|DiagnosticsArchiveTests|NativeAudioRecordingTests'
+```
+
+The outer sandbox profile is `(version 1) (allow default) (deny network*)`.
+Disabling SwiftPM's nested sandbox avoids `sandbox_apply: Operation not permitted`.
+
+- EXPECTED FAIL, exit 1: the four new boundary/capacity/error regressions against
+  the unchanged parent implementation, 20 failures across four tests.
+  Filter: `PersonalVoiceStoreTests.testDiagnosticReconciliationSkipsDestination|PersonalVoiceStoreTests.testDiagnosticImportSkipsPlain|PersonalVoiceStoreTests.testDiagnosticReconciliationContinuesPast|PersonalVoiceStoreTests.testDiagnosticReconciliationReportsReadError`.
+  Evidence: `/tmp/flo-r6-repair-red.log`.
+- PASS, exit 0: `--filter 'PersonalVoiceStoreTests'`, 27 tests, zero failures.
+  Evidence: `/tmp/flo-r6-repair-focused.log`.
+- PASS, exit 0: the persistence command above, 69 tests, zero failures. It also
+  covers concurrent same-ID imports, quota accounting, atomic/private storage,
+  diagnostic persistence, and synthetic pipeline/native audio integration.
+  Evidence: `/tmp/flo-r6-repair-persistence.log`.
+- PASS, exit 0: `git diff --check`.
+- NOT RUN: full suite, release configuration, packaging, installation, live app,
+  microphone, clipboard, network, or real archive operations. Independent repair
+  review and assembled integration validation belong to the parent task.
