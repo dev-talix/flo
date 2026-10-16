@@ -165,3 +165,67 @@ commands, environment, verified base/diff, and final release results are in
 Disk-full and mid-write device failures were NOT RUN; AVAudioFile write errors
 still propagate through the existing throwing call. No user recordings or model
 downloads were used. Runtime speedup and peak process memory were not measured.
+
+## E5: diagnostic accounting and typed timing writes, October 15, 2026
+
+Owner: Flo maintainers. Requirement source: the authorized efficiency report E5,
+against preview foundation commit `47f1bb906e8f3b2291a617f13dd9bb0b11300e74`.
+Reduce repeated diagnostic and idle audio work. Quotas, expiry, content filtering,
+serial ordering, recording opt-in, error reporting, and model defaults remain
+required. Capture recovery and ranged snapshots belong to other items.
+
+`DictationDiagnosticStore` keeps queue-owned file sizes, archive creation dates,
+and an oldest-first index. Beginning an archive, launch/hourly maintenance,
+explicit `prune`, and the next write after failed I/O reconcile disk state.
+Ordinary event appends stat their changed file instead of enumerating all
+archives. Audio replacement accounts for the actual closed WAV, including its
+header, and subtracts the previous file size. Every successful write checks
+expiry and the total byte quota immediately. Expired folders are removed before
+content enumeration during reconciliation. Pruned/deleted recordings cannot
+recreate their folders through late event or audio writes. Successful deletion
+clears accounting; failed deletion invalidates it.
+
+The directory is owned by this store, which serializes mutations on its existing
+utility queue. Changes made outside the store to other files or archive folders
+are discovered at the next full reconciliation. External growth of the file
+being appended is included by its post-write stat. This does not provide a
+filesystem watcher or coordination between multiple store instances writing to
+the same root.
+
+`DiagnosticsArchive.record` now sanitizes typed events through
+`DiagnosticsSnapshot.sanitized`, also used by legacy parsing, then encodes once.
+Schema/ordinal validation and the field/environment whitelists are shared.
+New trace files keep atomic publication and sanitize environment metadata once.
+Appends keep the original environment. Nonfinite retained metrics still throw. Second-resolution filenames
+match the existing ISO8601 archive format even for fractional live timestamps,
+so restarting does not split one trace into two files.
+
+Acceptance examples are covered by `DiagnosticsArchiveTests` for typed/private
+field filtering, invalid schema/ordinal rejection, encoding failures, 200 ordered
+events across restart, migration, expiry, export, and permissions.
+`DictationDiagnosticStoreTests` covers growing events, immediate quota eviction,
+closed WAV replacement accounting, expiry without maintenance, restart/external
+reconciliation, external growth of the appended file, failed-write recovery,
+240 concurrent complete event writes with
+per-producer ordering, deletion before late writes, unmanaged neighbors, and
+private permissions. All fixtures are synthetic.
+
+The audio demand/cadence change and warm-start contract are recorded in the
+[E5 recovery section](dictation-recovery.md#e5-idle-audio-analysis-and-spectrum-demand-october-15-2026).
+No runtime speedup is claimed. These checks measure behavior and callback counts,
+not CPU, power, end-to-end latency, or recognition accuracy.
+
+Verification environment: macOS 27.0.1, arm64, Apple Swift 6.4. Commands ran in
+this isolated worktree with its own `.build-e5` scratch directory. After the
+checks, build artifacts were moved under the ignored `.build/e5` directory. Evidence covers
+the baseline above plus the E5 diff at `/tmp/flo-e5.diff`; the handoff includes the
+final local commit. No app installation, model download, microphone capture,
+clipboard interaction, or typing was performed.
+
+- PASS, exit 0: `swift test --scratch-path .build-e5 --disable-automatic-resolution --filter 'DiagnosticsArchiveTests|DictationDiagnosticStoreTests|AudioCaptureLifecycleTests'`, 20 baseline tests. Evidence: `/tmp/flo-e5-baseline.log`.
+- PASS, exit 0: `swift test --scratch-path .build-e5 --disable-automatic-resolution --filter 'DiagnosticsArchiveTests|DictationDiagnosticStoreTests|AudioCaptureLifecycleTests|DiagnosticsSnapshotTests|WaveformOverlayTests'`, 56 tests. Evidence: `/tmp/flo-e5-focused.log`. Initial runs exited 1 because new fixtures assumed a nil synthetic device identity matched the system default and underestimated the WAV header size. Those fixture assumptions were corrected; one failed-run log is `/tmp/flo-e5-fixture-adjustments.log`.
+- EXPECTED FAIL, exit 1: `swift test --scratch-path .build-e5 --disable-automatic-resolution --filter 'AudioCaptureLifecycleTests.testSpectrumDemandAndRendererCadenceDoNotDropCapturedAudio'`, with demand/cadence gates temporarily removed and then restored. Five assertions detected 50 spectrum callbacks where the bounded fixture requires two. Evidence: `/tmp/flo-e5-metering-red.log`.
+- PASS, exit 0: `swift test --scratch-path .build-e5 --disable-automatic-resolution --filter 'Diagnostics|DictationDiagnostic|AudioCaptureLifecycle|AudioRecorder|NativeAudio|DictationSession|DictationDelivery|DictationTrace|WaveformOverlay'`, 135 tests. Evidence: `/tmp/flo-e5-regressions.log`.
+- PASS, exit 0: the same 135-test selection with `swift test -c release --scratch-path .build-e5 --disable-automatic-resolution --filter 'Diagnostics|DictationDiagnostic|AudioCaptureLifecycle|AudioRecorder|NativeAudio|DictationSession|DictationDelivery|DictationTrace|WaveformOverlay'`. Evidence: `/tmp/flo-e5-release.log`.
+- PASS, exit 0: `git diff --check`, repeated after implementation.
+- NOT RUN: full suite, real-device audio/converter continuity, real speech recognition, live HUD appearance, CPU/power profiling, app installation, and external publication. Flo maintainers own these checks after integration. Existing compiler warnings were also present in the baseline.

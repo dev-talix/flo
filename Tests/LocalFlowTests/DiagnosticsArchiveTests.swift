@@ -142,6 +142,54 @@ final class DiagnosticsArchiveTests: XCTestCase {
         XCTAssertThrowsError(try archive.export(to: root.appendingPathComponent("missing/export.txt")))
     }
 
+    func testTypedWritesUseParserSanitizationAndRejectUnsupportedEvents() throws {
+        let archive = DiagnosticsArchive(directory: root.appendingPathComponent("history"))
+        let original = event()
+        func with(schema: Int = 1, ordinal: Int = 0, fields: [String: Double]) -> DictationTrace.Event {
+            .init(schemaVersion: schema, traceID: original.traceID, source: .dictation, ordinal: ordinal,
+                  name: .transcriptionFinished, uptimeNs: 123, sinceStartMs: 10, sinceReleaseMs: 5,
+                  startedAt: original.startedAt, status: .success, fields: fields,
+                  model: "fixture-model", segment: .releaseTail, microphone: "fixture-microphone")
+        }
+        let input = with(fields: ["samples": 123, "private-fixture": 456])
+        let environment = "timing_environment {\"buildCommit\":\"fixture-build\",\"transcript\":\"private-fixture\"}"
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let parsed = DiagnosticsSnapshot.parse("0 0 " + environment + "\n0 0 timing " + String(decoding: try encoder.encode(input), as: UTF8.self))
+        try archive.record(input, environment: environment)
+        try archive.record(with(schema: 2, ordinal: 1, fields: [:]), environment: environment)
+        try archive.record(with(ordinal: -1, fields: [:]), environment: environment)
+        let trace = try XCTUnwrap(archive.read().traces.first)
+        XCTAssertEqual(trace.events.count, 1)
+        XCTAssertEqual(trace.events[0].fields, ["samples": 123])
+        XCTAssertEqual(trace.events[0].model, "fixture-model")
+        XCTAssertEqual(trace.events[0].segment, .releaseTail)
+        XCTAssertEqual(trace.events[0].microphone, "fixture-microphone")
+        XCTAssertEqual(trace.environment, ["buildCommit": "fixture-build"])
+        XCTAssertEqual(trace.report, parsed.traces.first?.report)
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: archive.directory, includingPropertiesForKeys: nil).first)
+        XCTAssertFalse(try String(contentsOf: file).contains("private-fixture"))
+        XCTAssertThrowsError(try archive.record(with(ordinal: 1, fields: ["durationMs": .infinity]), environment: environment))
+        XCTAssertEqual(try archive.read().traces.first?.events.count, 1)
+    }
+
+    func testGrowingTypedTraceKeepsOneFileAcrossFractionalTimestampAndRestart() throws {
+        let archive = DiagnosticsArchive(directory: root.appendingPathComponent("history"))
+        let id = UUID()
+        for ordinal in 0..<100 {
+            try archive.record(event(id, ordinal: ordinal, startedAt: 100.75), environment: "timing_environment {\"buildCommit\":\"first\"}")
+        }
+        let restarted = DiagnosticsArchive(directory: archive.directory)
+        for ordinal in 100..<200 {
+            try restarted.record(event(id, ordinal: ordinal, startedAt: 100.75), environment: "timing_environment {\"buildCommit\":\"second\"}")
+        }
+        let snapshot = try restarted.read()
+        XCTAssertEqual(snapshot.traces.count, 1)
+        XCTAssertEqual(snapshot.traces.first?.events.map(\.ordinal), Array(0..<200))
+        XCTAssertEqual(snapshot.traces.first?.environment["buildCommit"], "first")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: archive.directory.path).count, 1)
+    }
+
     func testStorageFailureIsReported() throws {
         let file = root.appendingPathComponent("not-a-directory")
         try Data().write(to: file)

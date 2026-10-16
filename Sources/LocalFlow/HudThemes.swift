@@ -15,6 +15,13 @@ enum HudTheme: String, CaseIterable {
         HudTheme(rawValue: Settings.hudTheme) ?? .classic
     }
 
+    var usesSpectrum: Bool {
+        switch self {
+        case .classic, .typeset, .mercury: return false
+        default: return true
+        }
+    }
+
     var label: String {
         switch self {
         case .classic: return "Classic Wave"

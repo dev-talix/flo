@@ -1157,3 +1157,44 @@ is omitted to keep validation within the task's device and clipboard boundary.
 R2 stack integration also clears the captured command target on the matching
 terminal failure, while stale failures leave a newer target intact. The compiled
 AppDelegate boundary harness includes R3 command-target parameters.
+
+## E5: idle audio analysis and spectrum demand, October 15, 2026
+
+Owner: Flo maintainers. Authorized efficiency report E5 reduces idle work without
+changing capture failure recovery, snapshots, voice thresholds, or model defaults.
+`AudioRecorder.append` checks recording activity and capture generation before
+RMS analysis. `SampleForwarder` still converts every delivered input buffer while
+a session stays warm, preserving converter history across the next press.
+
+The active overlay's theme requests spectrum through a locked demand flag.
+Classic, Typeset, and Mercury use loudness only. Processing/hidden overlays stop
+requesting spectrum. The recorder runs Goertzel analysis at most 30 times per
+second, matching the HUD renderer cadence, and resets that cadence on every
+recording start. RMS/live gating, pending first audible samples, original/native
+audio retention, and level callbacks still process each active buffer.
+
+`AudioCaptureLifecycleTests.testWarmIdleSkipsMetersAndWarmStartRetainsFirstQuietSyllable`
+verifies the same synthetic input stays warm, idle buffers emit no meters or
+recorded audio, the first two quiet speech buffers survive the live streak,
+native audio remains paired, and spectrum can update immediately on warm start.
+`testSpectrumDemandAndRendererCadenceDoNotDropCapturedAudio` verifies no spectrum
+without demand, bounded callbacks with a controlled clock, and all 50 samples
+and level callbacks retained. `WaveformOverlayTests` covers the theme demand map.
+These tests use the converted-buffer seam, not a real microphone/converter.
+
+Exact debug/release commands, exit results, regression-red evidence, environment,
+and the E5 diff reference are in the
+[E5 diagnostic record](diagnostic-recordings.md#e5-diagnostic-accounting-and-typed-timing-writes-october-15-2026).
+Real-device continuity and CPU/power benefit remain unmeasured.
+
+E5 integration reuses R2's monotonic clock for spectrum pacing. Health progress
+and conversion guards run before active-recording metering; idle buffers still
+convert but skip signal and spectrum analysis. Both capture test groups remain
+in the assembled suite.
+E5/R2 assembled focused checks passed 73 tests, exit 0:
+`/tmp/flo-r2-e5-integration-complete.log`. Initial assembly exposed an old
+array-based snapshot assertion and a synthetic factory that omitted resolved
+default-device identity. The fixture now uses E4's snapshot samples and preserves
+R2's open callback plus E5's device identity, so the warm-route check exercises
+session reuse. No live microphone was opened. Earlier failure logs:
+`/tmp/flo-r2-e5-integration.log` and `/tmp/flo-r2-e5-integration-final.log`.

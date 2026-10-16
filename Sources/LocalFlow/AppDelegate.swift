@@ -343,6 +343,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let overlay = self.overlay
         recorder.onLevel = { level in overlay.push(level: level) }
         recorder.onSpectrum = { bands in overlay.push(spectrum: bands) }
+        recorder.needsSpectrum = { overlay.needsSpectrum() }
         // The capture-live cue is passed to recorder.start per press, so it
         // carries that recording's generation and is installed on the
         // recorder's own queues — recording A's audio can't fire B's cue.

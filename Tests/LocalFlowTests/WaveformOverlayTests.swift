@@ -6,6 +6,10 @@ import XCTest
 final class WaveformOverlayTests: XCTestCase {
     private let size = NSSize(width: 200, height: 60)
 
+    func testOnlyThemesThatConsumeSpectrumRequestIt() {
+        XCTAssertEqual(Set(HudTheme.allCases.filter { !$0.usesSpectrum }), [.classic, .typeset, .mercury])
+    }
+
     func testOriginFullyInsideAScreenIsVisible() {
         let screens = [NSRect(x: 0, y: 0, width: 1440, height: 900)]
         XCTAssertTrue(WaveformOverlay.isVisible(origin: NSPoint(x: 100, y: 100),

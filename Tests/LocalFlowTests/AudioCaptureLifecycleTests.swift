@@ -667,6 +667,106 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         return result!
     }
 
+    func testWarmIdleSkipsMetersAndWarmStartRetainsFirstQuietSyllable() {
+        let input = SyntheticCaptureInput()
+        let recorder = AudioRecorder(makeCaptureSession: input.open, now: { 100 })
+        recorder.keepWarm = true
+        var levels = 0
+        var spectra = 0
+        var liveCount = 0
+        recorder.onLevel = { _ in levels += 1 }
+        recorder.onSpectrum = { _ in spectra += 1 }
+        let started = expectation(description: "cold start")
+        recorder.start { _ in started.fulfill() }
+        wait(for: [started], timeout: 2)
+        let source = input.latestSource!
+        source.send(converted: [0.1], native: [])
+        source.send(converted: [0.2], native: [])
+        let stopped = expectation(description: "warm stop")
+        recorder.stop { recording in
+            XCTAssertEqual(recording.samples, [0.1, 0.2])
+            stopped.fulfill()
+        }
+        wait(for: [stopped], timeout: 2)
+        let previousLevels = levels
+        let previousSpectra = spectra
+        for _ in 0..<20 { source.send(converted: [0.9], native: [0.9]) }
+        let idle = expectation(description: "idle buffers drained")
+        recorder.snapshot { samples in
+            XCTAssertTrue(samples.samples.isEmpty)
+            XCTAssertEqual(levels, previousLevels)
+            XCTAssertEqual(spectra, previousSpectra)
+            idle.fulfill()
+        }
+        wait(for: [idle], timeout: 2)
+        let warmStarted = expectation(description: "warm start")
+        recorder.start(retainNativeAudio: true, onCaptureLive: { liveCount += 1 }) { error in
+            XCTAssertNil(error)
+            warmStarted.fulfill()
+        }
+        wait(for: [warmStarted], timeout: 2)
+        XCTAssertTrue(input.latestSource === source)
+        XCTAssertEqual(input.openCount, 1)
+        // Quiet speech is above digital silence and must survive the two-buffer streak.
+        source.send(converted: [0.0002, 0.0003], native: [0.2])
+        source.send(converted: [0.0004], native: [0.3])
+        let warmStopped = expectation(description: "warm audio handoff")
+        recorder.stop { recording in
+            XCTAssertEqual(recording.samples, [0.0002, 0.0003, 0.0004])
+            XCTAssertEqual(recording.nativeAudio?.samples, [0.2, 0.3])
+            XCTAssertEqual(liveCount, 1)
+            XCTAssertEqual(spectra, previousSpectra + 1)
+            warmStopped.fulfill()
+        }
+        wait(for: [warmStopped], timeout: 2)
+        recorder.releaseWarmSession()
+    }
+
+    func testSpectrumDemandAndRendererCadenceDoNotDropCapturedAudio() {
+        let input = SyntheticCaptureInput()
+        var now: TimeInterval = 100
+        var demand = false
+        let recorder = AudioRecorder(makeCaptureSession: input.open, now: { now })
+        var spectra: [[Float]] = []
+        var levels = 0
+        recorder.onSpectrum = { spectra.append($0) }
+        recorder.needsSpectrum = { demand }
+        recorder.onLevel = { _ in levels += 1 }
+        let started = expectation(description: "started")
+        recorder.start { _ in started.fulfill() }
+        wait(for: [started], timeout: 2)
+        let source = input.latestSource!
+        func sendAndDrain(_ count: Int) {
+            for _ in 0..<count { source.send(converted: [0.1], native: []) }
+            let drained = expectation(description: "buffers drained")
+            recorder.snapshot { _ in drained.fulfill() }
+            wait(for: [drained], timeout: 2)
+        }
+        sendAndDrain(10)
+        XCTAssertTrue(spectra.isEmpty)
+        demand = true
+        sendAndDrain(10)
+        XCTAssertEqual(spectra.count, 1)
+        now += 1.0 / 60
+        sendAndDrain(10)
+        XCTAssertEqual(spectra.count, 1)
+        now += 1.0 / 30
+        sendAndDrain(10)
+        XCTAssertEqual(spectra.count, 2)
+        XCTAssertTrue(spectra.allSatisfy { $0.count == 12 && $0.allSatisfy(\.isFinite) })
+        demand = false
+        now += 1
+        sendAndDrain(10)
+        XCTAssertEqual(spectra.count, 2)
+        XCTAssertEqual(levels, 50)
+        let stopped = expectation(description: "all audio retained")
+        recorder.stop { recording in
+            XCTAssertEqual(recording.samples, [Float](repeating: 0.1, count: 50))
+            stopped.fulfill()
+        }
+        wait(for: [stopped], timeout: 2)
+    }
+
     func testSnapshotDoesNotDetachNativeAudioOrDiscardLaterSamples() {
         let input = SyntheticCaptureInput()
         let recorder = AudioRecorder(makeCaptureSession: input.open)
@@ -789,7 +889,8 @@ private final class SyntheticCaptureInput {
         self.source = source
         lock.unlock()
         try onOpen?(source)
-        return AudioCaptureSession(deviceUID: deviceUID, microphoneName: "Synthetic input",
+        return AudioCaptureSession(deviceUID: deviceUID ?? AudioDevices.defaultInputDeviceUID() ?? AVCaptureDevice.default(for: .audio)?.uniqueID,
+                                   microphoneName: "Synthetic input",
                                    isRunning: { true }, stop: {
             self.lock.lock()
             self.stops += 1
