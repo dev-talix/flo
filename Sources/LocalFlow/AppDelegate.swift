@@ -197,10 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var dictationDelivery = DictationDelivery(
         transcribe: { [weak self] request in
             guard let self else { throw CancellationError() }
-            return try await self.transcriber.transcribe(
-                samples: request.samples,
-                lowEnergy: request.lowEnergy
-            )
+            return try await self.transcriber.transcribe(request)
         },
         cleanup: { [weak self] request in
             guard let self else {

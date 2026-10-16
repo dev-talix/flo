@@ -99,6 +99,7 @@ struct DictationTranscriptionRequest {
     let segment: DictationTranscriptionSegment
     let samples: [Float]
     let lowEnergy: Bool
+    var purpose: TranscriptionPurpose = .authoritative
 }
 
 struct DictationCleanupRequest {
@@ -154,6 +155,7 @@ final class DictationSessionPipeline {
         /// Normal release and Escape leave inference running. Only explicit
         /// interruption or a stall deadline cancels it and quarantines the engine.
         var previewTask: Task<Void, Never>?
+        var previewLifetime: PreviewLifetime?
         var lastPreviewRange: Range<Int>?
         var displayedPreview: DisplayedPreview?
         var nextChunkSnapshotSamples = 0
@@ -322,17 +324,21 @@ final class DictationSessionPipeline {
         let audio = DictationAudioPreparation(samples: Array(samples[range]))
         guard audio.isAdmitted else { return }
         session.lastPreviewRange = range
+        let lifetime = PreviewLifetime()
+        session.previewLifetime = lifetime
         let request = DictationTranscriptionRequest(
             generation: session.generation,
             segment: .preview,
             samples: audio.samples,
-            lowEnergy: audio.lowEnergy
+            lowEnergy: audio.lowEnergy,
+            purpose: .preview(lifetime)
         )
         session.previewTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             // Failures are already in the trace and must not change the dictation.
             let text = try? await runTranscription(request, session: session)
             session.previewTask = nil
+            session.previewLifetime = nil
             guard let text, !text.isEmpty, isCurrent(session),
                   session.releaseAudio == nil,
                   session.completedSampleEnd == committedEnd else { return }
@@ -416,6 +422,8 @@ final class DictationSessionPipeline {
               !session.cancelled,
               session.releaseAudio == nil else { return }
 
+        session.previewLifetime?.invalidate()
+
         let fullSamples = full.originalSamples
         recordCapturedAudio(generation: generation, samples: fullSamples)
         guard full.isAdmitted else {
@@ -462,6 +470,7 @@ final class DictationSessionPipeline {
         let trace = sessions[generation]?.trace ?? completed[generation]?.trace
         trace?.record(.cancellationRequested)
         if let session = sessions.removeValue(forKey: generation) {
+            session.previewLifetime?.invalidate()
             session.releaseTimeout?.cancel()
             session.cleanupDeadline?.cancel()
             session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
@@ -698,6 +707,7 @@ final class DictationSessionPipeline {
 
     private func complete(_ session: Session, with outcome: DictationSessionOutcome) {
         guard isCurrent(session) else { return }
+        session.previewLifetime?.invalidate()
         session.releaseTimeout?.cancel()
         session.releaseTimeout = nil
         session.cleanupDeadline?.cancel()

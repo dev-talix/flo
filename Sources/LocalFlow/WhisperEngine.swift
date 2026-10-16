@@ -97,13 +97,23 @@ actor WhisperEngine: SpeechEngine {
     }
 
     func inferenceStartFields(lowEnergy: Bool) -> [DictationTrace.Field: Double] {
-        [.temperatureFallbackLimit: Double(decodingOptions(lowEnergy: lowEnergy).temperatureFallbackCount)]
+        inferenceStartFields(lowEnergy: lowEnergy, purpose: .authoritative)
+    }
+
+    func inferenceStartFields(lowEnergy: Bool, purpose: TranscriptionPurpose) -> [DictationTrace.Field: Double] {
+        [.temperatureFallbackLimit: Double(Self.decodingOptions(lowEnergy: lowEnergy, purpose: purpose).temperatureFallbackCount)]
     }
 
     func transcribe(samples: [Float], lowEnergy: Bool) async throws -> EngineTranscription {
+        try await transcribe(samples: samples, lowEnergy: lowEnergy, purpose: .authoritative)
+    }
+
+    func transcribe(samples: [Float], lowEnergy: Bool, purpose: TranscriptionPurpose) async throws -> EngineTranscription {
+        var options = Self.decodingOptions(lowEnergy: lowEnergy, purpose: purpose)
+        options.promptTokens = vocabularyTokens
         let results = try await pipeline.transcribe(
             audioArray: samples,
-            decodeOptions: decodingOptions(lowEnergy: lowEnergy)
+            decodeOptions: options
         )
         return EngineTranscription(
             segments: results.flatMap { result in
@@ -115,13 +125,13 @@ actor WhisperEngine: SpeechEngine {
         )
     }
 
-    private func decodingOptions(lowEnergy: Bool) -> DecodingOptions {
+    static func decodingOptions(lowEnergy: Bool, purpose: TranscriptionPurpose) -> DecodingOptions {
         var options = Self.decodingOptions
-        options.promptTokens = vocabularyTokens
         // Near-silent audio can spend six decoder attempts inventing text.
         // Keep the deterministic pass; the pipeline still recovers an unknown
-        // empty result using its original audio.
-        if lowEnergy { options.temperatureFallbackCount = 0 }
+        // empty result using its original audio. Disposable previews use the
+        // same single pass without spending final recognition's fallback budget.
+        if lowEnergy || purpose.preview != nil { options.temperatureFallbackCount = 0 }
         return options
     }
 

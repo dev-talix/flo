@@ -119,10 +119,7 @@ enum DictationReplay {
         let receiver = OutcomeReceiver()
         let pipeline = DictationSessionPipeline(
             transcribe: { request in
-                try await transcriber.transcribe(
-                    samples: request.samples,
-                    lowEnergy: request.lowEnergy
-                )
+                try await transcriber.transcribe(request)
             },
             cleanup: { request in
                 do {
