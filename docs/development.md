@@ -175,8 +175,10 @@ Required repository secrets:
 ## CodeQL scans
 
 [The CodeQL workflow](../.github/workflows/codeql.yml) scans main pushes,
-pull requests targeting main, and the weekly schedule. A newer run cancels
-an older run for the same Git ref, so separate PRs do not cancel each other.
+the weekly schedule, and pull requests targeting main that change `Sources/`,
+`Package.swift`, or the workflow itself. Lockfile-only PRs (Dependabot) skip
+the scan; the main push after merge covers them. A newer run cancels an older
+run for the same Git ref, so separate PRs do not cancel each other.
 
 SwiftPM resolves packages and builds the WhisperKit and FluidAudio dependency
 targets before CodeQL tracing starts. Sparkle arrives as a binary dependency.
@@ -188,9 +190,18 @@ rerun. Keep the dependency target list in sync with `Package.swift`.
 Cache keys include the OS, architecture, macOS version, Xcode and Swift versions,
 and the package manifest and lockfile. A dependency update may restore an older cache for
 the same toolchain; SwiftPM then resolves and rebuilds what changed. Toolchain
-changes start a fresh cache. The separate `codeql-deps-v1` namespace excludes
+changes start a fresh cache. The separate `codeql-deps-v3` namespace excludes
 older caches containing compiled app code. Do not move the save step after the
-app build or replace it with an action that saves at job completion.
+app build or replace it with an action that saves at job completion. Only main
+pushes and scheduled runs save; PRs restore main's cache, because a PR-scoped
+cache can't be restored by any other ref.
+
+The CodeQL tracer runs traced steps under Rosetta, where the runner's SwiftPM
+defaults to an x86_64 build in a separate `.build/x86_64-apple-macosx`
+directory. Before October 2026 that recompiled and extracted every dependency
+for about 40 minutes per scan. The workflow pins `SWIFT_TRIPLE` for both the
+dependency prebuild and the traced build so they share one build directory.
+Keep the `--triple` flag on every `swift build` in that workflow.
 
 With `actionlint` installed, validate workflow edits with
 `actionlint .github/workflows/codeql.yml`.
