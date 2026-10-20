@@ -28,6 +28,8 @@ jobs:
   analyze:
     name: Analyze Swift
     # Swift analysis has to build the code, and this is an AppKit app.
+    # Stays on GitHub's runner: the repo is public, so these minutes are free,
+    # and CodeQL is by far the longest job.
     runs-on: macos-26
     timeout-minutes: 60
     permissions:
