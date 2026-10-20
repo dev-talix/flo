@@ -91,7 +91,12 @@ jobs:
           queries: security-and-quality
 
       - name: Build
-        run: swift build
+        run: |
+          # TEMP diagnostic: is the traced build running under Rosetta or
+          # writing to a different triple dir? Remove before merge.
+          echo "traced arch: $(uname -m)"; ls .build
+          swift build
+          ls .build
 
       - name: Perform analysis
         uses: github/codeql-action/analyze@v4
