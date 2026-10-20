@@ -190,18 +190,18 @@ rerun. Keep the dependency target list in sync with `Package.swift`.
 Cache keys include the OS, architecture, macOS version, Xcode and Swift versions,
 and the package manifest and lockfile. A dependency update may restore an older cache for
 the same toolchain; SwiftPM then resolves and rebuilds what changed. Toolchain
-changes start a fresh cache. The separate `codeql-deps-v2` namespace excludes
+changes start a fresh cache. The separate `codeql-deps-v3` namespace excludes
 older caches containing compiled app code. Do not move the save step after the
 app build or replace it with an action that saves at job completion. Only main
 pushes and scheduled runs save; PRs restore main's cache, because a PR-scoped
 cache can't be restored by any other ref.
 
-Known issue (October 2026): on GitHub runners the traced `swift build` still
-recompiles FluidAudio, ArgmaxCore, and WhisperKit, so the dependency cache
-saves almost nothing. About 40 of the scan's ~50 build minutes go to those
-dependencies; LocalFlow itself compiles in about a minute. A plain full build
-after the dependency prebuild doesn't recompile them locally, so the trigger is
-specific to the traced CI build and hasn't been pinned down yet.
+The CodeQL tracer runs traced steps under Rosetta, where the runner's SwiftPM
+defaults to an x86_64 build in a separate `.build/x86_64-apple-macosx`
+directory. Before October 2026 that recompiled and extracted every dependency
+for about 40 minutes per scan. The workflow pins `SWIFT_TRIPLE` for both the
+dependency prebuild and the traced build so they share one build directory.
+Keep the `--triple` flag on every `swift build` in that workflow.
 
 With `actionlint` installed, validate workflow edits with
 `actionlint .github/workflows/codeql.yml`.

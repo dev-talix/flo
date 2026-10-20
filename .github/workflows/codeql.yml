@@ -36,6 +36,12 @@ jobs:
       security-events: write
       actions: read
       contents: read
+    env:
+      # The CodeQL tracer runs traced steps under Rosetta, and this SwiftPM
+      # then defaults to an x86_64 build in a separate .build directory. That
+      # recompiled and extracted every dependency (~40 minutes). Pinning the
+      # triple keeps the dependency prebuild and the traced build identical.
+      SWIFT_TRIPLE: arm64-apple-macosx
     steps:
       - uses: actions/checkout@v7
 
@@ -58,17 +64,17 @@ jobs:
             .build
           # This namespace contains dependency builds only. Never restore the
           # old full-app cache, which could hide unchanged files from CodeQL.
-          # v2: the rename to flo moved the checkout path.
-          key: ${{ runner.os }}-${{ runner.arch }}-codeql-deps-v2-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-codeql-deps-v2-${{ steps.toolchain.outputs.fingerprint }}-
+          # v2: the rename to flo moved the checkout path. v3: pinned triple.
+          key: ${{ runner.os }}-${{ runner.arch }}-codeql-deps-v3-${{ steps.toolchain.outputs.fingerprint }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-codeql-deps-v3-${{ steps.toolchain.outputs.fingerprint }}-
 
       - name: Resolve SwiftPM dependencies
         run: swift package resolve
 
       - name: Build SwiftPM dependencies
         run: |
-          swift build --target WhisperKit
-          swift build --target FluidAudio
+          swift build --triple "$SWIFT_TRIPLE" --target WhisperKit
+          swift build --triple "$SWIFT_TRIPLE" --target FluidAudio
 
       # Save before the app builds so even an unchanged app is compiled under
       # CodeQL on the next run. Sparkle is a resolved binary dependency.
@@ -91,12 +97,7 @@ jobs:
           queries: security-and-quality
 
       - name: Build
-        run: |
-          # TEMP diagnostic: is the traced build running under Rosetta or
-          # writing to a different triple dir? Remove before merge.
-          echo "traced arch: $(uname -m)"; ls .build
-          swift build
-          ls .build
+        run: swift build --triple "$SWIFT_TRIPLE"
 
       - name: Perform analysis
         uses: github/codeql-action/analyze@v4
