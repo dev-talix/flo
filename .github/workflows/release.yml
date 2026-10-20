@@ -79,7 +79,8 @@ jobs:
           path: |
             ~/.swiftpm
             .build
-          # Versioned like the CI cache key; bump both together.
+          # Versioned like the CI cache key. Bump both for path or rename
+          # changes; a CI-only runner change (CI v4) needs only the CI bump.
           key: ${{ runner.os }}-release-swiftpm-v3-${{ hashFiles('Package.resolved') }}
           restore-keys: ${{ runner.os }}-release-swiftpm-v3-
 

@@ -5,13 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # Only what `swift build` compiles. Release, docs, and test-only PRs skip
-    # the 40+ minute scan. Pushes to main stay unfiltered so every base commit
-    # has an analysis for PR comparisons.
+    # Only app sources. Release, docs, test-only, and Dependabot lockfile PRs
+    # skip the scan; the main push after merge still analyzes dependency
+    # bumps. Pushes to main stay unfiltered so every base commit has an
+    # analysis for PR comparisons.
     paths:
       - "Sources/**"
       - "Package.swift"
-      - "Package.resolved"
       - ".github/workflows/codeql.yml"
   schedule:
     # Weekly, so newly published queries reach existing code without a push.
@@ -72,8 +72,10 @@ jobs:
 
       # Save before the app builds so even an unchanged app is compiled under
       # CodeQL on the next run. Sparkle is a resolved binary dependency.
+      # PRs restore main's cache but never save their own. A PR-scoped cache
+      # is ~1.25 GB that no other ref can use.
       - name: Save SwiftPM dependencies
-        if: steps.dependencies.outputs.cache-hit != 'true'
+        if: github.event_name != 'pull_request' && steps.dependencies.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |

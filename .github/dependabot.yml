@@ -7,6 +7,11 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # One PR per week instead of one per package, so a batch of bumps costs
+    # one CI run.
+    groups:
+      swift:
+        patterns: ["*"]
     commit-message:
       prefix: "deps"
 
@@ -16,5 +21,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
     commit-message:
       prefix: "ci"

@@ -9,23 +9,33 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same PR makes the older run pointless. Main pushes
+# always finish so every main commit keeps a result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-test:
-    runs-on: blacksmith-6vcpu-macos-15
+    # Same SDK the release job ships with, so FoundationModels code paths and
+    # SDK-dependent warnings show up here first.
+    runs-on: blacksmith-6vcpu-macos-26
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache SwiftPM
-        uses: actions/cache@v6
+      - name: Restore SwiftPM cache
+        id: swiftpm-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.swiftpm
             .build
           # Bump the version when a restored .build goes stale. Repo renames
-          # move the checkout path and break the old cache (v2: walkie, v3: flo).
-          key: ${{ runner.os }}-swiftpm-v3-${{ hashFiles('Package.resolved') }}
+          # move the checkout path and break the old cache (v2: walkie, v3: flo,
+          # v4: macos-15 to macos-26 toolchain).
+          key: ${{ runner.os }}-swiftpm-v4-${{ hashFiles('Package.resolved') }}
           restore-keys: |
-            ${{ runner.os }}-swiftpm-v3-
+            ${{ runner.os }}-swiftpm-v4-
 
       - name: Lint shell scripts
         run: |
@@ -63,3 +73,15 @@ jobs:
           python3 Tests/TranscribeCLITests.py
           python3 -B Tests/CaptureFailureBoundaryTests.py
           python3 -B Tests/CommandAbandonmentBoundaryTests.py
+
+      # Only main saves. PR caches are scoped to their own ref, so each
+      # Dependabot PR would otherwise store another ~800 MB copy that nothing
+      # else can restore. PRs restore main's cache instead.
+      - name: Save SwiftPM cache
+        if: github.ref == 'refs/heads/main' && steps.swiftpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.swiftpm
+            .build
+          key: ${{ steps.swiftpm-cache.outputs.cache-primary-key }}
