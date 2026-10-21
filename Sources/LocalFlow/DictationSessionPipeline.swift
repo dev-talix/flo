@@ -5,17 +5,23 @@ import Foundation
 ///
 /// Previews transcribe the uncommitted audio for the HUD only and are never
 /// committed. Busy previews skip ticks rather than queue more inference.
+///
+/// Parakeet has no text prompt, so it ends every chunk with a period and
+/// capitalizes the next one. Its chunks feed only the HUD, and release decodes
+/// the whole utterance once (about 150 ms for 50 s of audio).
 struct IncrementalCadence: Equatable {
     let startSeconds: TimeInterval
     let tickSeconds: TimeInterval
     var previewTickSeconds: TimeInterval? = nil
     var previewStartSeconds: TimeInterval = 0
+    var decodesWholeUtteranceOnRelease = false
 
     static let whisper = IncrementalCadence(
         startSeconds: 8, tickSeconds: 4, previewTickSeconds: 1, previewStartSeconds: 1
     )
     static let parakeet = IncrementalCadence(
-        startSeconds: 4, tickSeconds: 2, previewTickSeconds: 1, previewStartSeconds: 1
+        startSeconds: 4, tickSeconds: 2, previewTickSeconds: 1, previewStartSeconds: 1,
+        decodesWholeUtteranceOnRelease: true
     )
 
     /// When capture takes its first snapshot, and how often after that.
@@ -523,6 +529,14 @@ final class DictationSessionPipeline {
 
     private func advance(_ session: Session) {
         guard !session.cancelled, session.activeTask == nil else { return }
+
+        if let release = session.releaseAudio,
+           session.context.incrementalCadence.decodesWholeUtteranceOnRelease {
+            // Queued chunks would only update the HUD after release.
+            session.pendingChunks.removeAll()
+            transcribeFullUtterance(session, audio: release.full)
+            return
+        }
 
         if session.incrementalFailed {
             guard let release = session.releaseAudio else { return }

@@ -43,8 +43,10 @@ final class TranscriptionModelTests: XCTestCase {
         XCTAssertEqual(IncrementalCadence.whisper.startSeconds, 8)
         XCTAssertEqual(IncrementalCadence.whisper.tickSeconds, 4)
         XCTAssertEqual(IncrementalCadence.parakeet, IncrementalCadence(
-            startSeconds: 4, tickSeconds: 2, previewTickSeconds: 1, previewStartSeconds: 1
+            startSeconds: 4, tickSeconds: 2, previewTickSeconds: 1, previewStartSeconds: 1,
+            decodesWholeUtteranceOnRelease: true
         ))
+        XCTAssertFalse(IncrementalCadence.whisper.decodesWholeUtteranceOnRelease)
     }
 
     func testBothEnginesPreviewBeforeTheirFirstCommittedChunk() {

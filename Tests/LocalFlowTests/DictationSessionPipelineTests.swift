@@ -763,7 +763,12 @@ final class DictationSessionPipelineTests: XCTestCase {
         let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
                                     outcomes: outcomes) { partials.append(PartialTranscript(generation: $0, text: $1)) }
 
-        pipeline.begin(generation: 93, context: parakeetContext())
+        // Parakeet always decodes the whole utterance on release, so the
+        // chunk-and-tail path this protects is Whisper's.
+        pipeline.begin(generation: 93, context: DictationSessionContext(
+            cleanupEnabled: false, styleProfile: .general, corrections: [], snippets: [],
+            incrementalCadence: .whisper
+        ))
         pipeline.processIncrementalSnapshot(generation: 93, samples: speech + speech)
         expectTrue(await waitForCall(.preview, generation: 93, in: transcriber))
         expectTrue(await transcriber.fail(TestError.decodeFailed, segment: .preview, generation: 93))
@@ -801,6 +806,31 @@ final class DictationSessionPipelineTests: XCTestCase {
         await settleAsyncWork()
         XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 94, text: "whole thing")])
         XCTAssertEqual(partials, [])
+    }
+
+    func testParakeetReleaseDecodesWholeUtteranceInsteadOfJoiningChunks() async {
+        let transcriber = ControlledTranscriber()
+        let outcomes = OutcomeRecorder()
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: RecordingCleaner(mode: .unchanged),
+                                    outcomes: outcomes)
+
+        pipeline.begin(generation: 95, context: parakeetContext())
+        pipeline.processIncrementalChunk(generation: 95, samples: speech, pauseSecondsAfterChunk: 0.4)
+        pipeline.processIncrementalChunk(generation: 95, samples: speech, pauseSecondsAfterChunk: 0.4)
+        expectTrue(await waitForCall(.incrementalChunk(index: 0), generation: 95, in: transcriber))
+        pipeline.release(generation: 95, fullSamples: speech + speech + speech, tailSamples: speech)
+        // The in-flight chunk finishes first. Its text and the queued chunk are not used.
+        expectTrue(await transcriber.succeed("Ending early.", segment: .incrementalChunk(index: 0), generation: 95))
+        expectTrue(await waitForCall(.fullUtterance, generation: 95, in: transcriber))
+        expectEqual(await transcriber.sampleCounts(.fullUtterance, generation: 95), [speech.count * 3])
+        expectTrue(await transcriber.succeed(
+            "Ending early before I finish.", segment: .fullUtterance, generation: 95
+        ))
+
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 95, text: "Ending early before I finish.")])
+        expectFalse(await transcriber.hasCall(.incrementalChunk(index: 1), generation: 95))
+        expectFalse(await transcriber.hasCall(.releaseTail, generation: 95))
     }
 
     func testWhisperPreviewsContinuousSpeechEarlyAndRepeatedlyWithoutCommitting() async {
