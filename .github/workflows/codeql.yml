@@ -3,12 +3,20 @@ name: CodeQL
 on:
   push:
     branches: [main]
+    # A PR scan already analyzes the merge result, so a main push only
+    # refreshes the Security tab and the base for the next PR comparison.
+    # Release, docs, and test-only merges have nothing new to scan. Lockfile
+    # bumps are covered here, since their PRs skip the scan.
+    paths:
+      - "Sources/**"
+      - "Package.swift"
+      - "Package.resolved"
+      - ".github/workflows/codeql.yml"
   pull_request:
     branches: [main]
     # Only app sources. Release, docs, test-only, and Dependabot lockfile PRs
     # skip the scan; the main push after merge still analyzes dependency
-    # bumps. Pushes to main stay unfiltered so every base commit has an
-    # analysis for PR comparisons.
+    # bumps.
     paths:
       - "Sources/**"
       - "Package.swift"
