@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.12.1](https://github.com/dev-talix/flo/compare/v1.12.0...v1.12.1) (2026-10-21)
+
+
+### Fixes
+
+* decode the whole utterance on release for Parakeet ([aeaebfc](https://github.com/dev-talix/flo/commit/aeaebfc869b326365492ed415d4d127553905976))
+* decode the whole utterance on release for Parakeet ([a850bc3](https://github.com/dev-talix/flo/commit/a850bc366bb2dc491e7d6501285a1a99126a1ff3))
+
 ## [1.12.0](https://github.com/dev-talix/flo/compare/v1.11.1...v1.12.0) (2026-10-16)
 
 ### Features
