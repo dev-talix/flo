@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.12.1](https://github.com/dev-talix/flo/compare/v1.12.0...v1.12.1) (2026-10-21)
+
+### Fixes
+
+* Stop adding stray periods mid-sentence with Parakeet by recognizing the whole recording at once when dictation ends. ([#65](https://github.com/dev-talix/flo/pull/65))
+
 ## [1.12.0](https://github.com/dev-talix/flo/compare/v1.11.1...v1.12.0) (2026-10-16)
 
 ### Features
