@@ -174,11 +174,13 @@ Required repository secrets:
 
 ## CodeQL scans
 
-[The CodeQL workflow](../.github/workflows/codeql.yml) scans main pushes,
-the weekly schedule, and pull requests targeting main that change `Sources/`,
-`Package.swift`, or the workflow itself. Lockfile-only PRs (Dependabot) skip
-the scan; the main push after merge covers them. A newer run cancels an older
-run for the same Git ref, so separate PRs do not cancel each other.
+[The CodeQL workflow](../.github/workflows/codeql.yml) scans the weekly
+schedule and pull requests targeting main that change `Sources/`,
+`Package.swift`, or the workflow itself. A main push runs the scan only when
+it changes those paths or `Package.resolved`, so release, docs, and test-only
+merges skip it. Lockfile-only PRs (Dependabot) skip the scan; the main push
+after merge covers them. A newer run cancels an older run for the same Git
+ref, so separate PRs do not cancel each other.
 
 SwiftPM resolves packages and builds the WhisperKit and FluidAudio dependency
 targets before CodeQL tracing starts. Sparkle arrives as a binary dependency.
