@@ -58,6 +58,12 @@ enum AudioDevices {
         defaultInputDeviceID().flatMap { stringProperty($0, kAudioDevicePropertyDeviceUID) }
     }
 
+    /// Label for a saved mic that is unplugged. Recording uses the system
+    /// default until the saved mic returns.
+    static func unavailableSavedMicLabel(systemDefaultName: String?) -> String {
+        "Saved mic not connected: using \(systemDefaultName ?? "System Default")"
+    }
+
     // Touched only on the main queue (the listener blocks are delivered there).
     nonisolated(unsafe) private static var changeCoalescer: DispatchWorkItem?
 

@@ -1741,7 +1741,10 @@ extension AppDelegate: NSMenuDelegate {
         }
 
         if let uid = currentUID, !devices.contains(where: { $0.uid == uid }) {
-            let item = NSMenuItem(title: "Saved mic (not connected)", action: #selector(selectMicrophone(_:)), keyEquivalent: "")
+            let item = NSMenuItem(
+                title: AudioDevices.unavailableSavedMicLabel(systemDefaultName: defaultName),
+                action: #selector(selectMicrophone(_:)), keyEquivalent: ""
+            )
             item.target = self
             item.representedObject = uid
             item.state = .on

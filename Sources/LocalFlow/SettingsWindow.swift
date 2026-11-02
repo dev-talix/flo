@@ -687,6 +687,10 @@ struct SettingsView: View {
                     ForEach(model.devices, id: \.uid) { device in
                         Text(device.name).tag(Optional(device.uid))
                     }
+                    if let uid = model.micUID, !model.devices.contains(where: { $0.uid == uid }) {
+                        Text(AudioDevices.unavailableSavedMicLabel(systemDefaultName: model.systemDefaultName))
+                            .tag(Optional(uid))
+                    }
                 }
             }
 
