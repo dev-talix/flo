@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.2](https://github.com/dev-talix/flo/compare/v1.12.1...v1.12.2) (2026-11-02)
+
+
+### Fixes
+
+* show the in-use mic when the saved mic is unplugged ([3067cc1](https://github.com/dev-talix/flo/commit/3067cc16a093436f78e445461fa06f081ee6f977))
+
 ## [1.12.1](https://github.com/dev-talix/flo/compare/v1.12.0...v1.12.1) (2026-10-21)
 
 ### Fixes
