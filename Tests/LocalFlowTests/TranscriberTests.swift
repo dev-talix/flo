@@ -147,6 +147,10 @@ final class TranscriberTests: XCTestCase {
         XCTAssertFalse(Transcriber.isCanonicalHallucination("   "))
     }
 
+    func testTestRunsDoNotWriteTheUserLog() {
+        XCTAssertFalse(DiagLog.fileURL.path.hasPrefix(NSHomeDirectory() + "/Library/Logs/"))
+    }
+
     func testIncrementalPartsPreserveLongPauseParagraphs() {
         XCTAssertEqual(
             Transcriber.joinTranscriptParts(

@@ -8,8 +8,11 @@ import Darwin
 /// Transcript content must never be logged here.
 enum DiagLog {
     private static let queue = DispatchQueue(label: "app.talix.localflow.diaglog", qos: .utility)
-    private static let path = (NSHomeDirectory() as NSString)
-        .appendingPathComponent("Library/Logs/\(AppIdentity.current.logFilename)")
+    // `swift test` runs under the xctest bundle ID, which AppIdentity maps to
+    // production. Keep synthetic test events out of the real log.
+    private static let path = NSClassFromString("XCTestCase") != nil
+        ? (NSTemporaryDirectory() as NSString).appendingPathComponent("LocalFlow-tests-diag.log")
+        : (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/\(AppIdentity.current.logFilename)")
     static var fileURL: URL { URL(fileURLWithPath: path) }
     private static let archivesHistory = Bundle.main.bundleIdentifier == AppIdentity.current.bundleIdentifier
     private static var archiveFailed = false
