@@ -208,8 +208,8 @@ actor Transcriber {
 
     /// `lowEnergy` marks audio whose RMS was near silence: Whisper reliably
     /// invents filler for such clips, so canonical hallucination phrases are
-    /// reported as no speech. Never applied to normal-energy audio —
-    /// people legitimately dictate "thank you".
+    /// reported as no speech. Never applied to normal-energy audio or to
+    /// other engines: people legitimately dictate "thank you".
     func transcribe(
         samples: [Float],
         lowEnergy: Bool = false,
@@ -252,7 +252,10 @@ actor Transcriber {
             try Task.checkCancellation()
             let inferenceFinishedAt = DispatchTime.now().uptimeNanoseconds
             text = Self.joinSegments(result.segments.map { (text: $0.text, start: $0.start, end: $0.end) })
-            isHallucination = lowEnergy && Self.isCanonicalHallucination(text)
+            // Parakeet returns nothing for silence, so on it a quiet
+            // "thank you" is a real dictation.
+            isHallucination = lowEnergy && lease.model.map(TranscriptionModel.engine(forID:)) != .parakeet
+                && Self.isCanonicalHallucination(text)
             raw = result.rawText
             // "whisperRaw" and "whisperPostprocessed" are historical stage
             // names kept for archived recordings; they cover every engine.
