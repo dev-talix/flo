@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.13.0](https://github.com/dev-talix/flo/compare/v1.12.1...v1.13.0) (2026-11-10)
+
+### Features
+
+* Custom vocabulary now works with Parakeet. Listed names fix near misspellings such as "Terrion" for "Tarion". It uses a 98 MB helper model that downloads the first time you set a vocabulary. ([#70](https://github.com/dev-talix/flo/pull/70))
+
+### Fixes
+
+* Keep a quiet "thank you", "thanks", "bye" or "you" as a dictation on Parakeet instead of dropping it as no speech. ([#70](https://github.com/dev-talix/flo/pull/70))
+* Show which microphone is in use when the saved one is unplugged. ([3067cc1](https://github.com/dev-talix/flo/commit/3067cc16a093436f78e445461fa06f081ee6f977))
+
 ## [1.12.1](https://github.com/dev-talix/flo/compare/v1.12.0...v1.12.1) (2026-10-21)
 
 ### Fixes
