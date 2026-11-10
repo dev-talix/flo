@@ -16,7 +16,7 @@ let package = Package(
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0"),
         // Parakeet speech recognition on CoreML. Pinned to the minor: the
         // package is pre-1.0 and ships breaking changes in minor releases.
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", .upToNextMinor(from: "0.17.5"))
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", .upToNextMinor(from: "0.18.3"))
     ],
     targets: [
         .executableTarget(
