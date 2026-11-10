@@ -26,8 +26,7 @@ struct TranscriptionModel: Equatable, Identifiable {
         whisper("openai_whisper-small.en", "Small English (fastest useful)"),
         whisper("openai_whisper-large-v3-v20240930_626MB", "Large v3 626 MB (compact, high accuracy)"),
         whisper(defaultID, "Large v3 Turbo (best accuracy, default)"),
-        // No decoder prompt: custom vocabulary does nothing for it.
-        TranscriptionModel(id: parakeetV3ID, engine: .parakeet, label: "Parakeet TDT 0.6B v3 (fastest, no vocabulary)", group: "Parakeet"),
+        TranscriptionModel(id: parakeetV3ID, engine: .parakeet, label: "Parakeet TDT 0.6B v3 (fastest)", group: "Parakeet"),
     ]
 
     /// Group headings in list order.

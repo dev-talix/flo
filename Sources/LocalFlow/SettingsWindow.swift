@@ -880,7 +880,7 @@ struct SettingsView: View {
             } header: {
                 Text("Custom vocabulary")
             } footer: {
-                Text("Comma-separated terms Whisper keeps mishearing (people, projects, jargon). They bias recognition on every dictation. Keep it short, a couple dozen terms at most; heavy bias can backfire. Parakeet ignores this list; corrections still apply.")
+                Text("Comma-separated terms that keep getting misheard (people, projects, jargon). Whisper is biased toward them on every dictation. Parakeet fixes near misses such as \"Terrion\" for \"Tarion\" and downloads a 98 MB helper model the first time. Keep it short, a couple dozen terms at most; heavy bias can backfire.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -63,7 +63,8 @@ Change the hotkey, speech model, microphone, and HUD theme in Settings.
   list", or "thumbs up emoji". Commands apply even mid-sentence. Enable
   **Literal formatting** in Settings to keep command phrases as text and disable
   automatic numbered lists.
-- **Vocabulary and corrections.** Add names and jargon in Settings to guide Whisper.
+- **Vocabulary and corrections.** Add names and jargon in Settings. Whisper is
+  biased toward them; Parakeet replaces near misses when the audio matches.
   Teach fixes like "talex" to "Talix", or edit and copy a pasted dictation,
   then pick **Fix Last Dictation...** to learn the swaps.
 - **Snippets.** Say a trigger phrase and it's replaced with saved text.
