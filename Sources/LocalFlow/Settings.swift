@@ -93,7 +93,7 @@ enum Settings {
         set { defaults.set(newValue.map { "\($0.wrong)\t\($0.right)" }, forKey: Key.corrections) }
     }
 
-    /// The recognition-bias vocabulary Whisper actually receives: the
+    /// The recognition-bias vocabulary the speech engine receives: the
     /// free-form custom terms plus every correction's right-hand side. A
     /// word the user had to fix is by definition a word worth biasing toward.
     static var effectiveVocabulary: String {

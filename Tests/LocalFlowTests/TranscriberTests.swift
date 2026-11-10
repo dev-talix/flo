@@ -147,6 +147,24 @@ final class TranscriberTests: XCTestCase {
         XCTAssertFalse(Transcriber.isCanonicalHallucination("   "))
     }
 
+    func testQuietCanonicalPhraseIsDroppedOnlyForWhisper() async throws {
+        let transcriber = Transcriber(modelLoader: { _, _ in FixedTextEngine(text: "Thank you.") })
+
+        try await transcriber.load(model: TranscriptionModel.defaultID)
+        do {
+            _ = try await transcriber.transcribe(samples: [0.01], lowEnergy: true)
+            XCTFail("Whisper should report a quiet canonical phrase as no speech")
+        } catch Transcriber.TranscriberError.noSpeech {}
+
+        try await transcriber.load(model: TranscriptionModel.parakeetV3ID)
+        let text = try await transcriber.transcribe(samples: [0.01], lowEnergy: true)
+        XCTAssertEqual(text, "Thank you.")
+    }
+
+    func testTestRunsDoNotWriteTheUserLog() {
+        XCTAssertFalse(DiagLog.fileURL.path.hasPrefix(NSHomeDirectory() + "/Library/Logs/"))
+    }
+
     func testIncrementalPartsPreserveLongPauseParagraphs() {
         XCTAssertEqual(
             Transcriber.joinTranscriptParts(
@@ -176,5 +194,18 @@ private actor CompletionOrder {
 
     func append(_ value: Int) {
         values.append(value)
+    }
+}
+
+private final class FixedTextEngine: SpeechEngine {
+    private let text: String
+
+    init(text: String) { self.text = text }
+
+    func setVocabulary(_ terms: String) async {}
+
+    func transcribe(samples: [Float], lowEnergy: Bool) async throws -> EngineTranscription {
+        .init(segments: [.init(text: text, start: 0, end: 1)], rawText: text,
+              decodingFallbacks: 0, resultCount: 1)
     }
 }

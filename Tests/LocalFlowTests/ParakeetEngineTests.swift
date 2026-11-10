@@ -23,6 +23,55 @@ final class ParakeetEngineTests: XCTestCase {
         XCTAssertEqual(ParakeetEngine.padded([]), [Float](repeating: 0, count: 24_000))
     }
 
+    func testVocabularyTermsSplitOnCommasAndLinesWithoutRepeats() {
+        XCTAssertEqual(
+            ParakeetEngine.vocabularyTerms(from: " Tarion, Jira card\nAuth0 ,, tarion,\n"),
+            ["Tarion", "Jira card", "Auth0"]
+        )
+        XCTAssertEqual(ParakeetEngine.vocabularyTerms(from: "  \n , "), [])
+    }
+
+    func testReplacedTextKeepsASingleSegmentsTiming() {
+        XCTAssertEqual(
+            ParakeetEngine.replacingText(
+                of: [EngineSegment(text: "Ask Terrion today.", start: 0.1, end: 2)], with: "Ask Tarion today."
+            ),
+            [EngineSegment(text: "Ask Tarion today.", start: 0.1, end: 2)]
+        )
+    }
+
+    func testReplacedTextKeepsParagraphBreaksWhenWordCountsChange() {
+        let segments = [
+            EngineSegment(text: "Check auth zero.", start: 0, end: 1),
+            EngineSegment(text: "Then ask Terrion.", start: 3, end: 4),
+            EngineSegment(text: "Done.", start: 6, end: 7),
+        ]
+        XCTAssertEqual(
+            ParakeetEngine.replacingText(of: segments, with: "Check Auth0. Then ask Tarion. Done."),
+            [
+                EngineSegment(text: "Check Auth0.", start: 0, end: 1),
+                EngineSegment(text: "Then ask Tarion.", start: 3, end: 4),
+                EngineSegment(text: "Done.", start: 6, end: 7),
+            ]
+        )
+        // Replacements on both sides of a break stay on their own side.
+        XCTAssertEqual(
+            ParakeetEngine.replacingText(
+                of: [EngineSegment(text: "Ask Terrion.", start: 0, end: 1), EngineSegment(text: "JiraCard next.", start: 3, end: 4)],
+                with: "Ask Tarion. Jira card next."
+            ),
+            [EngineSegment(text: "Ask Tarion.", start: 0, end: 1), EngineSegment(text: "Jira card next.", start: 3, end: 4)]
+        )
+        // One word became two at the start of a paragraph.
+        XCTAssertEqual(
+            ParakeetEngine.replacingText(
+                of: [EngineSegment(text: "First.", start: 0, end: 1), EngineSegment(text: "JiraCard next.", start: 3, end: 4)],
+                with: "First. Jira card next."
+            ),
+            [EngineSegment(text: "First.", start: 0, end: 1), EngineSegment(text: "Jira card next.", start: 3, end: 4)]
+        )
+    }
+
     func testMissingTokensGiveOneSegment() {
         XCTAssertEqual(
             ParakeetEngine.segments(text: " Hello there. ", tokens: nil, duration: 2),

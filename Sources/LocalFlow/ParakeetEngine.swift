@@ -5,9 +5,9 @@ import Foundation
 // Only this file imports FluidAudio, and it must never import WhisperKit:
 // both export `WordTiming` and `Tokenizer`.
 
-/// NVIDIA Parakeet TDT 0.6B v3 on CoreML through FluidAudio. No decoder
-/// prompt, so custom vocabulary does nothing here; corrections still apply as
-/// text replacements after transcription.
+/// NVIDIA Parakeet TDT 0.6B v3 on CoreML through FluidAudio. It has no decoder
+/// prompt, so custom vocabulary is applied after decoding: `VocabularyBooster`
+/// checks the audio for each term and replaces the words Parakeet misheard.
 final class ParakeetEngine: SpeechEngine {
     /// Short clips are padded with trailing silence to this length. FluidAudio
     /// rejects anything under 0.3 s and can return no tokens for very short
@@ -38,6 +38,7 @@ final class ParakeetEngine: SpeechEngine {
 
     private let asr: AsrManager
     private let decoderLayers: Int
+    private let booster = VocabularyBooster()
 
     private init(asr: AsrManager, decoderLayers: Int) {
         self.asr = asr
@@ -76,9 +77,15 @@ final class ParakeetEngine: SpeechEngine {
         }
     }
 
-    func setVocabulary(_ terms: String) async {}
+    func setVocabulary(_ terms: String) async {
+        await booster.setTerms(Self.vocabularyTerms(from: terms))
+    }
 
     func transcribe(samples: [Float], lowEnergy: Bool) async throws -> EngineTranscription {
+        try await transcribe(samples: samples, lowEnergy: lowEnergy, purpose: .authoritative)
+    }
+
+    func transcribe(samples: [Float], lowEnergy: Bool, purpose: TranscriptionPurpose) async throws -> EngineTranscription {
         let input = Self.padded(samples)
         // A fresh state per call: a cancelled call must not leak decoder
         // state into the next one.
@@ -87,8 +94,14 @@ final class ParakeetEngine: SpeechEngine {
         let tokens = result.tokenTimings?.map {
             Token(text: $0.token, start: $0.startTime, end: $0.endTime)
         }
+        var segments = Self.segments(text: result.text, tokens: tokens, duration: Float(result.duration))
+        // Previews rerun every second and only feed the HUD.
+        if purpose.preview == nil, let timings = result.tokenTimings,
+           let boosted = await booster.rescore(text: result.text, tokenTimings: timings, audioSamples: input) {
+            segments = Self.replacingText(of: segments, with: boosted)
+        }
         return EngineTranscription(
-            segments: Self.segments(text: result.text, tokens: tokens, duration: Float(result.duration)),
+            segments: segments,
             rawText: result.text,
             decodingFallbacks: 0,
             resultCount: 1
@@ -101,6 +114,60 @@ final class ParakeetEngine: SpeechEngine {
         let text: String
         let start: Double
         let end: Double
+    }
+
+    /// The vocabulary setting is free text. Terms are separated by commas or
+    /// line breaks, and repeats are dropped whatever their case.
+    static func vocabularyTerms(from text: String) -> [String] {
+        var seen = Set<String>()
+        return text.split(whereSeparator: { $0 == "," || $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
+    }
+
+    /// Spreads `text` over `segments` after vocabulary replacements changed
+    /// some words, keeping each paragraph break after the same word. A
+    /// replacement can change the word count ("auth zero" to "Auth0"), so
+    /// breaks are carried through a word diff, not counted.
+    static func replacingText(of segments: [EngineSegment], with text: String) -> [EngineSegment] {
+        let words = text.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard segments.count > 1 else {
+            return segments.map { EngineSegment(text: words.joined(separator: " "), start: $0.start, end: $0.end) }
+        }
+        let original = segments.map { $0.text.split(whereSeparator: \.isWhitespace).map(String.init) }
+        let difference = words.difference(from: original.flatMap { $0 })
+        var removed = Set<Int>()
+        var inserted = Set<Int>()
+        for change in difference {
+            switch change {
+            case .remove(let offset, _, _): removed.insert(offset)
+            case .insert(let offset, _, _): inserted.insert(offset)
+            }
+        }
+        var result: [EngineSegment] = []
+        var originalIndex = 0
+        var index = 0
+        for (position, (segment, segmentWords)) in zip(segments, original).enumerated() {
+            let start = index
+            for _ in segmentWords {
+                if removed.contains(originalIndex) {
+                    // Each replaced word takes one new word, and the last of
+                    // a replaced run takes whatever is left of the new run.
+                    if index < words.count, inserted.contains(index) { index += 1 }
+                    if !removed.contains(originalIndex + 1) {
+                        while index < words.count, inserted.contains(index) { index += 1 }
+                    }
+                } else {
+                    while index < words.count, inserted.contains(index) { index += 1 }
+                    index += 1
+                }
+                originalIndex += 1
+            }
+            if position == segments.count - 1 { index = words.count }
+            let piece = words[min(start, words.count)..<min(index, words.count)].joined(separator: " ")
+            if !piece.isEmpty { result.append(EngineSegment(text: piece, start: segment.start, end: segment.end)) }
+        }
+        return result
     }
 
     /// Pads with trailing zeros up to `minimumSeconds`. Longer input is
@@ -172,5 +239,78 @@ final class ParakeetEngine: SpeechEngine {
 
     private static func collapsed(_ text: String) -> String {
         text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+}
+
+/// Custom vocabulary for Parakeet. A small CTC model scores each term against
+/// the audio, and a term replaces the transcribed words only where it is the
+/// better acoustic match. Terms that fail to load leave dictation unchanged.
+private actor VocabularyBooster {
+    /// Next to the Parakeet model, so both app channels share one download
+    /// (about 98 MB, fetched the first time a vocabulary is set).
+    private static let directory = ParakeetEngine.modelsDirectory.appendingPathComponent(
+        CtcModels.defaultCacheDirectory().lastPathComponent, isDirectory: true
+    )
+
+    /// FluidAudio's defaults favor finding every term. On 436 saved
+    /// dictations with a 10-term list (0.18.3) they rewrote 359, mostly through
+    /// the acoustic rescue pass, which swaps in a term that shares no spelling
+    /// with the words it replaces ("Commit" became a product name). With
+    /// rescue off, a term must also look like what was transcribed and still
+    /// win on the audio. These values changed 40 of the 436, each to the
+    /// listed name. A 0.6 floor instead cut "Talix.app" down to "Talix", and
+    /// the default bias of 4.5 turned "auth zero" into "Auth0 zero".
+    /// With rescue off, transcripts that resemble no term skip the CTC model.
+    private static let config = VocabularyRescorer.Config(spotterRescueEnabled: false)
+    private static let thresholds = VocabularyBoostingSession.Thresholds(cbw: 2, minSimilarity: 0.7)
+
+    private var terms: [String] = []
+    private var revision = 0
+    private var session: VocabularyBoostingSession?
+    private var models: Task<CtcModels, Error>?
+
+    /// Returns once the terms are in effect when the model is already on
+    /// disk. A first download continues in the background so it never holds
+    /// up dictation.
+    func setTerms(_ terms: [String]) async {
+        guard terms != self.terms else { return }
+        self.terms = terms
+        revision += 1
+        session = nil
+        guard !terms.isEmpty else { return }
+        let cached = CtcModels.modelsExist(at: Self.directory)
+        let build = Task { [revision] in await self.build(terms, revision: revision) }
+        if cached { await build.value }
+    }
+
+    private func build(_ terms: [String], revision: Int) async {
+        let started = DispatchTime.now().uptimeNanoseconds
+        do {
+            if models == nil {
+                models = Task { try await CtcModels.downloadAndLoad(to: Self.directory) }
+            }
+            let session = try await VocabularyBoostingSession(
+                vocabulary: CustomVocabularyContext(terms: terms.map { CustomVocabularyTerm(text: $0) }),
+                ctcModels: try await models!.value,
+                config: Self.config,
+                thresholds: Self.thresholds
+            )
+            guard revision == self.revision else { return }
+            self.session = session
+            DiagLog.log("vocabulary boosting ready (%d terms, %dms)", terms.count,
+                        Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000))
+        } catch {
+            // A later vocabulary change or model reload tries again.
+            models = nil
+            DiagLog.log("vocabulary boosting unavailable: %@", String(describing: type(of: error)))
+        }
+    }
+
+    /// The transcript with vocabulary terms applied, or nil when nothing changed.
+    func rescore(text: String, tokenTimings: [TokenTiming], audioSamples: [Float]) async -> String? {
+        guard let session, session.hasCTCRescoringCandidates(text: text, tokenTimings: tokenTimings),
+              let output = await session.rescore(text: text, tokenTimings: tokenTimings, audioSamples: audioSamples),
+              output.wasModified else { return nil }
+        return output.text
     }
 }
