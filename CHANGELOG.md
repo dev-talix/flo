@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.13.0](https://github.com/dev-talix/flo/compare/v1.12.1...v1.13.0) (2026-11-10)
+
+
+### Features
+
+* apply custom vocabulary to Parakeet dictations ([68f1bf8](https://github.com/dev-talix/flo/commit/68f1bf88c4e9c8bf213cf749f844e4d48206cf32))
+* apply custom vocabulary to Parakeet, update FluidAudio to 0.18.3 ([f87f964](https://github.com/dev-talix/flo/commit/f87f964f2168e6755cb86a648fdc1ffe6b1d0ef9))
+
+
+### Fixes
+
+* keep a quiet "thank you" as a dictation on Parakeet ([9a126fb](https://github.com/dev-talix/flo/commit/9a126fb46c39d7f363f7ee04dcfe02f08aa9f164))
+* show the in-use mic when the saved mic is unplugged ([3067cc1](https://github.com/dev-talix/flo/commit/3067cc16a093436f78e445461fa06f081ee6f977))
+
 ## [1.12.1](https://github.com/dev-talix/flo/compare/v1.12.0...v1.12.1) (2026-10-21)
 
 ### Fixes
