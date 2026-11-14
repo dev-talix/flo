@@ -1,13 +1,13 @@
 {
-  "originHash" : "0cf107b68c259aae83f3312e7d628d3ae98354ef493abca75156a9415dffbd70",
+  "originHash" : "9797e9e80d6f9a9b238f2947d9d7d60bf9a717eb69414b36ee7de1640a7b8418",
   "pins" : [
     {
       "identity" : "argmax-oss-swift",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/argmaxinc/argmax-oss-swift.git",
       "state" : {
-        "revision" : "1e2a163736dfa5a198e637ae44c114e1c6d5cc2d",
-        "version" : "1.1.0"
+        "revision" : "1bbc57cb7fe6410248a685b1c5a3c6d56adc2ed4",
+        "version" : "1.1.1"
       }
     },
     {
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sparkle-project/Sparkle",
       "state" : {
-        "revision" : "eef1a539a373c1f1a320624b1130fc5de7b2e100",
-        "version" : "2.10.0"
+        "revision" : "ab7d71291238df6e0492143b120c9b696a35f603",
+        "version" : "2.10.1"
       }
     },
     {
