@@ -121,4 +121,42 @@ final class SettingsWindowEditingTests: XCTestCase {
                                       characters: characters, charactersIgnoringModifiers: characters,
                                       isARepeat: false, keyCode: code))
     }
+
+    /// Writes the Settings issue banner for visual review. Set
+    /// FLO_ISSUE_RENDER_DIR, and FLO_ISSUE_RENDER_LEGACY=1 for the old wording.
+    func testRendersShortcutIssueBannerWhenRequested() throws {
+        guard let directory = ProcessInfo.processInfo.environment["FLO_ISSUE_RENDER_DIR"] else {
+            throw XCTSkip("Set FLO_ISSUE_RENDER_DIR to write issue banner renders")
+        }
+        _ = NSApplication.shared
+        let folder = URL(fileURLWithPath: directory, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let legacy = ProcessInfo.processInfo.environment["FLO_ISSUE_RENDER_LEGACY"] == "1"
+        let issue = legacy
+            ? UserFacingIssue(summary: "Dictation shortcut unavailable",
+                              details: "Remove and re-add Flo in Accessibility settings. Flo will keep retrying.",
+                              at: Date().addingTimeInterval(-5))
+            : UserFacingIssue.shortcutUnavailable(appName: "Flo Local")
+        for dark in [false, true] {
+            let width: CGFloat = 620
+            let banner = IssueBanner(issue: issue)
+                .background(dark ? Color(white: 0.12) : .white)
+                .environment(\.colorScheme, dark ? .dark : .light)
+                .frame(width: width)
+                .fixedSize(horizontal: false, vertical: true)
+            let host = NSHostingView(rootView: banner)
+            host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            let window = SettingsWindow(contentRect: host.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            host.layoutSubtreeIfNeeded()
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let image = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            let name = "issue-\(legacy ? "before" : "after")-\(dark ? "dark" : "light").png"
+            try image.write(to: folder.appendingPathComponent(name))
+        }
+    }
 }

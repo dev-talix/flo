@@ -258,6 +258,9 @@ final class AudioRecorder {
         let recordingID: UUID
         let captureGeneration: Int
         let error: Error
+        /// Audio captured before the failure, for Retry Dictation. The hold
+        /// itself is still cancelled; this is never transcribed automatically.
+        var samples: [Float] = []
     }
 
     /// Startup retains its Bluetooth wakeup allowance. Once live, buffer and
@@ -733,7 +736,8 @@ final class AudioRecorder {
             lock.unlock()
             return
         }
-        let failure = RuntimeFailure(recordingID: recordingID, captureGeneration: captureGeneration, error: error)
+        let failure = RuntimeFailure(recordingID: recordingID, captureGeneration: captureGeneration,
+                                     error: error, samples: samples)
         let callback = notify ? onRuntimeFailure : nil
         let failedTrace = trace
         recordingActive = false
@@ -832,7 +836,8 @@ final class AudioRecorder {
     }
 
     /// Runtime errors before live capture use the bounded startup budget.
-    /// After live capture, terminal failure discards the incomplete hold.
+    /// After live capture, terminal failure cancels the incomplete hold. Its
+    /// audio goes to the failure callback for Retry Dictation only.
     private func handleRuntimeError(from generation: Int) {
         lock.lock()
         let failedRecording = recordingID

@@ -67,8 +67,7 @@ final class HotkeyManager {
                 guard let self, self.tapKey != newValue else { return }
                 if self.isDown {
                     self.isDown = false
-                    let release = self.onRelease
-                    DispatchQueue.main.async { release?() }
+                    DispatchQueue.main.async { self.onRelease?() }
                 }
                 self.tapKey = newValue
             }
@@ -341,7 +340,8 @@ final class HotkeyManager {
 
     /// Returns true when the event was LocalFlow's own health probe, so the
     /// tap callback can consume it instead of passing it on.
-    private func handle(type: CGEventType, event: CGEvent) -> Bool {
+    /// Runs on the tap thread. Internal so tests can drive it directly.
+    func handle(type: CGEventType, event: CGEvent) -> Bool {
         // macOS disables taps that stall; re-enable and carry on.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let threadTap { CGEvent.tapEnable(tap: threadTap, enable: true) }
@@ -364,15 +364,15 @@ final class HotkeyManager {
         guard pressed != wasDown else { return false }
         isDown = pressed
 
-        let handler = pressed ? onPress : onRelease
         let flags = event.flags.rawValue
         let receivedAt = DispatchTime.now().uptimeNanoseconds
         // NSLog can block. Keep all diagnostics out of the event-tap
         // callback, and run the latency-sensitive owner action first.
+        // The owner reassigns callbacks on the main thread, so read them there.
         DispatchQueue.main.async {
             self.callbackUptimeNs = receivedAt
             defer { self.callbackUptimeNs = nil }
-            handler?()
+            (pressed ? self.onPress : self.onRelease)?()
             DiagLog.log("hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
                   keyCode, flags, wasDown ? 1 : 0)
         }

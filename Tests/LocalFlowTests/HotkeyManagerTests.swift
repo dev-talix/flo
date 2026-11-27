@@ -28,6 +28,37 @@ final class HotkeyManagerTests: XCTestCase {
         }
     }
 
+    /// Run under `swift test --sanitize=thread` to catch the race. Without the
+    /// sanitizer it still checks that every edge reaches the current handler.
+    func testTapThreadEventsUseCallbacksTheMainThreadReassigns() throws {
+        let manager = HotkeyManager()
+        let key = HotkeyManager.Key.rightOption
+        let event = try XCTUnwrap(CGEvent(source: nil))
+        event.type = .flagsChanged
+        event.setIntegerValueField(.keyboardEventKeycode, value: key.keyCode)
+        var presses = 0
+        let edges = 400
+        let finished = expectation(description: "tap thread finished")
+        let tapThread = Thread {
+            for index in 0..<edges {
+                event.flags = index.isMultiple(of: 2) ? key.deviceMask.union(key.genericMask) : []
+                _ = manager.handle(type: .flagsChanged, event: event)
+            }
+            finished.fulfill()
+        }
+        tapThread.start()
+        // The app reassigns callbacks while its tap runs, e.g. when Ollama
+        // reachability restarts the command tap.
+        let deadline = Date().addingTimeInterval(5)
+        while presses < edges / 2, Date() < deadline {
+            manager.onPress = { presses += 1 }
+            manager.onRelease = {}
+            RunLoop.main.run(until: Date().addingTimeInterval(0.001))
+        }
+        wait(for: [finished], timeout: 5)
+        XCTAssertEqual(presses, edges / 2)
+    }
+
     func testDeviceSpecificFlagMeansPressed() {
         for key in HotkeyManager.Key.allCases {
             XCTAssertTrue(HotkeyManager.pressedState(

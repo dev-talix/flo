@@ -536,7 +536,7 @@ struct SettingsView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let issue = model.lastIssue {
-                    lastIssueBanner(issue)
+                    IssueBanner(issue: issue)
                     Divider()
                 }
                 selectedPaneView
@@ -546,46 +546,6 @@ struct SettingsView: View {
         .frame(minWidth: 740, idealWidth: 820, minHeight: 520, idealHeight: 650)
     }
 
-    private func lastIssueBanner(_ issue: UserFacingIssue) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .padding(.top, 2)
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(issue.summary)
-                        .font(.callout.weight(.semibold))
-                    Text(issue.at, style: .relative)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-                Text(issue.details)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .truncationMode(.tail)
-                    .textSelection(.enabled)
-                    .help(issue.details)
-            }
-
-            Spacer(minLength: 8)
-
-            Button {
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString("\(issue.summary)\n\(issue.details)", forType: .string)
-            } label: {
-                Image(systemName: "doc.on.doc")
-            }
-            .buttonStyle(.borderless)
-            .help("Copy error details")
-            .accessibilityLabel("Copy error details")
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
-        .background(Color.orange.opacity(0.07))
-    }
 
     @ViewBuilder
     private var selectedPaneView: some View {
@@ -1258,5 +1218,56 @@ final class PreviewHudView: NSView {
         let spectrum = SyntheticSpeech.spectrum(at: t, level: level)
         renderer.render(in: ctx, bounds: bounds, t: time, dt: 1.0 / 30.0,
                         level: CGFloat(level), spectrum: spectrum.map { CGFloat($0) })
+    }
+}
+
+/// The last failure, shown above every Settings pane until a dictation succeeds.
+struct IssueBanner: View {
+    let issue: UserFacingIssue
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(issue.summary)
+                        .font(.callout.weight(.semibold))
+                    Text(issue.at, style: .relative)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                Text(issue.details)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .help(issue.details)
+                if let action = issue.action {
+                    Button(action.title) { action.perform() }
+                        .controlSize(.small)
+                        .padding(.top, 4)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString("\(issue.summary)\n\(issue.details)", forType: .string)
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .help("Copy error details")
+            .accessibilityLabel("Copy error details")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.07))
     }
 }

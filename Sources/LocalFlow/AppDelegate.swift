@@ -5,14 +5,46 @@ import ServiceManagement
 struct UserFacingIssue: Equatable {
     static let menuCharacterLimit = 32
 
+    /// A one-click fix offered next to the issue in the menu and Settings.
+    enum Action: Equatable {
+        case openAccessibilitySettings
+
+        var title: String {
+            switch self {
+            case .openAccessibilitySettings: return "Open Accessibility Settings"
+            }
+        }
+
+        @MainActor func perform() {
+            switch self {
+            case .openAccessibilitySettings:
+                let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
     let summary: String
     let details: String
     let at: Date
+    var action: Action?
 
-    init(summary: String, details: String, at: Date = Date()) {
+    init(summary: String, details: String, at: Date = Date(), action: Action? = nil) {
         self.summary = summary
         self.details = details
         self.at = at
+        self.action = action
+    }
+
+    /// Every new build loses its Accessibility grant until the user toggles
+    /// it. Name the running app: Flo and Flo Local can both be listed.
+    static func shortcutUnavailable(appName: String) -> UserFacingIssue {
+        UserFacingIssue(
+            summary: "Dictation shortcut unavailable",
+            details: "Turn \(appName) off and back on in System Settings > Privacy & Security > Accessibility. "
+                + "\(appName) checks again every 3 seconds, so no relaunch is needed.",
+            action: .openAccessibilitySettings
+        )
     }
 
     var menuSummary: String {
@@ -266,7 +298,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // gating presses on `state == .idle` made the hotkey feel dead.
     private var isRecording = false
     private var processingCount = 0
-    private var pendingAudioHandoffs = 0
+    /// HUD generations whose released audio hasn't reached the main queue.
+    private var audioHandoffs: Set<Int> = []
+    /// Handoffs the deadline abandoned. Their late audio goes to Retry.
+    /// Escape removes a handoff without adding it here, so its audio is dropped.
+    private var expiredAudioHandoffs: Set<Int> = []
+    private var pendingAudioHandoffs: Int { audioHandoffs.count }
+    /// Release normally hands audio off in milliseconds. A recorder control
+    /// queue wedged in CoreAudio must not hold the HUD and Quit forever.
+    private static let audioHandoffTimeout: TimeInterval = 15
     // Lets a stale async start-failure from an abandoned recording be
     // distinguished from the one currently in flight.
     private var recordingGeneration = 0
@@ -332,6 +372,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildSettings()
         buildStatusItem()
         requestPermissions()
+        Task { [weak self] in
+            await self?.transcriber.setEngineLostHandler {
+                Task { @MainActor in self?.speechEngineLost() }
+            }
+        }
         loadModel()
         startHotkey()
         // Command mode's hotkey gate needs Ollama reachability even when
@@ -437,15 +482,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// result minutes later at wake, into whatever happens to have focus,
     /// would be worse than losing a dictation the user watched get cut off.
     private func abortRecording(reason: String) {
-        discardActiveRecording(reason: reason)
+        // Like Escape, give running inference Transcriber's grace instead of
+        // quarantining a healthy engine that would finish in milliseconds.
+        discardActiveRecording(reason: reason, interruptInference: false)
         // Sleep must not carry an open mic through the nap. Release any
         // warm session too (queued after stop, so it sees the idle state).
         recorder.releaseWarmSession()
     }
 
     /// Drops the held recording without transcribing it. Shared by
-    /// `abortRecording` (sleep, user switch) and the Escape key. Escape
-    /// passes `interruptInference: false` so Transcriber gives running inference
+    /// `abortRecording` (sleep, user switch) and the Escape key. Both pass
+    /// `interruptInference: false` so Transcriber gives running inference
     /// a grace period. A normal completion keeps the model warm.
     private func discardActiveRecording(reason: String, interruptInference: Bool = true) {
         hotkey.cancelHold()
@@ -553,6 +600,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         attemptHotkeyStart()
     }
 
+    private func hotkeyTapVerified() {
+        hotkeyActive = true
+        DiagLog.log("hotkey tap active (%@)", hotkey.key.label)
+        // The grant works now. Drop the stale shortcut issue so neither the
+        // menu nor Settings keeps telling the user to fix it.
+        if lastError?.action == .openAccessibilitySettings {
+            // Settings can post a newer issue of its own without lastError.
+            let settingsIssue = settingsModel?.lastIssue
+            lastError = nil
+            if settingsIssue?.action != .openAccessibilitySettings { settingsModel?.lastIssue = settingsIssue }
+        }
+        if case .failed(let issue) = state, issue.action == .openAccessibilitySettings {
+            state = isRecording ? .recording : restingState
+        }
+        recomputeReadyState()
+    }
+
     /// The tap can't be created — or can be created but receives nothing —
     /// until Accessibility is (re-)granted. Keep retrying so the grant
     /// takes effect without a relaunch.
@@ -560,15 +624,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey.start { [weak self] verified in
             guard let self else { return }
             if verified {
-                self.hotkeyActive = true
-                DiagLog.log("hotkey tap active (%@)", self.hotkey.key.label)
-                self.recomputeReadyState()
+                self.hotkeyTapVerified()
             } else {
                 self.hotkeyActive = false
-                self.state = .failed(UserFacingIssue(
-                    summary: "Dictation shortcut unavailable",
-                    details: "Remove and re-add Flo in Accessibility settings. Flo will keep retrying."
-                ))
+                self.state = .failed(.shortcutUnavailable(appName: AppIdentity.current.name))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     self.attemptHotkeyStart()
                 }
@@ -651,6 +710,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 scheduleModelRetry(generation: generation)
             }
         }
+    }
+
+    /// Transcriber quarantined a stuck engine and nothing can transcribe.
+    /// Stop claiming Ready and load a replacement, so later presses don't
+    /// record into a model that is gone and overflow the retry buffer.
+    private func speechEngineLost() {
+        DiagLog.log("speech engine quarantined; reloading %@", Settings.whisperModel)
+        // Cleared first so a failed reload reports "Couldn't load" instead
+        // of claiming a previous model is still serving.
+        modelLoaded = false
+        loadModel()
     }
 
     /// A model load failure is usually transient (launch-at-boot racing
@@ -780,7 +850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self?.handleCaptureFailure(failure.error, generation: generation,
                                            dictationGeneration: dictationGeneration,
-                                           summary: "Microphone stopped")
+                                           summary: "Microphone stopped",
+                                           capturedSamples: failure.samples)
             }
         }) { [weak self] error in
             guard let self else { return }
@@ -812,9 +883,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Recorder state is invalidated; hardware teardown may still be pending.
     /// No unscoped stop may reach a newer hold.
     private func handleCaptureFailure(
-        _ error: Error, generation: Int, dictationGeneration: Int?, summary: String
+        _ error: Error, generation: Int, dictationGeneration: Int?, summary: String,
+        capturedSamples: [Float] = []
     ) {
         guard generation == recordingGeneration else { return }
+        // Never paste a cut-off hold, but keep what was said for Retry Dictation.
+        // Only dictation holds have a dictation generation; release clears
+        // the command flag before a failure found at stop arrives here.
+        let kept = dictationGeneration != nil && dictationDelivery.retainForRetry(capturedSamples)
         recordingGeneration += 1
         isRecording = false
         recordingIsCommand = false
@@ -832,7 +908,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.hide()
         cancelKey.deactivate()
         playCue("Basso")
-        state = .failed(UserFacingIssue(summary: summary, details: error.localizedDescription))
+        let details = kept
+            ? "\(error.localizedDescription) The audio recorded before it stopped is kept. Use Retry Dictation in the menu."
+            : error.localizedDescription
+        state = .failed(UserFacingIssue(summary: summary, details: details))
         scheduleFailureRecovery()
     }
 
@@ -1018,11 +1097,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         releasedDictation = dictationGeneration.map { (generation: $0, hudGeneration: generation) }
         incrementalTimer?.cancel()
         incrementalTimer = nil
-        pendingAudioHandoffs += 1
+        audioHandoffs.insert(generation)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.audioHandoffTimeout) { [weak self] in
+            self?.audioHandoffTimedOut(hudGeneration: generation, dictationGeneration: dictationGeneration)
+        }
         DictationTrace.$current.withValue(trace) {
             recorder.stop { [weak self] recording in
                 guard let self else { return }
-                defer { self.pendingAudioHandoffs -= 1 }
+                guard self.audioHandoffs.remove(generation) != nil else {
+                    // The deadline already abandoned this hold. Keep its audio
+                    // for Retry Dictation instead of pasting it late.
+                    if self.expiredAudioHandoffs.remove(generation) != nil,
+                       !asCommand, recording.startError == nil {
+                        self.dictationDelivery.retainForRetry(recording.samples)
+                    }
+                    return
+                }
                 if recording.startError != nil {
                     if let dictationGeneration {
                         self.dictationDelivery.cancel(generation: dictationGeneration, interruptInference: false)
@@ -1038,6 +1128,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         overlay.beginProcessing()
+    }
+
+    private func audioHandoffTimedOut(hudGeneration: Int, dictationGeneration: Int?) {
+        guard audioHandoffs.remove(hudGeneration) != nil else { return }
+        expiredAudioHandoffs.insert(hudGeneration)
+        DiagLog.log("microphone did not hand off audio within %.0fs; abandoning the hold", Self.audioHandoffTimeout)
+        if let dictationGeneration {
+            dictationDelivery.cancel(generation: dictationGeneration, interruptInference: false)
+        }
+        dismissHud(hudGeneration)
+        // A newer hold owns the menu and cue now.
+        guard hudGeneration == recordingGeneration, !isRecording else { return }
+        playCue("Basso")
+        state = .failed(UserFacingIssue(
+            summary: "Microphone didn't respond",
+            details: dictationGeneration == nil
+                ? "The microphone didn't return the voice edit. Try it again."
+                : "The microphone didn't return the recording. If it arrives later with speech, it will appear under Retry Dictation in the menu."
+        ))
+        scheduleFailureRecovery()
     }
 
     /// Hides the processing HUD for the dictation identified by `generation`
@@ -1058,10 +1168,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if isRecording {
             discardActiveRecording(reason: "Escape pressed", interruptInference: false)
         } else if let released = releasedDictation {
+            // The user threw this hold away: neither its deadline nor late
+            // audio should resurface it.
+            audioHandoffs.remove(released.hudGeneration)
             dictationDelivery.cancel(generation: released.generation, interruptInference: false)
             // Before the audio handoff there's no pending release, so
             // cancel(generation:) can't fire onCancelled. Hide it here.
             dismissHud(released.hudGeneration)
+            // Like Escape mid-hold, retire the generation so a queued capture
+            // failure for this hold can't report an error or keep its audio.
+            if released.hudGeneration == recordingGeneration { recordingGeneration += 1 }
+            // Release leaves the state to the handoff, which this cancel
+            // pre-empts. Without this the menu stays on "Recording…".
+            state = restingState
         } else if let sequence = commandHudGenerations.first(where: { $0.value == recordingGeneration })?.key {
             // Speech abandonment uses Transcriber's grace so a quick finish
             // keeps the model warm. Text-model work can be cancelled immediately.
@@ -1462,6 +1581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusText: String
         statusMenuItem?.toolTip = nil
         statusMenuItem?.isEnabled = false
+        statusMenuItem?.action = #selector(openSettings)
         switch state {
         case .loadingModel:
             symbol = "hourglass"
@@ -1488,8 +1608,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .failed(let issue):
             symbol = "exclamationmark.triangle"
             statusText = issue.menuSummary
-            statusMenuItem?.toolTip = issue.details
+            statusMenuItem?.toolTip = issue.action.map { "\(issue.details)\nClick to \($0.title.lowercased())." } ?? issue.details
             statusMenuItem?.isEnabled = true
+            if issue.action != nil { statusMenuItem?.action = #selector(performIssueAction) }
         }
         if let symbol {
             setStatusIcon(nil)
@@ -1549,6 +1670,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         summary: "Couldn't retry dictation",
                         details: "\(error.localizedDescription) The audio is still kept in memory. Try Retry Dictation again before quitting."
                     ))
+                    // This attempt took over the load generation, so keep the
+                    // automatic backoff going instead of stranding recovery.
+                    scheduleModelRetry(generation: generation)
                     return
                 }
             }
@@ -1646,8 +1770,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openAccessibilitySettings() {
-        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
-        NSWorkspace.shared.open(url)
+        UserFacingIssue.Action.openAccessibilitySettings.perform()
+    }
+
+    /// The status line of a failure with a one-click fix runs that fix.
+    @objc private func performIssueAction() {
+        guard case .failed(let issue) = state, let action = issue.action else { return openSettings() }
+        action.perform()
     }
 
     // Quick-action selections name the menu as their source while sharing

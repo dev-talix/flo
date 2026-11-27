@@ -2,6 +2,17 @@ import XCTest
 @testable import LocalFlow
 
 final class UserFacingIssueTests: XCTestCase {
+    func testShortcutIssueNamesTheRunningAppAndOffersAccessibilitySettings() {
+        let issue = UserFacingIssue.shortcutUnavailable(appName: "Flo Local")
+        XCTAssertEqual(issue.summary, "Dictation shortcut unavailable")
+        XCTAssertTrue(issue.details.contains("Flo Local off and back on"),
+                      "With both channels installed, a bare \"Flo\" doesn't say which app to toggle")
+        XCTAssertTrue(issue.details.contains("Privacy & Security > Accessibility"))
+        XCTAssertEqual(issue.action, .openAccessibilitySettings)
+        XCTAssertEqual(issue.action?.title, "Open Accessibility Settings")
+        XCTAssertNil(UserFacingIssue(summary: "Other", details: "No fix to open").action)
+    }
+
     func testMenuSummaryCollapsesWhitespace() {
         let issue = UserFacingIssue(
             summary: "  Couldn't\nstart   the microphone  ",
@@ -35,6 +46,7 @@ final class UserFacingIssueTests: XCTestCase {
             "Couldn't transcribe audio",
             "Paste may not have landed",
             "Didn't hear any speech",
+            "Microphone didn't respond",
         ]
 
         for summary in summaries {

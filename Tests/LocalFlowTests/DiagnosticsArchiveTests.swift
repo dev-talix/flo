@@ -269,6 +269,52 @@ final class DiagnosticsArchiveTests: XCTestCase {
         XCTAssertEqual(calls, 2)
     }
 
+    func testRunningLogRotatesAtTheCapInsteadOfGrowingUntilRelaunch() throws {
+        let log = root.appendingPathComponent("running.log")
+        let rotated = URL(fileURLWithPath: log.path + ".1")
+        let line = String(repeating: "x", count: 99) + "\n"
+        for _ in 0..<25 { try DiagLog.append(line, to: log, rotatingAt: 1_000) }
+        func size(_ url: URL) throws -> Int {
+            try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int)
+        }
+        XCTAssertLessThanOrEqual(try size(log), 1_000, "One long-lived process must stay under the cap")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rotated.path), "The previous chunk is kept once")
+        // 25 lines of 100 bytes: two rotations at 1,000 bytes, 5 lines since.
+        XCTAssertEqual(try size(rotated), 1_000)
+        XCTAssertEqual(try size(log), 500)
+    }
+
+    func testLaunchRecoveryReadsTheRotatedLogToo() throws {
+        let archive = DiagnosticsArchive(directory: root.appendingPathComponent("history"))
+        let log = root.appendingPathComponent("running.log")
+        let rotated = URL(fileURLWithPath: log.path + ".1")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let json = String(decoding: try encoder.encode(event()), as: UTF8.self)
+        // A failed archive write left this timing event only in the rotated log.
+        try Data(("0 0 timing " + json + "\n").utf8).write(to: rotated)
+        try Data("0 0 session start\n".utf8).write(to: log)
+        let suite = "Flo-rotated-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(1, forKey: "diagLogPrivacyVersion")
+        XCTAssertTrue(DiagLog.startSession(archive: archive, log: log, defaults: defaults) {})
+        XCTAssertEqual(try archive.read().traces.count, 1, "Rotated timing evidence reaches history")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rotated.path), "Ingested chunks are not kept twice")
+    }
+
+    func testOneFailedArchiveWriteDoesNotDisableHistoryUntilRelaunch() {
+        var health = DiagLog.ArchiveHealth()
+        health.recordRecovery(succeeded: true)
+        health.recordWrite(succeeded: false)
+        XCTAssertFalse(health.isReadable, "A failing disk is reported")
+        health.recordWrite(succeeded: true)
+        XCTAssertTrue(health.isReadable, "The next good write restores history after a brief disk-full moment")
+        health.recordRecovery(succeeded: false)
+        health.recordWrite(succeeded: true)
+        XCTAssertFalse(health.isReadable, "Failed recovery means history may be incomplete until it succeeds")
+    }
+
     func testStorageFailureIsReported() throws {
         let file = root.appendingPathComponent("not-a-directory")
         try Data().write(to: file)

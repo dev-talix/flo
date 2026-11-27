@@ -354,6 +354,7 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         source.send(converted: [0.9], native: [0.9])
         source.queue.sync {}
         XCTAssertEqual(failures.count, 1, "Notification precedes hardware teardown completion")
+        XCTAssertEqual(failures.first?.samples, [0.1, 0.3], "Audio before a device failure stays available for retry")
         input.onStop = nil
         resumeTeardown.signal()
         XCTAssertTrue(drain(recorder).samples.isEmpty)
@@ -446,8 +447,28 @@ final class AudioCaptureLifecycleTests: XCTestCase {
         XCTAssertTrue(drain(recorder).samples.isEmpty)
         XCTAssertEqual(failures.count, 1)
         XCTAssertEqual(failures.first?.error as? AudioRecorder.RecorderError, .streamStopped)
+        XCTAssertEqual(failures.first?.samples, [0.1, 0.3], "Audio before a stall stays available for retry")
         XCTAssertEqual(input.openCount, 1, "Live gaps never join a replacement to partial speech")
         XCTAssertTrue(stopRecorder(recorder).samples.isEmpty)
+    }
+
+    func testStallFoundAtReleaseHandsCapturedAudioToFailure() {
+        let input = SyntheticCaptureInput()
+        let clock = CaptureHealthClock()
+        let recorder = healthRecorder(input, clock)
+        var failures: [AudioRecorder.RuntimeFailure] = []
+        let failed = expectation(description: "failure notified")
+        startRecorder(recorder) { failures.append($0); failed.fulfill() }
+        input.latestSource!.send(converted: [0.1], native: [0.2])
+        input.latestSource!.send(converted: [0.3], native: [0.4])
+        drain(recorder)
+        // The stall is found by release itself, before any health tick runs.
+        clock.advance(by: 3)
+        let recording = stopRecorder(recorder)
+        wait(for: [failed], timeout: 3)
+        XCTAssertTrue(recording.samples.isEmpty, "A failed hold is still never transcribed")
+        XCTAssertNotNil(recording.startError)
+        XCTAssertEqual(failures.first?.samples, [0.1, 0.3])
     }
 
     func testConversionErrorsAfterLiveFailAtInjectedLimit() {

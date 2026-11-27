@@ -73,6 +73,8 @@ jobs:
           python3 Tests/TranscribeCLITests.py
           python3 -B Tests/CaptureFailureBoundaryTests.py
           python3 -B Tests/CommandAbandonmentBoundaryTests.py
+          python3 -B Tests/RecordingRecoveryBoundaryTests.py
+          python3 -B Tests/ModelRecoveryBoundaryTests.py
 
       # Only main saves. PR caches are scoped to their own ref, so each
       # Dependabot PR would otherwise store another ~800 MB copy that nothing
