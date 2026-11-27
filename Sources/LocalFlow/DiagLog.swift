@@ -15,18 +15,28 @@ enum DiagLog {
         : (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/\(AppIdentity.current.logFilename)")
     static var fileURL: URL { URL(fileURLWithPath: path) }
     private static let archivesHistory = Bundle.main.bundleIdentifier == AppIdentity.current.bundleIdentifier
-    private static var archiveFailed = false
+    /// Whether timing history can be trusted for reads and export.
+    struct ArchiveHealth {
+        private(set) var recoveryFailed = false
+        private(set) var writeFailed = false
+        var isReadable: Bool { !recoveryFailed && !writeFailed }
+        mutating func recordRecovery(succeeded: Bool) { recoveryFailed = !succeeded }
+        /// A disk-full moment clears with the next good write. Only failed
+        /// recovery stays sticky, because history may be incomplete.
+        mutating func recordWrite(succeeded: Bool) { writeFailed = !succeeded }
+    }
+    private static var archiveHealth = ArchiveHealth()
     private static var maintenance: DispatchSourceTimer?
     static func exportHistory(to url: URL) throws {
         try queue.sync {
-            guard !archiveFailed else { throw CocoaError(.fileWriteUnknown) }
+            guard archiveHealth.isReadable else { throw CocoaError(.fileWriteUnknown) }
             try DiagnosticsArchive.current.export(to: url)
         }
     }
     private static let sessionEnvironment = environmentLine()
     static func readHistory(maximumTraces: Int) throws -> DiagnosticsSnapshot {
         try queue.sync {
-            guard !archiveFailed else { throw CocoaError(.fileWriteUnknown) }
+            guard archiveHealth.isReadable else { throw CocoaError(.fileWriteUnknown) }
             return try DiagnosticsArchive.current.read(maximumTraces: maximumTraces)
         }
     }
@@ -41,16 +51,19 @@ enum DiagLog {
     /// Trim on launch so the log can't grow without bound.
     static func startSession(afterRecovery: () -> Void = {}) {
         queue.sync {
-            archiveFailed = !startSession(archive: archivesHistory ? .current : nil,
-                                          log: fileURL, defaults: .standard, afterRecovery: afterRecovery)
+            archiveHealth.recordRecovery(succeeded: startSession(archive: archivesHistory ? .current : nil,
+                                                                 log: fileURL, defaults: .standard,
+                                                                 afterRecovery: afterRecovery))
             write("=== LocalFlow session start (pid \(ProcessInfo.processInfo.processIdentifier)) ===")
             write(sessionEnvironment)
             if archivesHistory, maintenance == nil, DiagnosticsArchive.current.retentionDays != nil {
                 let timer = DispatchSource.makeTimerSource(queue: queue)
                 timer.schedule(deadline: .now() + 3600, repeating: 3600)
                 timer.setEventHandler {
-                    do { try DiagnosticsArchive.current.prune() }
-                    catch { archiveFailed = true }
+                    do {
+                        try DiagnosticsArchive.current.prune()
+                        archiveHealth.recordWrite(succeeded: true)
+                    } catch { archiveHealth.recordWrite(succeeded: false) }
                 }
                 maintenance = timer
                 timer.resume()
@@ -64,10 +77,15 @@ enum DiagLog {
     static func startSession(archive: DiagnosticsArchive?, log: URL, defaults: UserDefaults,
                              afterRecovery: () -> Void) -> Bool {
         var recovered = true
+        let rotated = URL(fileURLWithPath: log.path + ".1")
         if let archive {
+            let recordings = archive.directory.deletingLastPathComponent().appendingPathComponent("DiagnosticRecordings")
             do {
-                try archive.recover(log: log, recordings: archive.directory
-                    .deletingLastPathComponent().appendingPathComponent("DiagnosticRecordings"))
+                try archive.recover(log: log, recordings: recordings)
+                // Running rotation moves older lines here. Merging dedupes events.
+                if FileManager.default.fileExists(atPath: rotated.path) {
+                    try archive.recover(log: rotated, recordings: recordings)
+                }
             } catch {
                 recovered = false
                 NSLog("LocalFlow: timing history recovery failed: %@", String(describing: type(of: error)))
@@ -84,6 +102,7 @@ enum DiagLog {
             }
             let attrs = try? manager.attributesOfItem(atPath: log.path)
             if let size = attrs?[.size] as? Int, size > 5_000_000 { try? manager.removeItem(at: log) }
+            if archive != nil { try? manager.removeItem(at: rotated) }
         }
         // This callback starts independent retained-audio maintenance after the attempt.
         afterRecovery()
@@ -110,9 +129,11 @@ enum DiagLog {
                   let json = String(data: data, encoding: .utf8) else { return }
             write("timing " + json)
             if archivesHistory {
-                do { try DiagnosticsArchive.current.record(event, environment: sessionEnvironment) }
-                catch {
-                    archiveFailed = true
+                do {
+                    try DiagnosticsArchive.current.record(event, environment: sessionEnvironment)
+                    archiveHealth.recordWrite(succeeded: true)
+                } catch {
+                    archiveHealth.recordWrite(succeeded: false)
                     NSLog("LocalFlow: timing history write failed: %@", String(describing: type(of: error)))
                 }
             }
@@ -154,14 +175,32 @@ enum DiagLog {
         return String(cString: bytes)
     }
 
+    static let maxLogBytes = 5_000_000
+
     private static func write(_ message: String) {
         let line = "\(stamp.string(from: Date())) \(message)\n"
-        if let handle = FileHandle(forWritingAtPath: path) {
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-            try? handle.close()
-        } else {
-            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        try? append(line, to: fileURL)
+    }
+
+    /// Rotates to `<name>.1` at `limit` so a process that runs for months
+    /// stays bounded, not only at launch. Uses the throwing FileHandle calls:
+    /// the legacy ones raise an uncatchable exception on a full disk, and
+    /// launchd would relaunch straight into the same crash.
+    static func append(_ line: String, to url: URL, rotatingAt limit: Int = maxLogBytes) throws {
+        let data = Data(line.utf8)
+        guard let handle = try? FileHandle(forWritingTo: url) else {
+            try data.write(to: url, options: .atomic)
+            return
         }
+        defer { try? handle.close() }
+        let size = try handle.seekToEnd()
+        if size > 0, size + UInt64(data.count) > UInt64(limit) {
+            let rotated = URL(fileURLWithPath: url.path + ".1")
+            try? FileManager.default.removeItem(at: rotated)
+            try FileManager.default.moveItem(at: url, to: rotated)
+            try data.write(to: url, options: .atomic)
+            return
+        }
+        try handle.write(contentsOf: data)
     }
 }
