@@ -53,6 +53,23 @@ final class DictationDeliveryTests: XCTestCase {
         XCTAssertFalse(delivery.isBusy)
     }
 
+    func testAudioFromAFailedHoldIsRetainedForRetryWithoutBeingDelivered() async {
+        let effects = Effects()
+        let delivery = makeDelivery(effects: effects) { request in
+            "kept \(Int((request.samples.first ?? 0) * 10))"
+        }
+        XCTAssertFalse(delivery.retainForRetry([]), "Nothing captured, nothing to retry")
+        XCTAssertFalse(delivery.retainForRetry([Float](repeating: 0, count: 1_600)), "Silence is not retried")
+        for amplitude: Float in [0.1, 0.2, 0.3, 0.4] {
+            XCTAssertTrue(delivery.retainForRetry(speech(amplitude)))
+        }
+        XCTAssertEqual(delivery.retryCount, DictationDelivery.retryLimit)
+        XCTAssertTrue(effects.injected.isEmpty, "Retained audio is never pasted on its own")
+        delivery.retryFailedDictations { self.configuration() }
+        await waitUntil { effects.injected.count == 3 }
+        XCTAssertEqual(effects.injected, ["kept 2", "kept 3", "kept 4"])
+    }
+
     func testEmptyAutomaticRecoveryRetainsOneOriginalAndFailedManualRetryRetainsItOnce() async {
         let effects = Effects()
         var calls = 0

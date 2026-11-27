@@ -122,6 +122,7 @@ final class Recorder { var stops = 0; func stop(_ callback: (Int) -> Void) { sto
     var recordingCommandTarget: TextInjector.CommandTarget?
     var recordingGeneration = 1
     var releasedDictation: (generation: Int, hudGeneration: Int)?
+    var audioHandoffs: Set<Int> = []
     var activeDictationTrace: DictationTrace?
     let recorder = Recorder()
     let hotkey = Key()

@@ -125,6 +125,13 @@ actor Transcriber {
     // otherwise build several multi-hundred-MB pipelines concurrently.
     private let loadGate = TranscriptionGate()
     private var vocabularyText = ""
+    private var onEngineLost: (@Sendable () -> Void)?
+
+    /// Called after a quarantine leaves no engine loaded, so the owner can
+    /// stop advertising readiness and load a replacement.
+    func setEngineLostHandler(_ handler: @escaping @Sendable () -> Void) {
+        onEngineLost = handler
+    }
 
     var isLoaded: Bool { engine != nil }
 
@@ -409,6 +416,7 @@ actor Transcriber {
         let previousGate = transcriptionGate
         transcriptionGate = TranscriptionGate()
         engineGeneration += 1
+        onEngineLost?()
         await previousGate.retire()
     }
 

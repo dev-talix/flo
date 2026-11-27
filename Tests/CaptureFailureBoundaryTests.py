@@ -17,6 +17,7 @@ enum TextInjector {
 }
 struct UserFacingIssue { let summary: String; let details: String }
 struct NativeAudioRecording {}
+enum DiagLog { static func log(_ format: String, _ args: CVarArg...) {} }
 struct IncrementalCadence { let snapshotSeconds: TimeInterval = 0.4 }
 final class DictationTrace {
     @TaskLocal static var current: DictationTrace?
@@ -40,6 +41,13 @@ final class Delivery {
     var incrementalCalls = 0
     func incrementalSnapshotRange(generation: Int) -> ((Int) -> Range<Int>)? { { 0..<$0 } }
     func processIncrementalSnapshot(generation: Int, samples: [Float], sampleOffset: Int) { incrementalCalls += 1 }
+    var retained: [[Float]] = []
+    @discardableResult
+    func retainForRetry(_ samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return false }
+        retained.append(samples)
+        return true
+    }
     func cancel(generation: Int, interruptInference: Bool = true) {
         cancelled.insert(generation)
         interruptions.append(interruptInference)
@@ -61,6 +69,7 @@ final class Recorder {
     func stop(completion: @escaping (Recording) -> Void) { completions.append(completion) }
 }
 final class AppDelegate {
+    static let audioHandoffTimeout: TimeInterval = 60
     enum State { case recording, failed(UserFacingIssue) }
     var recordingGeneration = 1
     var isRecording = true
@@ -71,7 +80,9 @@ final class AppDelegate {
     var hudDictationGeneration: (dictation: Int, hud: Int)? = (10, 1)
     var releasedDictation: (generation: Int, hudGeneration: Int)?
     var incrementalTimer: DispatchWorkItem? = DispatchWorkItem {}
-    var pendingAudioHandoffs = 0
+    var audioHandoffs: Set<Int> = []
+    var pendingAudioHandoffs: Int { audioHandoffs.count }
+    var expiredAudioHandoffs: Set<Int> = []
     var processCalls = 0
     var cues = 0
     var recoveries = 0
@@ -124,6 +135,26 @@ CASES = r'''
             handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "late notification")
             precondition(recordingGeneration == 2 && cues == 1 && recoveries == 1)
             precondition(dictationDelivery.interruptions == [false, false])
+        case "salvage":
+            handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "stopped",
+                                 capturedSamples: [0.1, 0.2])
+            precondition(dictationDelivery.retained == [[0.1, 0.2]], "Mid-hold failure keeps audio for retry")
+            precondition(dictationDelivery.cancelled == [10] && processCalls == 0)
+        case "command-salvage":
+            recordingIsCommand = true
+            handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: nil, summary: "stopped",
+                                 capturedSamples: [0.1, 0.2])
+            precondition(dictationDelivery.retained.isEmpty, "Commands never enter dictation retry")
+        case "command-release-salvage":
+            // Release clears the command flag before the stop handoff finds the failure.
+            recordingIsCommand = true
+            activeDictationGeneration = nil
+            hotkeyReleased()
+            precondition(!recordingIsCommand)
+            handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: nil, summary: "stopped",
+                                 capturedSamples: [0.1, 0.2])
+            precondition(dictationDelivery.retained.isEmpty,
+                         "A spoken command must never become a dictation that Retry can paste")
         case "startup-failure":
             handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "startup")
             handleCaptureFailure(Failure.stopped, generation: 1, dictationGeneration: 10, summary: "duplicate")
@@ -183,7 +214,7 @@ class CaptureFailureBoundaryTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         source = (root / "Sources/LocalFlow/AppDelegate.swift").read_text()
         methods = "\n".join(method(source, name) for name in (
-            "handleCaptureFailure", "cancelActiveDictationSession", "hotkeyReleased", "dismissHud", "commandKeyReleased", "runIncrementalTick"))
+            "handleCaptureFailure", "cancelActiveDictationSession", "hotkeyReleased", "audioHandoffTimedOut", "dismissHud", "commandKeyReleased", "runIncrementalTick"))
         harness = directory / "main.swift"
         harness.write_text(STUBS + methods + CASES)
         cls.binary = directory / "capture-failure-boundary"
@@ -206,6 +237,15 @@ class CaptureFailureBoundaryTests(unittest.TestCase):
 
     def test_failed_handoff_before_ui_notification_preserves_healthy_inference(self):
         self.run_case("failed-handoff")
+
+    def test_mid_hold_failure_keeps_captured_audio_for_retry(self):
+        self.run_case("salvage")
+
+    def test_command_failure_does_not_enter_dictation_retry(self):
+        self.run_case("command-salvage")
+
+    def test_command_failure_found_at_release_does_not_enter_dictation_retry(self):
+        self.run_case("command-release-salvage")
 
     def test_startup_failure_cancels_once_without_interrupting_inference(self):
         self.run_case("startup-failure")

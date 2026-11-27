@@ -647,6 +647,41 @@ final class DictationSessionStallTests: XCTestCase {
         _ = try? await secondTask.value
     }
 
+    func testQuarantineTellsOwnerTheEngineIsGoneSoItCanReload() async throws {
+        let blocked = NoncooperativeInference()
+        let first = FakeEngine()
+        first.inference = { await blocked.run() }
+        let second = FakeEngine()
+        second.inference = { syntheticResult("after reload") }
+        var loads = 0
+        let transcriber = Transcriber(modelLoader: { _, _ in
+            loads += 1
+            return loads == 1 ? first : second
+        })
+        let lost = LostCounter()
+        await transcriber.setEngineLostHandler { Task { await lost.increment() } }
+        try await transcriber.load(model: "test")
+        let stuck = Task { try await transcriber.transcribe(samples: speech) }
+        for _ in 0..<200 {
+            if await blocked.calls == 1 { break }
+            await Task.yield()
+        }
+        stuck.cancel()
+        await expectEventually { !(await transcriber.isLoaded) }
+        await expectEventually { await lost.count == 1 }
+        let lostAfterQuarantine = await lost.count
+        XCTAssertEqual(lostAfterQuarantine, 1, "The owner must learn the engine is gone, or it keeps claiming Ready")
+        // The owner's reload restores dictation while the old call is still stuck.
+        try await transcriber.load(model: "test")
+        let text = try await transcriber.transcribe(samples: speech)
+        XCTAssertEqual(text, "after reload")
+        await blocked.finish()
+        _ = try? await stuck.value
+        for _ in 0..<100 { await Task.yield() }
+        let lostAfterLateReturn = await lost.count
+        XCTAssertEqual(lostAfterLateReturn, 1, "A late return from the old engine is not another loss")
+    }
+
     func testRecoveryCapsQuarantinedEnginesUntilOldInferenceReturns() async throws {
         try await verifyRecoveryCap(abandon: false)
     }
@@ -812,6 +847,11 @@ private actor SuspendedLoad {
         pending?.resume()
         pending = nil
     }
+}
+
+private actor LostCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
 }
 
 private actor NoncooperativeInference {

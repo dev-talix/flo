@@ -155,6 +155,23 @@ final class DictationDelivery {
         }
     }
 
+    /// Keeps audio from a hold that never reached recognition, such as a
+    /// microphone failure mid-hold, so Retry Dictation can still use it.
+    @discardableResult
+    func retainForRetry(_ samples: [Float]) -> Bool {
+        guard DictationAudioPreparation(samples: samples).isAdmitted else { return false }
+        appendRetry(samples)
+        return true
+    }
+
+    private func appendRetry(_ samples: [Float]) {
+        retrySamples.append(samples)
+        guard retrySamples.count > Self.retryLimit else { return }
+        retrySamples.removeFirst()
+        DiagLog.log("retry buffer full; dropped the oldest failed dictation")
+    }
+    static let retryLimit = 3
+
     func beginCommand() -> Int {
         let sequence = injections.begin(kind: .command)
         pendingCommands.insert(sequence)
@@ -182,8 +199,7 @@ final class DictationDelivery {
             recordTranscript(text)
             if let sequence = completed.sequence { injections.complete(sequence, with: .inject(text)) }
         case .emptyTranscript, .failed:
-            retrySamples.append(completed.samples)
-            if retrySamples.count > 3 { retrySamples.removeFirst() }
+            appendRetry(completed.samples)
             if let sequence = completed.sequence { injections.complete(sequence, with: .skip) }
         case .insufficientVoice:
             if let sequence = completed.sequence { injections.complete(sequence, with: .skip) }
