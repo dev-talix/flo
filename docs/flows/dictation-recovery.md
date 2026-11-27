@@ -1784,3 +1784,62 @@ branch, and `AppDelegate.handleCaptureFailure`. Run the commands above and check
 that both new tests finish inference before releasing hardware teardown.
 Suggested skills: unslop, code-review, review-finished-work, and workflow-capture.
 Physical-device acceptance remains with the maintainer before publication.
+
+## Audit fixes, November 27, 2026
+
+A read-only audit of 1.13.0 found these recovery gaps. Each fix has a test that
+failed on `6608f16` and passes after the change.
+
+- **Quarantine leaves no model.** `Transcriber.quarantineEngine` now calls the
+  owner's engine-lost handler. `AppDelegate.speechEngineLost` clears
+  `modelLoaded` and runs the normal `loadModel` path with its retry backoff.
+  Presses during the reload are refused with the loading cue instead of
+  recording into a missing engine. A failed manual Retry Dictation load
+  reschedules the automatic backoff, so recovery continues once an abandoned
+  engine slot frees. This replaces the "no automatic reload"
+  policy noted in the R2 follow-up above.
+- **Sleep and user switch.** `abortRecording` passes `interruptInference: false`,
+  like Escape, so a healthy preview finishes warm instead of being quarantined.
+- **Mid-hold capture failure.** `AudioRecorder.RuntimeFailure.samples` carries
+  the audio captured before the failure. The hold is still cancelled and never
+  pasted. Only holds with a dictation generation keep audio, so a command whose
+  failure is found at release never becomes a dictation. `handleCaptureFailure`
+  passes the audio to
+  `DictationDelivery.retainForRetry`, which applies the same admission check
+  and three-entry limit as failed recognition, and now logs a dropped entry.
+- **Escape after release.** `cancelFromKeyboard` resets the menu to the resting
+  state when it cancels before the audio handoff, and retires the hold's
+  generation as Escape mid-hold already did, so a queued capture failure for
+  the cancelled hold is ignored.
+- **Audio handoff deadline.** Release tracks each handoff by HUD generation.
+  After 15 seconds without audio, the hold is cancelled, the HUD hides, Quit is
+  allowed, and "Microphone didn't respond" is shown unless a newer hold owns the
+  menu. A voice edit gets its own message, since it never enters Retry.
+  Dictation audio that arrives later goes to Retry Dictation, not to the focused
+  app. Escape before the handoff removes it from both paths, so its audio is
+  dropped and no failure appears.
+- **Diagnostic log.** `DiagLog.append` rotates to `<name>.1` at 5 MB while the
+  app runs and uses the throwing `FileHandle` calls. The legacy calls raised an
+  uncaught exception on a full disk; a 2 MB disk image reproduced exit 134
+  before the change and a thrown out-of-space error after it. Launch recovery
+  ingests `<name>.1` too and removes it after a successful merge.
+- **Timing history after a write error.** `DiagLog.ArchiveHealth` clears a
+  write failure after the next successful write or prune. Failed recovery
+  stays sticky until a later launch recovers.
+- **Hotkey callbacks.** `HotkeyManager` reads `onPress` and `onRelease` on the
+  main queue, where the owner assigns them. Thread Sanitizer reported the old
+  tap-thread read in `testTapThreadEventsUseCallbacksTheMainThreadReassigns`.
+- **Accessibility shortcut error.** `UserFacingIssue.shortcutUnavailable` names
+  the running app, gives the off-and-on toggle steps, and offers Open
+  Accessibility Settings in the Settings banner and the menu status line. The
+  menu status and the shortcut banner clear once the tap verifies. A newer
+  Settings issue stays.
+
+Tests: `RecordingRecoveryBoundaryTests.py` (sleep, Escape after release,
+handoff deadline), `ModelRecoveryBoundaryTests.py` (manual retry during
+backoff, shortcut recovery), new cases in `CaptureFailureBoundaryTests.py`,
+`DictationSessionStallTests`, `AudioCaptureLifecycleTests`,
+`DictationDeliveryTests`, `DiagnosticsArchiveTests`, `HotkeyManagerTests`
+(run with `--sanitize=thread` to check the race), and `UserFacingIssueTests`.
+Not verified on hardware: a real CoreAudio stall, a real Bluetooth drop, and a
+real sleep during inference.
